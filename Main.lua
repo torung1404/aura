@@ -1194,8 +1194,11 @@ local function updateGlobalStuckJump()
 		return
 	end
 	local targetRoot = if validTarget(Target) then getTargetRoot(Target) else nil
-	local followingVerticalPath = State == NavigationState.PATH and RuntimeState.VerticalPathTarget == Target
-	local objectivePosition = if followingVerticalPath
+	-- PATH progress must be measured against the active waypoint, not directly
+	-- against the enemy. A valid route can temporarily move away from the enemy
+	-- to get around a BasicPart, which used to make the global watchdog reset a
+	-- character that was following its path correctly.
+	local objectivePosition = if State == NavigationState.PATH
 		then upcomingMovementGoal()
 		else if targetRoot then targetRoot.Position else upcomingMovementGoal()
 	if not objectivePosition then
@@ -1910,9 +1913,11 @@ local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 	if os.clock() < RuntimeState.RespawnRushUntil then
 		return
 	end
-	-- Skill range is independent from the hold distance: cast as soon as a valid
-	-- target enters Q/E range, including while the controller is approaching.
-	if State == NavigationState.DODGE or not Target or not validTarget(Target) or distance3D > activeSkillRange then
+	-- SkillRange is the maximum valid range, not a reason to interrupt an active
+	-- approach. Casting while still outside the farm hold distance can make a
+	-- long animation repeatedly cancel translation (for example at 95 studs).
+	local castDistance = math.min(activeSkillRange, Config.PreferredCombatDistance)
+	if State == NavigationState.DODGE or not Target or not validTarget(Target) or distance3D > castDistance then
 		return
 	end
 	local now = os.clock()
@@ -2329,6 +2334,11 @@ local function updatePathNavigation()
 		PathIssuedIndex = 0
 		PathIssuedAt = 0
 		ActiveWaypointIssueSerial = 0
+		-- The next waypoint is a new navigation objective; do not carry the old
+		-- waypoint's distance into the global no-progress watchdog.
+		RuntimeState.JumpStillSince = os.clock()
+		RuntimeState.JumpBestDistance = math.huge
+		RuntimeState.JumpBestVertical = math.huge
 		if advanced then
 			markMeaningfulProgress()
 		end
@@ -2838,7 +2848,20 @@ recoverByRespawn = function(
 			return
 		end
 		ResetExecuting = true
-		resetNavigationForTarget(nil)
+		-- Keep a living target across a forced character reset. Clearing it here
+		-- made CharacterAdded wait for normal acquisition after replay.
+		local retainedTarget = if validTarget(Target) then Target else nil
+		if retainedTarget then
+			cancelPathRequest()
+			GoalTarget = nil
+			NavigationGoal = nil
+			RecoveryGoal = nil
+			RecoveryUntil = 0
+			resetProgress(retainedTarget, nil)
+			setNavigationState(NavigationState.IDLE)
+		else
+			resetNavigationForTarget(nil)
+		end
 		-- Roblox Reset Character sequence. R resets; L would select Leave Game.
 		local resetCharacter = Character
 		for _, key in ipairs({ Enum.KeyCode.Escape, Enum.KeyCode.R, Enum.KeyCode.Return, Enum.KeyCode.Return }) do
@@ -3097,6 +3120,16 @@ local function bindCharacter(character: Model)
 	clearAimObjects()
 	restoreMovementSpeed()
 	cancelPathRequest()
+	-- A replay/reset can recreate PlayerModule controls while the old control
+	-- object is still marked disabled. Re-resolve it for the new character.
+	if PlayerControlsDisabled and PlayerControls then
+		pcall(function()
+			PlayerControls:Enable()
+		end)
+	end
+	PlayerControls = nil
+	PlayerControlsDisabled = false
+	PlayerControlsResolvePending = false
 	Character = character
 	Humanoid = newHumanoid
 	Root = newRoot
