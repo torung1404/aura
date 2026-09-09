@@ -1913,11 +1913,9 @@ local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 	if os.clock() < RuntimeState.RespawnRushUntil then
 		return
 	end
-	-- SkillRange is the maximum valid range, not a reason to interrupt an active
-	-- approach. Casting while still outside the farm hold distance can make a
-	-- long animation repeatedly cancel translation (for example at 95 studs).
-	local castDistance = math.min(activeSkillRange, Config.PreferredCombatDistance)
-	if State == NavigationState.DODGE or not Target or not validTarget(Target) or distance3D > castDistance then
+	-- Skill range is independent from the hold distance: cast as soon as a valid
+	-- target enters Q/E range, including while the controller is approaching.
+	if State == NavigationState.DODGE or not Target or not validTarget(Target) or distance3D > activeSkillRange then
 		return
 	end
 	local now = os.clock()
