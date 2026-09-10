@@ -597,8 +597,15 @@ local function registerHazard(instance: Instance)
 	end
 end
 
-local function buildInitialCaches()
-	for _, object in ipairs(workspace:GetDescendants()) do
+local function buildInitialCaches(cacheRoot: Instance?)
+	-- A confirmed enemy folder is both cheaper and safer than re-walking an
+	-- entire replayed map. The workspace fallback remains for games that do
+	-- not expose such a folder yet.
+	local source = cacheRoot
+	if not source or not source:IsDescendantOf(workspace) then
+		source = workspace
+	end
+	for _, object in ipairs(source:GetDescendants()) do
 		if object:IsA("Model") then
 			registerEnemy(object)
 		elseif Config.DodgeEnabled and object:IsA("BasePart") then
@@ -2296,8 +2303,8 @@ local function updatePathNavigation()
 		return
 	end
 	if PathNeedsRebuild then
+		cancelPathRequest()
 		beginLocalRecovery(NavigationGoal or Root.Position)
-		requestPath(NavigationGoal or Root.Position)
 		return
 	end
 	local waypoint = PathWaypoints[PathIndex]
@@ -2410,6 +2417,9 @@ local function updateRecoveryMovement()
 		end
 	end
 	Humanoid:Move(Vector3.zero, false)
+	-- A recovery detour must own movement long enough to get clear of the
+	-- blocking BasicPart. Rebuilding immediately here used to publish a new PATH
+	-- before the character had physically left the same blocked edge.
 	if State ~= NavigationState.RETREAT and not PathComputing and NavigationGoal then
 		requestPath(NavigationGoal)
 	end
@@ -2461,8 +2471,8 @@ local function decideNavigation()
 		-- a full STEER interval made the controller repeatedly resume DIRECT into the
 		-- same basic Part, producing bursty stop/start movement at walls and corners.
 		SteeringTried = true
+		cancelPathRequest()
 		beginLocalRecovery(NavigationGoal)
-		requestPath(NavigationGoal)
 	end
 end
 
@@ -2617,7 +2627,15 @@ resetRuntimeForNewDungeon = function()
 		if not Enabled or not Running or resetSerial ~= RuntimeState.RoundResetSerial then
 			return
 		end
-		buildInitialCaches()
+		RuntimeState.refreshDungeonReferences()
+		local enemyFolder = RuntimeState.EnemyFolderInstance
+		-- Do not repeatedly full-scan while the new map is still constructing.
+		-- DescendantAdded keeps the cache warm; this is the bounded catch-up pass
+		-- once the new dungeon has supplied its own enemy container.
+		if not enemyFolder or not enemyFolder:IsDescendantOf(workspace) then
+			return
+		end
+		buildInitialCaches(enemyFolder)
 		LastTargetAcquireAt = -math.huge
 		if alive() and not Target then
 			local acquired = acquireBestTarget()
@@ -2627,10 +2645,11 @@ resetRuntimeForNewDungeon = function()
 			end
 		end
 	end
-	-- The first pass catches fast map loads. The one follow-up pass catches
-	-- dungeons whose enemy models appear after the replay UI has already closed.
+	-- The bounded passes catch both fast and late dungeon construction without
+	-- performing an unbounded workspace scan every frame.
 	task.delay(0.4, refreshRoundTargets)
 	task.delay(1.5, refreshRoundTargets)
+	task.delay(3, refreshRoundTargets)
 end
 
 local function leaveDodge()
@@ -2755,7 +2774,8 @@ local function runRecoveryPolicy()
 		or State == NavigationState.PATH
 		or State == NavigationState.RECOVERY
 		or State == NavigationState.STEER
-	if translating and Root then
+	local noMeaningfulProgressFor = now - LastMeaningfulProgressAt
+	if translating and Root and noMeaningfulProgressFor >= Config.SlowMovementRepathDelay then
 		local velocity = Root.AssemblyLinearVelocity
 		local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
 		if horizontalSpeed < Config.SlowMovementSpeedThreshold then
@@ -2767,7 +2787,6 @@ local function runRecoveryPolicy()
 				LastLowSpeedPathRetryAt = now
 				cancelPathRequest()
 				beginLocalRecovery(NavigationGoal)
-				requestPath(NavigationGoal)
 				return
 			end
 		else
@@ -2789,7 +2808,6 @@ local function runRecoveryPolicy()
 		LastStuckPathRetryAt = now
 		cancelPathRequest()
 		beginLocalRecovery(NavigationGoal)
-		requestPath(NavigationGoal)
 		return
 	end
 end
@@ -3336,7 +3354,23 @@ RuntimeState.sendStatusWebhook("SCRIPT_STARTED")
 table.insert(
 	Connections,
 	workspace.DescendantAdded:Connect(function(instance)
-		registerEnemy(instance)
+		-- Map/VFX BasicParts can arrive in large bursts after Replay. Enemy
+		-- registration only needs a Model (or its Humanoid once it is populated),
+		-- so do not walk ancestors for every decorative part in the dungeon.
+		if instance:IsA("Model") then
+			task.defer(function()
+				if Enabled and instance:IsDescendantOf(workspace) then
+					registerEnemy(instance)
+				end
+			end)
+		elseif instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
+			local model = instance.Parent
+			task.defer(function()
+				if Enabled and model:IsDescendantOf(workspace) then
+					registerEnemy(model)
+				end
+			end)
+		end
 		if Config.DodgeEnabled then
 			registerHazard(instance)
 		end
