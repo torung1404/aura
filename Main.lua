@@ -71,7 +71,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 15,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = false, -- Temporarily disabled; retain the controller and settings for later re-enable.
+	DodgeEnabled = true,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -558,6 +558,11 @@ local function hazardNameHint(part: BasePart): boolean
 			or lowerName:find("telegraph", 1, true)
 			or lowerName:find("indicator", 1, true)
 			or lowerName:find("hitbox", 1, true)
+			or lowerName:find("precast", 1, true)
+			or lowerName:find("damagebox", 1, true)
+			or lowerName:find("damagepart", 1, true)
+			or lowerName:find("attack", 1, true)
+			or lowerName:find("skill", 1, true)
 		then
 			return true
 		end
@@ -567,35 +572,47 @@ local function hazardNameHint(part: BasePart): boolean
 end
 
 local function isHazardCandidate(part: BasePart): boolean
-	if Character and part:IsDescendantOf(Character) then
+	if not part:IsDescendantOf(workspace) or (Character and part:IsDescendantOf(Character)) then
 		return false
 	end
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
 	local broadAndThin = dimensions[1] <= 5 and dimensions[2] >= 5 and dimensions[3] >= 5
-	return hazardNameHint(part)
-		or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
-		or (part:IsA("MeshPart") and broadAndThin)
+	local color = part.Color
+	local visiblyRed = color.R >= 0.65 and color.R >= color.G * 1.35 and color.R >= color.B * 1.2
+	local effectGeometry = broadAndThin
+		or not part.CanCollide
+		or part.AssemblyLinearVelocity.Magnitude >= 1
+		or (part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball))
+	return (hazardNameHint(part) and effectGeometry)
+		or (visiblyRed and broadAndThin)
+		or (visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
 end
 
-local function isRedHazardPart(part: BasePart): boolean
+local function isActiveHazardPart(part: BasePart): boolean
 	if not part:IsDescendantOf(workspace) or (Character and part:IsDescendantOf(Character)) then
+		return false
+	end
+	if part.Transparency >= 0.98 or part.Size.X <= 0.05 or part.Size.Y <= 0.05 or part.Size.Z <= 0.05 then
 		return false
 	end
 	local color = part.Color
 	local visiblyRed = color.R >= 0.65 and color.R >= color.G * 1.35 and color.R >= color.B * 1.2
-	if not visiblyRed or part.Transparency >= 0.98 then
-		return false
-	end
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
 	local broadAndThin = dimensions[1] <= 5 and dimensions[2] >= 5 and dimensions[3] >= 5
-	return hazardNameHint(part) or broadAndThin
+	local effectGeometry = broadAndThin
+		or not part.CanCollide
+		or part.AssemblyLinearVelocity.Magnitude >= 1
+		or (part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball))
+	return (hazardNameHint(part) and effectGeometry)
+		or (visiblyRed and broadAndThin)
+		or (visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
 end
 
 local function registerHazard(instance: Instance)
 	-- Cache structural candidates, not only parts that happen to be red at creation time.
-	if instance:IsA("BasePart") and (isHazardCandidate(instance) or isRedHazardPart(instance)) then
+	if instance:IsA("BasePart") and isHazardCandidate(instance) then
 		HazardSet[instance] = true
 	end
 end
@@ -633,9 +650,63 @@ local function hazardVerticalHalfExtent(part: BasePart): number
 		+ math.abs(part.CFrame.LookVector:Dot(worldUp)) * part.Size.Z * 0.5
 end
 
-local function hazardThreatensHeight(part: BasePart, position: Vector3): boolean
-	return math.abs(position.Y - part.Position.Y)
+local function hazardThreatensHeight(part: BasePart, position: Vector3, lookaheadSeconds: number?): boolean
+	local predictedPosition = part.Position + part.AssemblyLinearVelocity * (lookaheadSeconds or 0)
+	return math.abs(position.Y - predictedPosition.Y)
 		<= hazardVerticalHalfExtent(part) + rootGroundOffset() + Config.DodgeVerticalPadding
+end
+
+RuntimeState.hazardIsPrecast = function(part: BasePart): boolean
+	local current: Instance? = part
+	while current and current ~= workspace do
+		local name = current.Name:lower()
+		if
+			name:find("precast", 1, true)
+			or name:find("telegraph", 1, true)
+			or name:find("indicator", 1, true)
+			or name:find("warning", 1, true)
+		then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+RuntimeState.hazardEdgeDistance = function(part: BasePart, position: Vector3, lookaheadSeconds: number?): number
+	local futureCFrame = part.CFrame + part.AssemblyLinearVelocity * (lookaheadSeconds or 0)
+	local half = part.Size * 0.5
+	if part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball) then
+		local radiusX = math.abs(futureCFrame.RightVector.X) * half.X
+			+ math.abs(futureCFrame.UpVector.X) * half.Y
+			+ math.abs(futureCFrame.LookVector.X) * half.Z
+		local radiusZ = math.abs(futureCFrame.RightVector.Z) * half.X
+			+ math.abs(futureCFrame.UpVector.Z) * half.Y
+			+ math.abs(futureCFrame.LookVector.Z) * half.Z
+		return flatPointDistance(position, futureCFrame.Position) - math.max(radiusX, radiusZ)
+	end
+	local localPoint = futureCFrame:PointToObjectSpace(Vector3.new(position.X, futureCFrame.Position.Y, position.Z))
+	local outsideX = math.abs(localPoint.X) - half.X
+	local outsideZ = math.abs(localPoint.Z) - half.Z
+	if outsideX <= 0 and outsideZ <= 0 then
+		return -math.min(-outsideX, -outsideZ)
+	end
+	return Vector2.new(math.max(0, outsideX), math.max(0, outsideZ)).Magnitude
+end
+
+RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3): number
+	local minimum = math.huge
+	for index = 0, 4 do
+		local alpha = index / 4
+		local point = first:Lerp(second, alpha)
+		if hazardThreatensHeight(part, point, Config.DodgeLookaheadSeconds * alpha) then
+			minimum = math.min(
+				minimum,
+				RuntimeState.hazardEdgeDistance(part, point, Config.DodgeLookaheadSeconds * alpha)
+			)
+		end
+	end
+	return minimum
 end
 
 local function playerFootprintRadius(): number
@@ -665,7 +736,13 @@ local function refreshNearbyActiveHazards()
 	overlap.FilterDescendantsInstances = Character and { Character } or {}
 	overlap.MaxParts = 100
 	for _, part in ipairs(workspace:GetPartBoundsInRadius(Root.Position, Config.DodgeDetectionRadius, overlap)) do
-		if isRedHazardPart(part) and hazardThreatensHeight(part, Root.Position) then
+		if
+			isActiveHazardPart(part)
+			and (
+				hazardThreatensHeight(part, Root.Position)
+				or hazardThreatensHeight(part, Root.Position, Config.DodgeLookaheadSeconds)
+			)
+		then
 			NearbyActiveHazards[part] = true
 			HazardSet[part] = true
 		end
@@ -676,8 +753,11 @@ local function refreshNearbyActiveHazards()
 			HazardSet[part] = nil
 		elseif
 			(part.Position - Root.Position).Magnitude <= Config.DodgeDetectionRadius + hazardRadius(part)
-			and isRedHazardPart(part)
-			and hazardThreatensHeight(part, Root.Position)
+			and isActiveHazardPart(part)
+			and (
+				hazardThreatensHeight(part, Root.Position)
+				or hazardThreatensHeight(part, Root.Position, Config.DodgeLookaheadSeconds)
+			)
 		then
 			NearbyActiveHazards[part] = true
 		end
@@ -691,10 +771,10 @@ local function pointIsSafeFromHazards(position: Vector3): boolean
 	for part in pairs(NearbyActiveHazards) do
 		if
 			part:IsDescendantOf(workspace)
-			and isRedHazardPart(part)
-			and hazardThreatensHeight(part, position)
-			and flatPointDistance(position, part.Position)
-				<= hazardRadius(part) + playerFootprintRadius() + Config.DodgeSafePadding
+			and isActiveHazardPart(part)
+			and hazardThreatensHeight(part, position, Config.DodgeLookaheadSeconds)
+			and RuntimeState.hazardEdgeDistance(part, position, Config.DodgeLookaheadSeconds)
+				<= playerFootprintRadius() + Config.DodgeSafePadding
 		then
 			return false
 		end
@@ -721,17 +801,6 @@ local function upcomingMovementGoal(): Vector3?
 	return Root.Position
 end
 
-local function segmentDistanceXZ(point: Vector3, first: Vector3, second: Vector3): number
-	local segment = Vector2.new(second.X - first.X, second.Z - first.Z)
-	local relative = Vector2.new(point.X - first.X, point.Z - first.Z)
-	local denominator = segment:Dot(segment)
-	if denominator <= 0.001 then
-		return relative.Magnitude
-	end
-	local alpha = math.clamp(relative:Dot(segment) / denominator, 0, 1)
-	return (relative - segment * alpha).Magnitude
-end
-
 local function threateningHazard(): (BasePart?, boolean, number, number)
 	if not Root then
 		return nil, false, math.huge, math.huge
@@ -753,22 +822,26 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 		end
 	end
 	for part in pairs(NearbyActiveHazards) do
-		if part:IsDescendantOf(workspace) and isRedHazardPart(part) and hazardThreatensHeight(part, Root.Position) then
-			local centerDistance = flatPointDistance(Root.Position, part.Position)
-			if centerDistance <= Config.DodgeDetectionRadius then
-				local effectiveRadius = hazardRadius(part) + footprint
-				local edgeDistance = centerDistance - effectiveRadius
-				local routeDistance = segmentDistanceXZ(part.Position, Root.Position, predictedEnd)
-				local routeClearance = routeDistance - effectiveRadius
-				local predicted = routeClearance <= Config.DodgePreTriggerPadding
-				local threatScore = math.min(edgeDistance, routeClearance)
-				if (edgeDistance <= Config.DodgeTriggerPadding or predicted) and threatScore < bestThreatScore then
-					bestThreatScore = threatScore
-					nearestEdge = edgeDistance
-					nearest = part
-					nearestPredicted = predicted
-					nearestRouteDistance = routeDistance
-				end
+		if part:IsDescendantOf(workspace) and isActiveHazardPart(part) then
+			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0) - footprint
+			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, predictedEnd) - footprint
+			local triggerPadding = if RuntimeState.hazardIsPrecast(part)
+				then Config.DodgePreTriggerPadding
+				else Config.DodgeTriggerPadding
+			local predicted = routeClearance <= triggerPadding
+			local retainingActiveDodge = State == NavigationState.DODGE
+				and edgeDistance <= Config.DodgeSafePadding
+			local threatScore = math.min(edgeDistance, routeClearance)
+			if
+				edgeDistance <= Config.DodgeDetectionRadius
+				and (edgeDistance <= triggerPadding or predicted or retainingActiveDodge)
+				and threatScore < bestThreatScore
+			then
+				bestThreatScore = threatScore
+				nearestEdge = edgeDistance
+				nearest = part
+				nearestPredicted = predicted
+				nearestRouteDistance = routeClearance
 			end
 		end
 	end
@@ -790,22 +863,33 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	if obstacle and obstacle.Distance < flatDelta.Magnitude - 1.5 then
 		return false
 	end
+	local footprint = playerFootprintRadius()
+	local previousClearances: { [BasePart]: number } = {}
+	for hazard in pairs(NearbyActiveHazards) do
+		if isActiveHazardPart(hazard) then
+			previousClearances[hazard] = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0) - footprint
+		end
+	end
 	local previous = Root.Position
-	for index = 1, math.max(3, math.ceil(flatDelta.Magnitude / 3)) do
-		local count = math.max(3, math.ceil(flatDelta.Magnitude / 3))
+	local count = math.max(3, math.ceil(flatDelta.Magnitude / 3))
+	for index = 1, count do
 		local grounded, found = projectToWalkableGround(Root.Position:Lerp(goal, index / count), Target)
 		if not found or math.abs(grounded.Y - previous.Y) > Config.ExploreMaxVerticalStep then
 			return false
 		end
 		for hazard in pairs(NearbyActiveHazards) do
-			if isRedHazardPart(hazard) and hazardThreatensHeight(hazard, grounded) then
-				local startDistance = flatPointDistance(Root.Position, hazard.Position)
-				local radius = hazardRadius(hazard) + playerFootprintRadius()
-				local sampleDistance = flatPointDistance(grounded, hazard.Position)
-				-- Leaving an overlapping hazard is allowed, crossing a new one is not.
-				if sampleDistance < math.min(radius, startDistance) - 0.1 then
+			if isActiveHazardPart(hazard) and hazardThreatensHeight(hazard, grounded) then
+				local clearance = RuntimeState.hazardEdgeDistance(hazard, grounded, 0) - footprint
+				local prior = previousClearances[hazard] or math.huge
+				-- Leaving an overlapping hazard is allowed, but the route may not
+				-- move deeper into it or cross a different unsafe footprint.
+				if
+					(prior <= Config.DodgeSafePadding and clearance < prior - 0.1)
+					or (prior > Config.DodgeSafePadding and clearance <= Config.DodgeSafePadding)
+				then
 					return false
 				end
+				previousClearances[hazard] = clearance
 			end
 		end
 		previous = grounded
@@ -820,12 +904,18 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 	local fromCenter = Vector3.new(Root.Position.X - hazard.Position.X, 0, Root.Position.Z - hazard.Position.Z)
 	local baseAngle = fromCenter.Magnitude > 0.1 and math.atan2(fromCenter.Z, fromCenter.X) or 0
 	local bestGoal: Vector3? = nil
-	local bestDistance = math.huge
+	local bestScore = -math.huge
 	local footprint = playerFootprintRadius()
-	local ringDistances = { footprint + 3, footprint + 7, footprint + 12 }
+	local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0) - footprint
+	local escapeDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
+	local ringDistances = { escapeDistance, escapeDistance + 5, escapeDistance + 10 }
 	for ringIndex, ringDistance in ipairs(ringDistances) do
 		for angleIndex = 0, Config.DodgeCandidateCount - 1 do
-			local angle = baseAngle + angleIndex * math.pi * 2 / Config.DodgeCandidateCount
+			local offsetIndex = 0
+			if angleIndex > 0 then
+				offsetIndex = if angleIndex % 2 == 1 then (angleIndex + 1) / 2 else -angleIndex / 2
+			end
+			local angle = baseAngle + offsetIndex * math.pi * 2 / Config.DodgeCandidateCount
 			local candidate = Root.Position
 				+ Vector3.new(math.cos(angle) * ringDistance, 0, math.sin(angle) * ringDistance)
 			local grounded, foundGround = projectToWalkableGround(candidate, nil)
@@ -837,8 +927,22 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 				else nil
 			if not rejection then
 				local distance = flatPointDistance(Root.Position, grounded)
-				if not bestGoal or distance < bestDistance then
-					bestDistance = distance
+				local minimumSafety = math.huge
+				for otherHazard in pairs(NearbyActiveHazards) do
+					if isActiveHazardPart(otherHazard) and hazardThreatensHeight(otherHazard, grounded) then
+						minimumSafety = math.min(
+							minimumSafety,
+							RuntimeState.hazardEdgeDistance(otherHazard, grounded, Config.DodgeLookaheadSeconds)
+								- footprint
+						)
+					end
+				end
+				local awayDirection = Vector3.new(math.cos(baseAngle), 0, math.sin(baseAngle))
+				local candidateDirection = Vector3.new(grounded.X - Root.Position.X, 0, grounded.Z - Root.Position.Z)
+				local awayBias = candidateDirection.Magnitude > 0.1 and awayDirection:Dot(candidateDirection.Unit) or 0
+				local score = math.min(minimumSafety, 40) * 4 - distance + awayBias * 3
+				if not bestGoal or score > bestScore then
+					bestScore = score
 					bestGoal = grounded
 				end
 			else
@@ -2709,10 +2813,21 @@ local function updateDodgeController(): boolean
 	end
 	LastHazardThreatAt = os.clock()
 
-	local needsNewGoal = State ~= NavigationState.DODGE
-		or ActiveHazard ~= hazard
-		or not DodgeGoal
-		or not pointIsSafeFromHazards(DodgeGoal)
+	local goalUnsafe = not DodgeGoal or not pointIsSafeFromHazards(DodgeGoal)
+	if
+		not goalUnsafe
+		and State == NavigationState.DODGE
+		and ActiveHazard ~= hazard
+		and DodgeGoal
+	then
+		goalUnsafe = not dodgeRouteClear(DodgeGoal)
+		if not goalUnsafe then
+			-- A newly detected hazard does not force a left/right flip when the
+			-- committed goal and its route are still safe.
+			ActiveHazard = hazard
+		end
+	end
+	local needsNewGoal = State ~= NavigationState.DODGE or goalUnsafe
 	if needsNewGoal then
 		if State ~= NavigationState.DODGE then
 			DodgeStartedAt = os.clock()
@@ -2747,7 +2862,10 @@ local function updateDodgeController(): boolean
 			if outward.Magnitude <= 0.1 then
 				outward = Vector3.new(1, 0, 0)
 			end
-			local fallback = hazard.Position + outward.Unit * (hazardRadius(hazard) + Config.DodgeSafePadding + 1)
+			local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0)
+				- playerFootprintRadius()
+			local fallbackDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
+			local fallback = Root.Position + outward.Unit * fallbackDistance
 			fallback = Vector3.new(fallback.X, Root.Position.Y, fallback.Z)
 			local grounded, foundGround = projectToWalkableGround(fallback, nil)
 			if
