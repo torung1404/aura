@@ -160,6 +160,9 @@ for key, defaultValue in pairs(DEFAULT_CONFIG) do
 	end
 end
 Config.RespawnStuckTime = 15
+-- Existing config files may have persisted the temporary Dodge OFF setting.
+-- This release explicitly re-enables Dodge after saved values are restored.
+Config.DodgeEnabled = true
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 98
