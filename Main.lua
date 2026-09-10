@@ -3583,6 +3583,11 @@ table.insert(
 				or instantFPS
 		end
 		local now = os.clock()
+		-- Keep the requested Dodge ON state even if a stale getgenv/config writer
+		-- changes it after startup. This does not add a scan or movement command.
+		if Config.DodgeEnabled ~= true then
+			Config.DodgeEnabled = true
+		end
 		if now - RuntimeState.LastStatsSampleAt >= 1 then
 			RuntimeState.LastStatsSampleAt = now
 			pcall(function()
