@@ -112,7 +112,10 @@ local NavigationState = {
 
 local Environment = (getgenv and getgenv()) or _G
 if type(Environment.AutoFarmV21Shutdown) == "function" then
-	pcall(Environment.AutoFarmV21Shutdown)
+	local shutdownOk, shutdownError = pcall(Environment.AutoFarmV21Shutdown)
+	if not shutdownOk then
+		warn("[AF ERROR] previous shutdown: " .. tostring(shutdownError))
+	end
 end
 
 local CONFIG_FILE = "AutoFarmV21Config.json"
@@ -145,38 +148,27 @@ for key, value in pairs(DEFAULT_CONFIG) do
 	end
 end
 
-for _, key in ipairs({ "FarmRange", "MovementSpeedMultiplier" }) do
-	if tonumber(SavedConfig[key]) then
-		Config[key] = tonumber(SavedConfig[key])
+-- Keep user settings across source upgrades. Values with the wrong type are
+-- ignored and the current default remains in place.
+for key, defaultValue in pairs(DEFAULT_CONFIG) do
+	local savedValue = SavedConfig[key]
+	if savedValue ~= nil and type(savedValue) == type(defaultValue) then
+		Config[key] = savedValue
 	end
 end
 Config.RespawnStuckTime = 15
--- Preserve the user's current speed setting; it is applied once when farming starts.
-Config.MovementSpeedMultiplier = DEFAULT_CONFIG.MovementSpeedMultiplier
 Config.ApproachDistance = nil
-Config.TargetAcquireInterval = DEFAULT_CONFIG.TargetAcquireInterval
-Config.PreferredCombatDistance = DEFAULT_CONFIG.PreferredCombatDistance
-Config.RetreatEnterDistance = DEFAULT_CONFIG.RetreatEnterDistance
-Config.RetreatExitDistance = DEFAULT_CONFIG.RetreatExitDistance
-Config.AutoReplay = true
-Config.KiteDistance = DEFAULT_CONFIG.KiteDistance
+-- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 98
 Config.BossSkillRange = 100
 Config.SkillRange = nil
-Config.AttackRange = 15
-Config.UseTool = false
-Config.DodgeEnabled = false
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
--- This build uses the tuning above as authoritative; an older local JSON must
--- not silently restore the previous 700-stud range.
-Config.FarmRange = DEFAULT_CONFIG.FarmRange
 if type(SavedConfig.FarmEnabled) == "boolean" then
 	Config.FarmEnabled = SavedConfig.FarmEnabled
 end
 
 -- Clear obsolete settings retained by getgenv from older V21 runs.
-Config.AutoStart = false
 Config.CombatDistance = nil
 Config.RetreatDistance = nil
 Config.StuckDistance = nil
@@ -198,20 +190,17 @@ local function saveConfig()
 		return
 	end
 	pcall(function()
-		writefile(
-			CONFIG_FILE,
-			HttpService:JSONEncode({
-				FarmEnabled = Config.FarmEnabled == true,
-				AutoReplay = Config.AutoReplay == true,
-				FarmRange = Config.FarmRange,
-				PreferredCombatDistance = Config.PreferredCombatDistance,
-				AutoStart = Config.AutoStart,
-				AttackRange = Config.AttackRange,
-				NormalSkillRange = Config.NormalSkillRange,
-				BossSkillRange = Config.BossSkillRange,
-				MovementSpeedMultiplier = Config.MovementSpeedMultiplier,
-			})
-		)
+		local persisted = {}
+		for key, defaultValue in pairs(DEFAULT_CONFIG) do
+			local value = Config[key]
+			if type(value) == type(defaultValue) then
+				persisted[key] = value
+			end
+		end
+		persisted.FarmEnabled = Config.FarmEnabled == true
+		persisted.NormalSkillRange = 98
+		persisted.BossSkillRange = 100
+		writefile(CONFIG_FILE, HttpService:JSONEncode(persisted))
 	end)
 end
 
