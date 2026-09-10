@@ -20,6 +20,9 @@ local DEFAULT_CONFIG = {
 	IgnoredTargetKeywords = { "ancient spirit" },
 	BossKeywords = { "boss", "protector" },
 	FarmRange = 500,
+	-- A nearby enemy is safer to engage than a distant locked target. This is a
+	-- target-selection priority only; it does not change Q/E skill range.
+	TargetPriorityRange = 80,
 	TargetAcquireInterval = 1,
 	GoalRefreshInterval = 0.15,
 	TargetLockRangeMultiplier = 1.25,
@@ -1138,6 +1141,11 @@ local function acquireBestTarget(): Model?
 		end
 	end
 	table.sort(cheapCandidates, function(first, second)
+		local firstNearby = first.Distance <= Config.TargetPriorityRange
+		local secondNearby = second.Distance <= Config.TargetPriorityRange
+		if firstNearby ~= secondNearby then
+			return firstNearby
+		end
 		return first.Distance < second.Distance
 	end)
 	local best = cheapCandidates[1]
@@ -1145,8 +1153,12 @@ local function acquireBestTarget(): Model?
 		return nil
 	end
 	local nearestDistance = best.Distance
+	local bestIsNearby = nearestDistance <= Config.TargetPriorityRange
 	for index = 2, #cheapCandidates do
 		local candidate = cheapCandidates[index]
+		if bestIsNearby and candidate.Distance > Config.TargetPriorityRange then
+			break
+		end
 		if candidate.Distance - nearestDistance > 5 then
 			break
 		end
@@ -3008,7 +3020,16 @@ local function updateTargetAndObjective()
 		local candidate = acquireBestTarget()
 		local _, currentDistance = targetMetrics(Target)
 		local _, candidateDistance = targetMetrics(candidate)
-		if candidate and candidate ~= Target and candidateDistance <= currentDistance - 10 then
+		local candidateIsNearby = candidateDistance <= Config.TargetPriorityRange
+		local currentIsNearby = currentDistance <= Config.TargetPriorityRange
+		if
+			candidate
+			and candidate ~= Target
+			and (
+				(candidateIsNearby and not currentIsNearby)
+				or candidateDistance <= currentDistance - 10
+			)
+		then
 			resetNavigationForTarget(candidate)
 			return
 		end
