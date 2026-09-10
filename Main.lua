@@ -30,7 +30,7 @@ local DEFAULT_CONFIG = {
 	RetreatEnterDistance = 70,
 	RetreatExitDistance = 75,
 	AttackRange = 15,
-	NormalSkillRange = 98,
+	NormalSkillRange = 80,
 	BossSkillRange = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
@@ -165,7 +165,7 @@ Config.RespawnStuckTime = 15
 Config.DodgeEnabled = true
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
-Config.NormalSkillRange = 98
+Config.NormalSkillRange = 80
 Config.BossSkillRange = 100
 Config.SkillRange = nil
 Config.WebhookEnabled = nil
@@ -204,7 +204,7 @@ local function saveConfig()
 			end
 		end
 		persisted.FarmEnabled = Config.FarmEnabled == true
-		persisted.NormalSkillRange = 98
+		persisted.NormalSkillRange = 80
 		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, HttpService:JSONEncode(persisted))
 	end)
@@ -457,7 +457,12 @@ local function isBossTarget(model: Model): boolean
 end
 
 local function skillRangeForTarget(target: Model): number
-	return isBossTarget(target) and Config.BossSkillRange or Config.NormalSkillRange
+	-- Only this named boss has the extended skill range. Other bosses use the
+	-- same normal range as regular enemies.
+	if string.lower(target.Name) == "ancient enchanted tree" then
+		return Config.BossSkillRange
+	end
+	return Config.NormalSkillRange
 end
 
 getTargetRoot = function(model: Model): BasePart?
