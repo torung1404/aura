@@ -71,7 +71,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 15,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = true,
+	DodgeEnabled = false,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -160,9 +160,8 @@ for key, defaultValue in pairs(DEFAULT_CONFIG) do
 	end
 end
 Config.RespawnStuckTime = 15
--- Existing config files may have persisted the temporary Dodge OFF setting.
--- This release explicitly re-enables Dodge after saved values are restored.
-Config.DodgeEnabled = true
+-- Keep Dodge disabled even when an older saved/getgenv config has it enabled.
+Config.DodgeEnabled = false
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 80
@@ -3588,10 +3587,9 @@ table.insert(
 				or instantFPS
 		end
 		local now = os.clock()
-		-- Keep the requested Dodge ON state even if a stale getgenv/config writer
-		-- changes it after startup. This does not add a scan or movement command.
-		if Config.DodgeEnabled ~= true then
-			Config.DodgeEnabled = true
+		-- Keep Dodge disabled even if stale runtime config changes it after startup.
+		if Config.DodgeEnabled ~= false then
+			Config.DodgeEnabled = false
 		end
 		if now - RuntimeState.LastStatsSampleAt >= 1 then
 			RuntimeState.LastStatsSampleAt = now
