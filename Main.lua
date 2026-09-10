@@ -456,9 +456,10 @@ local function isBossTarget(model: Model): boolean
 end
 
 local function skillRangeForTarget(target: Model): number
-	-- Only this named boss has the extended skill range. Other bosses use the
-	-- same normal range as regular enemies.
-	if string.lower(target.Name) == "ancient enchanted tree" then
+	-- Only these named bosses have the extended skill range. Other bosses use
+	-- the same normal range as regular enemies.
+	local targetName = string.lower(target.Name)
+	if targetName == "ancient enchanted tree" or targetName == "enchanted forest dragon" then
 		return Config.BossSkillRange
 	end
 	return Config.NormalSkillRange
