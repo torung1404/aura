@@ -341,6 +341,10 @@ local RuntimeState = {
 	RoundBootstrapAttempts = 0,
 	RoundBootstrapLastCacheAt = -math.huge,
 	LastStaleTarget = nil :: Model?,
+	CharacterBindRetryUntil = 0,
+	CharacterBindRetryPending = false,
+	CharacterBindRetryCharacter = nil :: Model?,
+	LastCharacterBindWait = "",
 	SmoothedFPS = 0,
 	HUDInfo = nil :: TextLabel?,
 	HUDButton = nil :: TextButton?,
@@ -3422,14 +3426,47 @@ end
 local function bindCharacter(character: Model)
 	CharacterBindSerial += 1
 	local serial = CharacterBindSerial
-	local newHumanoid = character:WaitForChild("Humanoid", 8)
-	local newRoot = character:WaitForChild("HumanoidRootPart", 8)
-	if not Enabled or serial ~= CharacterBindSerial or Player.Character ~= character then
+	local now = os.clock()
+	if RuntimeState.CharacterBindRetryUntil < now then
+		RuntimeState.CharacterBindRetryUntil = now + 8
+	end
+	local newHumanoid = character:FindFirstChildOfClass("Humanoid")
+	local newRoot = character:FindFirstChild("HumanoidRootPart")
+	if not isCurrentExecution() or serial ~= CharacterBindSerial or Player.Character ~= character then
 		return
 	end
 	if not newHumanoid or not newHumanoid:IsA("Humanoid") or not newRoot or not newRoot:IsA("BasePart") then
+		local missing = (not newHumanoid and "Humanoid" or "") .. (not newRoot and " HumanoidRootPart" or "")
+		if RuntimeState.LastCharacterBindWait ~= missing then
+			RuntimeState.LastCharacterBindWait = missing
+			print("[CHAR] bind waiting=" .. missing)
+		end
+		if now < RuntimeState.CharacterBindRetryUntil and not RuntimeState.CharacterBindRetryPending then
+			RuntimeState.CharacterBindRetryPending = true
+			RuntimeState.CharacterBindRetryCharacter = character
+			local executionGeneration = RuntimeState.Generation
+			task.delay(0.5, function()
+				if RuntimeState.CharacterBindRetryCharacter == character then
+					RuntimeState.CharacterBindRetryPending = false
+					RuntimeState.CharacterBindRetryCharacter = nil
+				end
+				if
+					isCurrentExecution()
+					and RuntimeState.Generation == executionGeneration
+					and Player.Character == character
+				then
+					bindCharacter(character)
+				end
+			end)
+		else
+			print("[CHAR] bind timeout")
+		end
 		return
 	end
+	RuntimeState.CharacterBindRetryUntil = 0
+	RuntimeState.CharacterBindRetryPending = false
+	RuntimeState.CharacterBindRetryCharacter = nil
+	RuntimeState.LastCharacterBindWait = ""
 	disconnectAll(CharacterConnections)
 	clearAimObjects()
 	restoreMovementSpeed()
@@ -3763,6 +3800,22 @@ table.insert(
 	Player.CharacterAdded:Connect(function(character)
 		local executionGeneration = RuntimeState.Generation
 		RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
+		RuntimeState.CharacterBindRetryUntil = os.clock() + 8
+		RuntimeState.CharacterBindRetryPending = false
+		RuntimeState.CharacterBindRetryCharacter = nil
+		RuntimeState.LastCharacterBindWait = ""
+		disconnectAll(CharacterConnections)
+		clearAimObjects()
+		restoreMovementSpeed()
+		cancelPathRequest()
+		Character = nil
+		Humanoid = nil
+		Root = nil
+		GoalTarget = nil
+		NavigationGoal = nil
+		RecoveryGoal = nil
+		RecoveryUntil = 0
+		setNavigationState(NavigationState.IDLE)
 		print("[CHAR] respawn")
 		task.defer(function()
 			if isCurrentExecution() and RuntimeState.Generation == executionGeneration then
@@ -3814,6 +3867,13 @@ table.insert(
 				local targetRoot = activeTarget and getTargetRoot(activeTarget)
 				local distance = targetRoot and Root and (targetRoot.Position - Root.Position).Magnitude
 				local height = targetRoot and Root and math.abs(targetRoot.Position.Y - Root.Position.Y)
+				local translating = State == NavigationState.DIRECT
+					or State == NavigationState.STEER
+					or State == NavigationState.RETREAT
+					or State == NavigationState.PATH
+					or State == NavigationState.RECOVERY
+					or State == NavigationState.EXPLORE
+				local stuckSeconds = if alive() and translating then math.max(0, now - RuntimeState.JumpStillSince) else 0
 				local targetName = activeTarget and (activeTarget.Name .. (isBossTarget(activeTarget) and " [BOSS]" or "")) or "None"
 				local replayLabel = if RuntimeState.ReplayPhase == "CONFIRMING"
 					then "CONFIRM"
@@ -3832,7 +3892,7 @@ table.insert(
 					RuntimeState.SmoothedFPS,
 					RuntimeState.PingMs,
 					(Config.MovementSpeedMultiplier - 1) * 100,
-					math.max(0, now - RuntimeState.JumpStillSince),
+					stuckSeconds,
 					Config.RespawnStuckTime
 				)
 				button.Text = Running and "DỪNG AUTO FARM" or "BẮT ĐẦU AUTO FARM"
