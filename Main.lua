@@ -8,6 +8,7 @@ local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local HttpService = game:GetService("HttpService")
 local GuiService = game:GetService("GuiService")
+local Stats = game:GetService("Stats")
 
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
@@ -335,6 +336,11 @@ local RuntimeState = {
 	LastHUDUpdateAt = -math.huge,
 	LastStatsSampleAt = -math.huge,
 	PingMs = 0,
+	RoundTransitionActive = false,
+	RoundBootstrapUntil = 0,
+	RoundBootstrapAttempts = 0,
+	RoundBootstrapLastCacheAt = -math.huge,
+	LastStaleTarget = nil :: Model?,
 	SmoothedFPS = 0,
 	HUDInfo = nil :: TextLabel?,
 	HUDButton = nil :: TextButton?,
@@ -358,6 +364,19 @@ local getTargetRoot
 
 local function isCurrentExecution(): boolean
 	return Enabled and Environment.AutoFarmV21Generation == RuntimeState.Generation
+end
+
+local function readPingMs(): number?
+	local ok, value = pcall(function()
+		local network = Stats.Network
+		local items = network and network.ServerStatsItem
+		local pingItem = items and items["Data Ping"]
+		return pingItem and pingItem:GetValue() or nil
+	end)
+	if ok and type(value) == "number" then
+		return math.floor(value + 0.5)
+	end
+	return nil
 end
 
 local function telemetry(event: string, message: string)
@@ -501,6 +520,7 @@ local function validTarget(target: Model?): boolean
 	local enemyRoot = getTargetRoot(target)
 	return enemyHumanoid ~= nil
 		and enemyRoot ~= nil
+		and enemyRoot:IsDescendantOf(workspace)
 		and enemyHumanoid.Health > 0
 		and (enemyRoot.Position - Root.Position).Magnitude <= Config.FarmRange * Config.TargetLockRangeMultiplier
 end
@@ -1222,7 +1242,13 @@ local function acquireBestTarget(): Model?
 		else
 			local enemyHumanoid = model:FindFirstChildOfClass("Humanoid")
 			local enemyRoot = getTargetRoot(model)
-			if not isIgnoredTarget(model) and enemyHumanoid and enemyRoot and enemyHumanoid.Health > 0 then
+			if
+				not isIgnoredTarget(model)
+				and enemyHumanoid
+				and enemyRoot
+				and enemyRoot:IsDescendantOf(workspace)
+				and enemyHumanoid.Health > 0
+			then
 				local delta = enemyRoot.Position - Root.Position
 				if delta.Magnitude <= Config.FarmRange then
 					table.insert(cheapCandidates, {
@@ -1231,6 +1257,8 @@ local function acquireBestTarget(): Model?
 						Distance = delta.Magnitude,
 					})
 				end
+			else
+				EnemySet[model] = nil
 			end
 		end
 	end
@@ -1245,7 +1273,13 @@ local function acquireBestTarget(): Model?
 			then
 				local enemyHumanoid = object:FindFirstChildOfClass("Humanoid")
 				local enemyRoot = getTargetRoot(object)
-				if not isIgnoredTarget(object) and enemyHumanoid and enemyRoot and enemyHumanoid.Health > 0 then
+				if
+					not isIgnoredTarget(object)
+					and enemyHumanoid
+					and enemyRoot
+					and enemyRoot:IsDescendantOf(workspace)
+					and enemyHumanoid.Health > 0
+				then
 					local delta = enemyRoot.Position - Root.Position
 					if delta.Magnitude <= Config.FarmRange then
 						table.insert(cheapCandidates, {
@@ -1300,6 +1334,12 @@ local function targetMetrics(target: Model?): (number, number)
 end
 
 local function updateGlobalStuckJump()
+	if RuntimeState.RoundTransitionActive then
+		RuntimeState.JumpStillSince = os.clock()
+		RuntimeState.JumpBestDistance = math.huge
+		RuntimeState.JumpBestVertical = math.huge
+		return
+	end
 	if not Running or not alive() or not Root or not Humanoid then
 		RuntimeState.JumpStillSince = os.clock()
 		RuntimeState.JumpBestDistance = math.huge
@@ -2638,6 +2678,10 @@ local function resetNavigationForTarget(newTarget: Model?)
 		RuntimeState.BossDiedTarget = nil
 	end
 	Target = newTarget
+	if newTarget then
+		RuntimeState.LastStaleTarget = nil
+		print("[TARGET] acquired=" .. newTarget.Name)
+	end
 	clearExploreObjective()
 	if newTarget then
 		telemetry("EXPLORE_TARGET", "target=" .. newTarget:GetFullName())
@@ -2690,7 +2734,11 @@ resetRuntimeForNewDungeon = function()
 	local resetSerial = RuntimeState.RoundResetSerial
 	local executionGeneration = RuntimeState.Generation
 	local now = os.clock()
-	print("[ROUND] new round")
+	print("[ROUND] transition=BEGIN")
+	RuntimeState.RoundTransitionActive = true
+	RuntimeState.RoundBootstrapUntil = now + 7
+	RuntimeState.RoundBootstrapAttempts = 0
+	RuntimeState.RoundBootstrapLastCacheAt = -math.huge
 	cancelPathRequest()
 	-- Clear the old target through its normal lifecycle so its death listener,
 	-- path and facing state cannot survive into the replayed dungeon.
@@ -2716,6 +2764,9 @@ resetRuntimeForNewDungeon = function()
 	BestVerticalDifference = math.huge
 	LastMeaningfulProgressAt = now
 	LastProgressCheckAt = 0
+	LastStuckPathRetryAt = -math.huge
+	LowSpeedSince = nil
+	LastLowSpeedPathRetryAt = -math.huge
 	LastDirectDecisionAt = 0
 	LastGoalRefreshAt = 0
 	LastPathBuildAt = -math.huge
@@ -2769,6 +2820,7 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.StartButton = nil
 	RuntimeState.StartDebugMarker = nil
 	RuntimeState.StartDebugButton = nil
+	RuntimeState.LastStaleTarget = nil
 	RuntimeState.LastStartMarkerScanAt = -math.huge
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
@@ -2781,15 +2833,26 @@ resetRuntimeForNewDungeon = function()
 		then
 			return
 		end
-		RuntimeState.refreshDungeonReferences()
-		local enemyFolder = RuntimeState.EnemyFolderInstance
-		-- Do not repeatedly full-scan while the new map is still constructing.
-		-- DescendantAdded keeps the cache warm; this is the bounded catch-up pass
-		-- once the new dungeon has supplied its own enemy container.
-		if not enemyFolder or not enemyFolder:IsDescendantOf(workspace) then
+		local attemptNow = os.clock()
+		if attemptNow >= RuntimeState.RoundBootstrapUntil then
+			RuntimeState.RoundTransitionActive = false
+			LastMeaningfulProgressAt = attemptNow
+			LowSpeedSince = nil
+			LastTargetAcquireAt = -math.huge
+			print("[ROUND] transition=END timeout")
 			return
 		end
-		buildInitialCaches(enemyFolder)
+		RuntimeState.RoundBootstrapAttempts += 1
+		print("[ROUND] bootstrap attempt=" .. tostring(RuntimeState.RoundBootstrapAttempts))
+		RuntimeState.refreshDungeonReferences()
+		local enemyFolder = RuntimeState.EnemyFolderInstance
+		local startMarker = cachedStartScreen()
+		if enemyFolder and enemyFolder:IsDescendantOf(workspace) and attemptNow - RuntimeState.RoundBootstrapLastCacheAt >= 1 then
+			-- The bounded cache refresh covers late enemy replication; events keep
+			-- additions warm between attempts without a workspace-wide frame scan.
+			RuntimeState.RoundBootstrapLastCacheAt = attemptNow
+			buildInitialCaches(enemyFolder)
+		end
 		LastTargetAcquireAt = -math.huge
 		if alive() and not Target then
 			local acquired = acquireBestTarget()
@@ -2798,12 +2861,18 @@ resetRuntimeForNewDungeon = function()
 				NoTargetSince = nil
 			end
 		end
+		if startMarker or (alive() and enemyFolder and enemyFolder:IsDescendantOf(workspace) and RuntimeState.RoundBootstrapLastCacheAt > -math.huge) then
+			RuntimeState.RoundTransitionActive = false
+			LastMeaningfulProgressAt = attemptNow
+			LowSpeedSince = nil
+			print("[ROUND] bootstrap=READY")
+			print("[ROUND] transition=END")
+			return
+		end
+		task.delay(0.5, refreshRoundTargets)
 	end
-	-- The bounded passes catch both fast and late dungeon construction without
-	-- performing an unbounded workspace scan every frame.
+	-- Bounded retry handles late replication without relying on fixed long waits.
 	task.delay(0.4, refreshRoundTargets)
-	task.delay(1.5, refreshRoundTargets)
-	task.delay(3, refreshRoundTargets)
 end
 
 local function leaveDodge()
@@ -2933,11 +3002,16 @@ local function updateDodgeController(): boolean
 end
 
 local function runRecoveryPolicy()
+	local now = os.clock()
+	if RuntimeState.RoundTransitionActive then
+		LastMeaningfulProgressAt = now
+		LowSpeedSince = nil
+		return
+	end
 	if not Target or not NavigationGoal or State == NavigationState.COMBAT then
 		LowSpeedSince = nil
 		return
 	end
-	local now = os.clock()
 	local translating = State == NavigationState.DIRECT
 		or State == NavigationState.PATH
 		or State == NavigationState.RECOVERY
@@ -2983,6 +3057,9 @@ end
 local function recoveryAbortReason(): string?
 	if not isCurrentExecution() then
 		return "shutdown"
+	end
+	if RuntimeState.RoundTransitionActive then
+		return "ROUND_TRANSITION"
 	end
 	if RuntimeState.ReplayPhase ~= "IDLE" then
 		return "replay=" .. RuntimeState.ReplayPhase
@@ -3131,6 +3208,16 @@ local function updateDungeonReplayState()
 	elseif RuntimeState.DungeonFinishedLastState then
 		-- The old value was destroyed during replay; wait for the recreated value before resetting.
 		RuntimeState.DungeonFinishedInstance = nil
+		if not RuntimeState.RoundTransitionActive then
+			RuntimeState.RoundTransitionActive = true
+			RuntimeState.RoundBootstrapUntil = now + 7
+			print("[ROUND] transition=BEGIN awaiting-new-state")
+		elseif now >= RuntimeState.RoundBootstrapUntil then
+			RuntimeState.RoundTransitionActive = false
+			LastMeaningfulProgressAt = now
+			LowSpeedSince = nil
+			print("[ROUND] transition=END timeout")
+		end
 	end
 	local remaining = RuntimeState.remainingDungeonTime()
 	if remaining and remaining <= 20 then
@@ -3150,19 +3237,29 @@ local function updateTargetAndObjective()
 		stopTranslation()
 		return
 	end
+	if RuntimeState.RoundTransitionActive then
+		LastMeaningfulProgressAt = now
+		LowSpeedSince = nil
+		setNavigationState(NavigationState.IDLE)
+		stopTranslation()
+		return
+	end
 	if not validTarget(Target) then
 		local invalidTarget = Target
-		if invalidTarget then
-			print("[TARGET] stale -> cleared")
+		if invalidTarget and RuntimeState.LastStaleTarget ~= invalidTarget then
+			RuntimeState.LastStaleTarget = invalidTarget
+			print("[TARGET] stale=" .. invalidTarget.Name .. " reason=invalid")
 		end
 		if invalidTarget or now - LastTargetAcquireAt >= Config.TargetAcquireInterval then
 			LastTargetAcquireAt = now
 			local acquired = acquireBestTarget()
 			if acquired then
 				resetNavigationForTarget(acquired)
+				RuntimeState.LastStaleTarget = nil
 				NoTargetSince = nil
 			elseif invalidTarget then
 				resetNavigationForTarget(nil)
+				LastTargetAcquireAt = -math.huge
 				NoTargetSince = now
 			end
 		end
@@ -3623,6 +3720,30 @@ table.insert(
 		if instance:IsA("Model") then
 			EnemySet[instance] = nil
 		end
+		local targetRoot = Target and getTargetRoot(Target)
+		if
+			Target
+			and (
+				Target == instance
+				or Target:IsDescendantOf(instance)
+				or targetRoot == instance
+			)
+		then
+			if RuntimeState.LastStaleTarget ~= Target then
+				RuntimeState.LastStaleTarget = Target
+				print("[TARGET] stale=" .. Target.Name .. " reason=removed")
+			end
+			resetNavigationForTarget(nil)
+			LastTargetAcquireAt = -math.huge
+		end
+		local activeRoot = RuntimeState.ActiveDungeonRoot
+		if activeRoot and (activeRoot == instance or activeRoot:IsDescendantOf(instance)) then
+			RuntimeState.ActiveDungeonRoot = nil
+			RuntimeState.EnemyFolderInstance = nil
+			RuntimeState.FightingBossInstance = nil
+			RuntimeState.DungeonTimeInstance = nil
+			RuntimeState.LastDungeonReferenceSearchAt = -math.huge
+		end
 		if instance:IsA("BasePart") then
 			HazardSet[instance] = nil
 		end
@@ -3675,11 +3796,13 @@ table.insert(
 		if Config.DodgeEnabled ~= false then
 			Config.DodgeEnabled = false
 		end
-		if now - RuntimeState.LastStatsSampleAt >= 1 then
+		if now - RuntimeState.LastStatsSampleAt >= 0.5 then
 			RuntimeState.LastStatsSampleAt = now
-			pcall(function()
-				RuntimeState.PingMs = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
-			end)
+			local pingMs = readPingMs()
+			if pingMs then
+				RuntimeState.PingMs = pingMs
+				telemetry("PING", tostring(pingMs))
+			end
 		end
 		updateDungeonReplayState()
 		if now - RuntimeState.LastHUDUpdateAt >= 0.2 then
@@ -3687,10 +3810,11 @@ table.insert(
 			local info = RuntimeState.HUDInfo
 			local button = RuntimeState.HUDButton
 			if info and info:IsDescendantOf(game) and button and button:IsDescendantOf(game) then
-				local targetRoot = Target and getTargetRoot(Target)
+				local activeTarget = if validTarget(Target) then Target else nil
+				local targetRoot = activeTarget and getTargetRoot(activeTarget)
 				local distance = targetRoot and Root and (targetRoot.Position - Root.Position).Magnitude
 				local height = targetRoot and Root and math.abs(targetRoot.Position.Y - Root.Position.Y)
-				local targetName = Target and (Target.Name .. (isBossTarget(Target) and " [BOSS]" or "")) or "None"
+				local targetName = activeTarget and (activeTarget.Name .. (isBossTarget(activeTarget) and " [BOSS]" or "")) or "None"
 				local replayLabel = if RuntimeState.ReplayPhase == "CONFIRMING"
 					then "CONFIRM"
 					elseif RuntimeState.ReplayPhase == "WAIT_NEW_ROUND" then "WAIT ROUND"
@@ -3701,7 +3825,7 @@ table.insert(
 					targetName,
 					distance and string.format("%.1f", distance) or "--",
 					height and string.format("%.1f", height) or "--",
-					Target and skillRangeForTarget(Target) or Config.NormalSkillRange,
+					activeTarget and skillRangeForTarget(activeTarget) or Config.NormalSkillRange,
 					Config.KiteDistance,
 					Config.DodgeEnabled and (State == NavigationState.DODGE and "ACTIVE" or "READY") or "OFF",
 					replayLabel,
