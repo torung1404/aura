@@ -114,6 +114,7 @@ local NavigationState = {
 }
 
 local Environment = (getgenv and getgenv()) or _G
+Environment.AutoFarmV21Generation = (tonumber(Environment.AutoFarmV21Generation) or 0) + 1
 if type(Environment.AutoFarmV21Shutdown) == "function" then
 	local shutdownOk, shutdownError = pcall(Environment.AutoFarmV21Shutdown)
 	if not shutdownOk then
@@ -293,6 +294,7 @@ local ExploredCells: { [string]: boolean } = {}
 local ExploredCellOrder: { string } = {}
 local LastTelemetry: { [string]: string } = {}
 local RuntimeState = {
+	Generation = Environment.AutoFarmV21Generation,
 	JumpStillSince = os.clock(),
 	JumpBestDistance = math.huge,
 	JumpBestVertical = math.huge,
@@ -353,6 +355,10 @@ local setNavigationState
 local stopTranslation
 local resetRuntimeForNewDungeon
 local getTargetRoot
+
+local function isCurrentExecution(): boolean
+	return Enabled and Environment.AutoFarmV21Generation == RuntimeState.Generation
+end
 
 local function telemetry(event: string, message: string)
 	if not Config.DebugTelemetry or LastTelemetry[event] == message then
@@ -1882,11 +1888,18 @@ local function tryStartDungeon(): boolean
 		VirtualInputManager:SendMouseMoveEvent(clickX, clickY, game)
 	end)
 	if physicalClickIssued then
+		local executionGeneration = RuntimeState.Generation
 		task.delay(0.05, function()
+			if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+				return
+			end
 			pcall(function()
 				VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
 			end)
 			task.delay(0.04, function()
+				if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+					return
+				end
 				pcall(function()
 					VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
 				end)
@@ -2005,7 +2018,11 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 			keypress(virtualKey)
 		end)
 		if ok then
+			local executionGeneration = RuntimeState.Generation
 			task.delay(0.03, function()
+				if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+					return
+				end
 				pcall(function()
 					keyrelease(virtualKey)
 				end)
@@ -2018,7 +2035,11 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 		VirtualInputManager:SendKeyEvent(true, key, false, game)
 	end)
 	if ok then
+		local executionGeneration = RuntimeState.Generation
 		task.delay(0.03, function()
+			if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+				return
+			end
 			pcall(function()
 				VirtualInputManager:SendKeyEvent(false, key, false, game)
 			end)
@@ -2111,13 +2132,14 @@ local function disablePlayerControls()
 			return
 		end
 		PlayerControlsResolvePending = true
+		local executionGeneration = RuntimeState.Generation
 		task.defer(function()
 			local playerScripts = Player:WaitForChild("PlayerScripts", 5)
 			if playerScripts then
 				playerScripts:WaitForChild("PlayerModule", 5)
 			end
 			PlayerControlsResolvePending = false
-			if Enabled and Running and not PlayerControlsDisabled then
+			if isCurrentExecution() and RuntimeState.Generation == executionGeneration and Running and not PlayerControlsDisabled then
 				local retryControls = resolvePlayerControls()
 				if retryControls and type(retryControls.Disable) == "function" then
 					local ok = pcall(function()
@@ -2371,6 +2393,7 @@ local function requestPath(goal: Vector3): boolean
 	local expectedTarget = Target
 	local expectedCharacter = Character
 	local origin = Root.Position
+	local executionGeneration = RuntimeState.Generation
 	PathComputing = true
 	LastPathBuildAt = now
 	disposePath()
@@ -2385,7 +2408,7 @@ local function requestPath(goal: Vector3): boolean
 		local ok = pcall(function()
 			newPath:ComputeAsync(origin, goal)
 		end)
-		if requestId ~= PathRequestSerial then
+		if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration or requestId ~= PathRequestSerial then
 			newPath:Destroy()
 			return
 		end
@@ -2665,7 +2688,9 @@ end
 resetRuntimeForNewDungeon = function()
 	RuntimeState.RoundResetSerial += 1
 	local resetSerial = RuntimeState.RoundResetSerial
+	local executionGeneration = RuntimeState.Generation
 	local now = os.clock()
+	print("[ROUND] new round")
 	cancelPathRequest()
 	-- Clear the old target through its normal lifecycle so its death listener,
 	-- path and facing state cannot survive into the replayed dungeon.
@@ -2748,7 +2773,12 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
 	local function refreshRoundTargets()
-		if not Enabled or not Running or resetSerial ~= RuntimeState.RoundResetSerial then
+		if
+			not isCurrentExecution()
+			or RuntimeState.Generation ~= executionGeneration
+			or not Running
+			or resetSerial ~= RuntimeState.RoundResetSerial
+		then
 			return
 		end
 		RuntimeState.refreshDungeonReferences()
@@ -2950,6 +2980,22 @@ local function runRecoveryPolicy()
 	end
 end
 
+local function recoveryAbortReason(): string?
+	if not isCurrentExecution() then
+		return "shutdown"
+	end
+	if RuntimeState.ReplayPhase ~= "IDLE" then
+		return "replay=" .. RuntimeState.ReplayPhase
+	end
+	if os.clock() < RuntimeState.RespawnRushUntil then
+		return "respawn-grace"
+	end
+	if cachedStartScreen() then
+		return "start-screen"
+	end
+	return nil
+end
+
 recoverByRespawn = function(
 	expectedTarget: Model?,
 	expectedProgressAt: number?,
@@ -2960,9 +3006,16 @@ recoverByRespawn = function(
 		return
 	end
 	RespawnInProgress = true
+	local executionGeneration = RuntimeState.Generation
 	task.spawn(function()
 		task.wait(0.4)
-		if not Enabled or not Running then
+		if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration or not Running then
+			RespawnInProgress = false
+			return
+		end
+		local abortReason = recoveryAbortReason()
+		if abortReason then
+			print("[RECOVERY] abort=" .. abortReason)
 			RespawnInProgress = false
 			return
 		end
@@ -2991,6 +3044,7 @@ recoverByRespawn = function(
 			return
 		end
 		ResetExecuting = true
+		print("[RECOVERY] reason=stuck")
 		-- Keep a living target across a forced character reset. Clearing it here
 		-- made CharacterAdded wait for normal acquisition after replay.
 		local retainedTarget = if validTarget(Target) then Target else nil
@@ -3005,10 +3059,18 @@ recoverByRespawn = function(
 		else
 			resetNavigationForTarget(nil)
 		end
-		-- Roblox Reset Character sequence. R resets; L would select Leave Game.
+		-- Roblox Reset Character sequence. A single confirmation avoids a stale
+		-- second Return selecting an unrelated dialog during a map transition.
 		local resetCharacter = Character
-		for _, key in ipairs({ Enum.KeyCode.Escape, Enum.KeyCode.R, Enum.KeyCode.Return, Enum.KeyCode.Return }) do
-			if not Enabled or not Running or Character ~= resetCharacter or State == NavigationState.DODGE then
+		for _, key in ipairs({ Enum.KeyCode.Escape, Enum.KeyCode.R, Enum.KeyCode.Return }) do
+			if
+				not isCurrentExecution()
+				or RuntimeState.Generation ~= executionGeneration
+				or not Running
+				or Character ~= resetCharacter
+				or State == NavigationState.DODGE
+				or recoveryAbortReason()
+			then
 				break
 			end
 			sendKey(key)
@@ -3090,6 +3152,9 @@ local function updateTargetAndObjective()
 	end
 	if not validTarget(Target) then
 		local invalidTarget = Target
+		if invalidTarget then
+			print("[TARGET] stale -> cleared")
+		end
 		if invalidTarget or now - LastTargetAcquireAt >= Config.TargetAcquireInterval then
 			LastTargetAcquireAt = now
 			local acquired = acquireBestTarget()
@@ -3317,6 +3382,7 @@ local function bindCharacter(character: Model)
 		table.insert(
 			CharacterConnections,
 			Humanoid.Died:Connect(function()
+				local executionGeneration = RuntimeState.Generation
 				RuntimeState.RespawnRushUntil = 0
 				RuntimeState.sendStatusWebhook("CHARACTER_DIED")
 				-- Do not discard a living enemy just because this character died.
@@ -3330,7 +3396,12 @@ local function bindCharacter(character: Model)
 				if Running then
 					task.defer(function()
 						task.wait(0.65)
-						if Enabled and Running and not alive() then
+						if
+							isCurrentExecution()
+							and RuntimeState.Generation == executionGeneration
+							and Running
+							and not alive()
+						then
 							recoverByRespawn(nil, nil)
 						end
 					end)
@@ -3475,6 +3546,7 @@ local function createHUD()
 end
 
 local function shutdown()
+	print("[SHUTDOWN] runtime stopped")
 	Config.FarmEnabled = Running
 	saveConfig()
 	Enabled, Running = false, false
@@ -3492,9 +3564,12 @@ local function shutdown()
 		HUD:Destroy()
 		HUD = nil
 	end
-	Environment.AutoFarmV21Shutdown = nil
+	if Environment.AutoFarmV21Shutdown == shutdown then
+		Environment.AutoFarmV21Shutdown = nil
+	end
 end
 
+print("[EXEC] generation=" .. tostring(RuntimeState.Generation))
 createHUD()
 print("[AF] HUD created")
 RuntimeState.sendStatusWebhook("SCRIPT_STARTED")
@@ -3505,15 +3580,17 @@ table.insert(
 		-- registration only needs a Model (or its Humanoid once it is populated),
 		-- so do not walk ancestors for every decorative part in the dungeon.
 		if instance:IsA("Model") then
+			local executionGeneration = RuntimeState.Generation
 			task.defer(function()
-				if Enabled and instance:IsDescendantOf(workspace) then
+				if isCurrentExecution() and RuntimeState.Generation == executionGeneration and instance:IsDescendantOf(workspace) then
 					registerEnemy(instance)
 				end
 			end)
 		elseif instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
 			local model = instance.Parent
+			local executionGeneration = RuntimeState.Generation
 			task.defer(function()
-				if Enabled and model:IsDescendantOf(workspace) then
+				if isCurrentExecution() and RuntimeState.Generation == executionGeneration and model:IsDescendantOf(workspace) then
 					registerEnemy(model)
 				end
 			end)
@@ -3553,8 +3630,9 @@ table.insert(
 )
 
 if Player.Character then
+	local executionGeneration = RuntimeState.Generation
 	task.defer(function()
-		if Enabled and Player.Character then
+		if isCurrentExecution() and RuntimeState.Generation == executionGeneration and Player.Character then
 			bindCharacter(Player.Character)
 		end
 	end)
@@ -3562,15 +3640,20 @@ end
 table.insert(
 	Connections,
 	Player.CharacterAdded:Connect(function(character)
+		local executionGeneration = RuntimeState.Generation
 		RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
+		print("[CHAR] respawn")
 		task.defer(function()
-			bindCharacter(character)
+			if isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+				bindCharacter(character)
+			end
 		end)
 	end)
 )
 
+local startupGeneration = RuntimeState.Generation
 task.defer(function()
-	if Enabled then
+	if isCurrentExecution() and RuntimeState.Generation == startupGeneration then
 		buildInitialCaches()
 	end
 end)
