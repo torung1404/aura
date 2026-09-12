@@ -271,6 +271,7 @@ local PlayerControlsDisabled = false
 local PlayerControlsResolvePending = false
 
 local EnemySet: { [Model]: boolean } = {}
+local PendingEnemyModels: { [Model]: boolean } = {}
 local LastTargetAcquireAt = -math.huge
 local HazardSet: { [BasePart]: boolean } = {}
 local ActiveHazard: BasePart? = nil
@@ -349,6 +350,10 @@ local RuntimeState = {
 	ReplayDebugButton = nil :: GuiButton?,
 	RoundResetSerial = 0,
 	RespawnRushUntil = 0,
+	RoundTransitionSerial = 0,
+	RoundTransitionStartedAt = 0,
+	RoundTransitionDeadline = 0,
+	RoundTransitionTimedOut = false,
 	VerticalPathTarget = nil :: Model?,
 	VerticalPathGoal = nil :: Vector3?,
 }
@@ -531,14 +536,17 @@ local function registerEnemy(instance: Instance)
 	while current and current ~= workspace do
 		if current:IsA("Model") and current ~= Character and not Players:GetPlayerFromCharacter(current) then
 			local enemyHumanoid = current:FindFirstChildOfClass("Humanoid")
-			if enemyHumanoid and enemyHumanoid.Health > 0 and getTargetRoot(current) then
+			local enemyRoot = getTargetRoot(current)
+			if enemyHumanoid and enemyHumanoid.Health > 0 and enemyRoot and enemyRoot:IsDescendantOf(workspace) then
 				local wasKnown = EnemySet[current] == true
 				EnemySet[current] = true
+				PendingEnemyModels[current] = nil
 				if Running and not wasKnown then
 					LastTargetAcquireAt = -math.huge
 				end
 				return
 			end
+			PendingEnemyModels[current] = true
 		end
 		current = current.Parent
 	end
@@ -1298,7 +1306,9 @@ local function acquireBestTarget(): Model?
 				then
 					local delta = enemyRoot.Position - Root.Position
 					if delta.Magnitude <= Config.FarmRange then
-						table.insert(cheapCandidates, {
+							EnemySet[object] = true
+							PendingEnemyModels[object] = nil
+							table.insert(cheapCandidates, {
 							Model = object,
 							Vertical = math.abs(delta.Y),
 							Distance = delta.Magnitude,
@@ -1837,11 +1847,22 @@ local resolveStartButton
 local function cachedStartScreen(): (GuiObject?, GuiButton?)
 	local marker = RuntimeState.StartMarker
 	if marker and marker:IsDescendantOf(game) and visibleGui(marker) then
-		local button = RuntimeState.StartButton
-		if button and button:IsDescendantOf(game) and visibleGui(button) then
-			return marker, button
+		local currentText = startMarkerText(marker)
+		if currentText and normalizeStartText(currentText) == "start" then
+			local button = RuntimeState.StartButton
+			if
+				button
+				and button:IsDescendantOf(game)
+				and visibleGui(button)
+				and (button == marker or button:IsDescendantOf(marker) or marker:IsDescendantOf(button))
+			then
+				return marker, button
+			end
+			local refreshedButton = resolveStartButton(marker)
+			RuntimeState.StartButton = refreshedButton
+			return marker, refreshedButton
 		end
-		return marker, nil
+		print("[START] cache=INVALID_TEXT")
 	end
 	RuntimeState.StartMarker = nil
 	RuntimeState.StartButton = nil
@@ -2742,6 +2763,10 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.RoundTransitionActive = true
 	RuntimeState.RoundBootstrapUntil = now + 7
 	RuntimeState.RoundBootstrapAttempts = 0
+	RuntimeState.RoundTransitionSerial += 1
+	RuntimeState.RoundTransitionStartedAt = now
+	RuntimeState.RoundTransitionDeadline = now + 7
+	RuntimeState.RoundTransitionTimedOut = false
 	RuntimeState.RoundBootstrapLastCacheAt = -math.huge
 	cancelPathRequest()
 	-- Clear the old target through its normal lifecycle so its death listener,
@@ -2789,6 +2814,7 @@ resetRuntimeForNewDungeon = function()
 	State = NavigationState.IDLE
 	stopTranslation()
 	table.clear(EnemySet)
+	table.clear(PendingEnemyModels)
 	table.clear(HazardSet)
 	RuntimeState.DungeonFinishedInstance = nil
 	RuntimeState.PreviousDungeonFinishedInstance = nil
@@ -2840,10 +2866,11 @@ resetRuntimeForNewDungeon = function()
 		local attemptNow = os.clock()
 		if attemptNow >= RuntimeState.RoundBootstrapUntil then
 			RuntimeState.RoundTransitionActive = false
+			RuntimeState.RoundTransitionTimedOut = true
 			LastMeaningfulProgressAt = attemptNow
 			LowSpeedSince = nil
 			LastTargetAcquireAt = -math.huge
-			print("[ROUND] transition=END timeout")
+			print("[ROUND] transition=TIMEOUT")
 			return
 		end
 		RuntimeState.RoundBootstrapAttempts += 1
@@ -3210,17 +3237,30 @@ local function updateDungeonReplayState()
 			return
 		end
 	elseif RuntimeState.DungeonFinishedLastState then
-		-- The old value was destroyed during replay; wait for the recreated value before resetting.
 		RuntimeState.DungeonFinishedInstance = nil
-		if not RuntimeState.RoundTransitionActive then
+		if not RuntimeState.RoundTransitionActive and not RuntimeState.RoundTransitionTimedOut then
 			RuntimeState.RoundTransitionActive = true
+			RuntimeState.RoundTransitionStartedAt = now
+			RuntimeState.RoundTransitionDeadline = now + 7
 			RuntimeState.RoundBootstrapUntil = now + 7
 			print("[ROUND] transition=BEGIN awaiting-new-state")
-		elseif now >= RuntimeState.RoundBootstrapUntil then
+		elseif RuntimeState.RoundTransitionActive and now >= RuntimeState.RoundTransitionDeadline then
 			RuntimeState.RoundTransitionActive = false
-			LastMeaningfulProgressAt = now
-			LowSpeedSince = nil
-			print("[ROUND] transition=END timeout")
+			RuntimeState.RoundTransitionTimedOut = true
+			RuntimeState.ActiveDungeonRoot = nil
+			RuntimeState.EnemyFolderInstance = nil
+			RuntimeState.FightingBossInstance = nil
+			RuntimeState.DungeonTimeInstance = nil
+			RuntimeState.DungeonTimeText = nil
+			RuntimeState.LastDungeonReferenceSearchAt = -math.huge
+			RuntimeState.ReplayPhase = "IDLE"
+			RuntimeState.ReplayAwaitingClose = nil
+			RuntimeState.ReplayYesButton = nil
+			RuntimeState.ReplayCompletionRoot = nil
+			RuntimeState.ReplayOpener = nil
+			resetNavigationForTarget(nil)
+			LastTargetAcquireAt = -math.huge
+			print("[ROUND] transition=TIMEOUT")
 		end
 	end
 	local remaining = RuntimeState.remainingDungeonTime()
@@ -3721,14 +3761,16 @@ table.insert(
 					registerEnemy(instance)
 				end
 			end)
-		elseif instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
-			local model = instance.Parent
-			local executionGeneration = RuntimeState.Generation
-			task.defer(function()
-				if isCurrentExecution() and RuntimeState.Generation == executionGeneration and model:IsDescendantOf(workspace) then
-					registerEnemy(model)
-				end
-			end)
+		elseif instance:IsA("Humanoid") or instance:IsA("BasePart") then
+			local model: Model? = instance.Parent and instance.Parent:FindFirstAncestorOfClass("Model")
+			if model then
+				local executionGeneration = RuntimeState.Generation
+				task.defer(function()
+					if isCurrentExecution() and RuntimeState.Generation == executionGeneration and model:IsDescendantOf(workspace) then
+						registerEnemy(model)
+					end
+				end)
+			end
 		end
 		if Config.DodgeEnabled then
 			registerHazard(instance)
