@@ -278,9 +278,9 @@ local LowSpeedSince: number? = nil
 local LastLowSpeedPathRetryAt = -math.huge
 
 local CombatState = {
-	CombatState.LastAttack = 0,
-	CombatState.NextQAt = 0,
-	CombatState.NextEAt = 0,
+	LastAttack = 0,
+	NextQAt = 0,
+	NextEAt = 0,
 }
 local TargetDiedConnection: RBXScriptConnection? = nil
 local AimState = {
@@ -391,9 +391,9 @@ local RuntimeState = {
 }
 
 local UIState = {
-	UIState.Connections = {} :: { RBXScriptConnection },
-	UIState.CharacterConnections = {} :: { RBXScriptConnection },
-	UIState.HUD = nil :: ScreenGui?,
+	Connections = {} :: { RBXScriptConnection },
+	CharacterConnections = {} :: { RBXScriptConnection },
+	HUD = nil :: ScreenGui?,
 }
 local recoverByRespawn
 local setRunning
