@@ -350,6 +350,7 @@ local RuntimeState = {
 	ReplayYesButton = nil :: GuiButton?,
 	ReplayDebugButton = nil :: GuiButton?,
 	RoundResetSerial = 0,
+	RecoverySerial = 0,
 	RespawnRushUntil = 0,
 	RoundTransitionSerial = 0,
 	RoundTransitionStartedAt = 0,
@@ -2808,6 +2809,7 @@ end
 
 resetRuntimeForNewDungeon = function()
 	RuntimeState.RoundResetSerial += 1
+	RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
 	local resetSerial = RuntimeState.RoundResetSerial
 	local executionGeneration = RuntimeState.Generation
 	local now = os.clock()
@@ -3197,11 +3199,11 @@ recoverByRespawn = function(
 	if RespawnInProgress or recoveryAbortReason() then
 		return
 	end
-	RespawnInProgress = true
-	RuntimeState.RecoverySerial += 1
+	RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
 	local recoverySerial = RuntimeState.RecoverySerial
 	local executionGeneration = RuntimeState.Generation
 	local roundSerial = RuntimeState.RoundResetSerial
+	RespawnInProgress = true
 	local function recoveryStillCurrent(): boolean
 		return isCurrentExecution()
 			and RuntimeState.Generation == executionGeneration
@@ -3843,6 +3845,7 @@ local function shutdown()
 	print("[SHUTDOWN] runtime stopped")
 	Config.FarmEnabled = Running
 	saveConfig()
+	RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
 	Enabled, Running = false, false
 	RuntimeState.RespawnRushUntil = 0
 	clearDodgeObjective()
