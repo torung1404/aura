@@ -71,7 +71,8 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = true,
+	-- Temporarily paused until generic hazard detection is tuned.
+	DodgeEnabled = false,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -128,7 +129,7 @@ end
 local CONFIG_FILE = "AutoFarmV21Config.json"
 -- Version only the Dodge preference so a forced OFF written by older releases
 -- is migrated once, while all current user choices continue to persist.
-local DODGE_CONFIG_VERSION = 1
+local DODGE_CONFIG_VERSION = 2
 local SavedConfig: { [string]: any } = {}
 if type(isfile) == "function" and type(readfile) == "function" then
 	local ok, decoded = pcall(function()
