@@ -1,16 +1,18 @@
 -- Main.lua — Delta Executor remote entrypoint.
 -- One Heartbeat owns movement; DODGE preempts COMBAT, DIRECT, PATH, RECOVERY, and EXPLORE.
 
-local Players = game:GetService("Players")
-local PathfindingService = game:GetService("PathfindingService")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local HttpService = game:GetService("HttpService")
-local GuiService = game:GetService("GuiService")
-local Stats = game:GetService("Stats")
+local Services = {
+	Players = game:GetService("Players"),
+	Pathfinding = game:GetService("PathfindingService"),
+	Run = game:GetService("RunService"),
+	Input = game:GetService("UserInputService"),
+	VirtualInput = game:GetService("VirtualInputManager"),
+	Http = game:GetService("HttpService"),
+	Gui = game:GetService("GuiService"),
+	Stats = game:GetService("Stats"),
+}
 
-local Player = Players.LocalPlayer
+local Player = Services.Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
 print("[AF] loaded")
 
@@ -131,7 +133,7 @@ local SavedConfig: { [string]: any } = {}
 if type(isfile) == "function" and type(readfile) == "function" then
 	local ok, decoded = pcall(function()
 		if isfile(CONFIG_FILE) then
-			return HttpService:JSONDecode(readfile(CONFIG_FILE))
+			return Services.Http:JSONDecode(readfile(CONFIG_FILE))
 		end
 		return nil
 	end)
@@ -219,7 +221,7 @@ local function saveConfig()
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.NormalSkillRange = 80
 		persisted.BossSkillRange = 100
-		writefile(CONFIG_FILE, HttpService:JSONEncode(persisted))
+		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
 end
 
@@ -275,15 +277,21 @@ local LastStuckPathRetryAt = -math.huge
 local LowSpeedSince: number? = nil
 local LastLowSpeedPathRetryAt = -math.huge
 
-local LastAttack = 0
-local NextQAt = 0
-local NextEAt = 0
+local CombatState = {
+	CombatState.LastAttack = 0,
+	CombatState.NextQAt = 0,
+	CombatState.NextEAt = 0,
+}
 local TargetDiedConnection: RBXScriptConnection? = nil
-local AimAttachment: Attachment? = nil
-local AimAlignment: AlignOrientation? = nil
-local PlayerControls = nil
-local PlayerControlsDisabled = false
-local PlayerControlsResolvePending = false
+local AimState = {
+	Attachment = nil :: Attachment?,
+	Alignment = nil :: AlignOrientation?,
+}
+local ControlState = {
+	Controls = nil,
+	Disabled = false,
+	ResolvePending = false,
+}
 
 local EnemySet: { [Model]: boolean } = {}
 local PendingEnemyModels: { [Model]: boolean } = {}
@@ -382,9 +390,11 @@ local RuntimeState = {
 	VerticalPathGoal = nil :: Vector3?,
 }
 
-local Connections: { RBXScriptConnection } = {}
-local CharacterConnections: { RBXScriptConnection } = {}
-local HUD: ScreenGui? = nil
+local UIState = {
+	UIState.Connections = {} :: { RBXScriptConnection },
+	UIState.CharacterConnections = {} :: { RBXScriptConnection },
+	UIState.HUD = nil :: ScreenGui?,
+}
 local recoverByRespawn
 local setRunning
 local setNavigationState
@@ -392,13 +402,15 @@ local stopTranslation
 local resetRuntimeForNewDungeon
 local getTargetRoot
 
-local function isCurrentExecution(): boolean
+local RuntimeUtil = {}
+
+RuntimeUtil.isCurrentExecution = function(): boolean
 	return Enabled and Environment.AutoFarmV21Generation == RuntimeState.Generation
 end
 
-local function readPingMs(): number?
+RuntimeUtil.readPingMs = function(): number?
 	local ok, value = pcall(function()
-		local network = Stats.Network
+		local network = Services.Stats.Network
 		local items = network and network.ServerStatsItem
 		local pingItem = items and items["Data Ping"]
 		return pingItem and pingItem:GetValue() or nil
@@ -409,7 +421,7 @@ local function readPingMs(): number?
 	return nil
 end
 
-local function telemetry(event: string, message: string)
+RuntimeUtil.telemetry = function(event: string, message: string)
 	if not Config.DebugTelemetry or LastTelemetry[event] == message then
 		return
 	end
@@ -420,15 +432,17 @@ end
 -- Lifecycle events remain callable, but webhook/network activity is removed.
 RuntimeState.sendStatusWebhook = function(_event: string) end
 
-local function disconnect(connection: RBXScriptConnection?)
+local ConnectionUtil = {}
+
+ConnectionUtil.disconnect = function(connection: RBXScriptConnection?)
 	if connection and connection.Connected then
 		connection:Disconnect()
 	end
 end
 
-local function disconnectAll(list: { RBXScriptConnection })
+ConnectionUtil.disconnectAll = function(list: { RBXScriptConnection })
 	for index = #list, 1, -1 do
-		disconnect(list[index])
+		ConnectionUtil.disconnect(list[index])
 		list[index] = nil
 	end
 end
@@ -471,7 +485,7 @@ local function isBossTarget(model: Model): boolean
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local structurallyValid = model:IsDescendantOf(workspace)
 		and model ~= Character
-		and not Players:GetPlayerFromCharacter(model)
+		and not Services.Players:GetPlayerFromCharacter(model)
 		and humanoid ~= nil
 		and humanoid.Health > 0
 	if
@@ -543,7 +557,7 @@ local function validTarget(target: Model?): boolean
 	if isIgnoredTarget(target) then
 		return false
 	end
-	if target == Character or Players:GetPlayerFromCharacter(target) then
+	if target == Character or Services.Players:GetPlayerFromCharacter(target) then
 		return false
 	end
 	local enemyHumanoid = target:FindFirstChildOfClass("Humanoid")
@@ -558,7 +572,7 @@ end
 local function registerEnemy(instance: Instance)
 	local current: Instance? = instance
 	while current and current ~= workspace do
-		if current:IsA("Model") and current ~= Character and not Players:GetPlayerFromCharacter(current) then
+		if current:IsA("Model") and current ~= Character and not Services.Players:GetPlayerFromCharacter(current) then
 			local enemyHumanoid = current:FindFirstChildOfClass("Humanoid")
 			local enemyRoot = getTargetRoot(current)
 			if enemyHumanoid and enemyHumanoid.Health > 0 and enemyRoot and enemyRoot:IsDescendantOf(workspace) then
@@ -1054,7 +1068,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 					bestGoal = grounded
 				end
 			else
-				telemetry("DODGE_REJECT_" .. tostring(ringIndex) .. "_" .. tostring(angleIndex), rejection)
+				RuntimeUtil.telemetry("DODGE_REJECT_" .. tostring(ringIndex) .. "_" .. tostring(angleIndex), rejection)
 			end
 		end
 		if bestGoal then
@@ -1155,15 +1169,15 @@ RuntimeState.chooseExploreGoal = function(): (Vector3?, Vector3?, number)
 		local angle = baseAngle + index * math.pi * 2 / Config.ExploreCandidateCount
 		local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
 		local goal, score, reason, downhill = RuntimeState.evaluateExploreDirection(direction)
-		telemetry("EXPLORE_CANDIDATE_" .. tostring(index), reason)
+		RuntimeUtil.telemetry("EXPLORE_CANDIDATE_" .. tostring(index), reason)
 		if goal and score > bestScore then
 			bestGoal, bestDirection, bestScore, bestDownhill = goal, direction, score, downhill
 		end
 	end
 	if bestGoal then
-		telemetry("EXPLORE_GOAL", string.format("goal=%s score=%.1f", tostring(bestGoal), bestScore))
+		RuntimeUtil.telemetry("EXPLORE_GOAL", string.format("goal=%s score=%.1f", tostring(bestGoal), bestScore))
 	else
-		telemetry("EXPLORE_GOAL", "no-safe-candidate")
+		RuntimeUtil.telemetry("EXPLORE_GOAL", "no-safe-candidate")
 	end
 	return bestGoal, bestDirection, bestDownhill
 end
@@ -1182,7 +1196,7 @@ RuntimeState.extendDescentGoal = function(now: number): boolean
 	end
 	local goal, _, reason, downhill = RuntimeState.evaluateExploreDirection(ExploreHeading)
 	if not goal then
-		telemetry("DESCENT_RELEASE", reason)
+		RuntimeUtil.telemetry("DESCENT_RELEASE", reason)
 		DescentLocked = false
 		DescentRiseStrikes = 0
 		return false
@@ -1190,7 +1204,7 @@ RuntimeState.extendDescentGoal = function(now: number): boolean
 	if downhill < -Config.DescentFlatTolerance then
 		DescentRiseStrikes += 1
 		if DescentRiseStrikes >= Config.DescentRiseReleaseCount then
-			telemetry("DESCENT_RELEASE", string.format("rising downhill=%.1f", downhill))
+			RuntimeUtil.telemetry("DESCENT_RELEASE", string.format("rising downhill=%.1f", downhill))
 			DescentLocked = false
 			DescentRiseStrikes = 0
 			return false
@@ -1201,7 +1215,7 @@ RuntimeState.extendDescentGoal = function(now: number): boolean
 	ExploreGoal = goal
 	ExploreBestDistance = flatPointDistance(Root.Position, goal)
 	ExploreCommitUntil = now + Config.ExploreCommitTime
-	telemetry("DESCENT_EXTEND", string.format("goal=%s downhill=%.1f", tostring(goal), downhill))
+	RuntimeUtil.telemetry("DESCENT_EXTEND", string.format("goal=%s downhill=%.1f", tostring(goal), downhill))
 	return true
 end
 
@@ -1357,7 +1371,7 @@ local function acquireBestTarget(): Model?
 			if
 				object:IsA("Model")
 				and object ~= Character
-				and not Players:GetPlayerFromCharacter(object)
+				and not Services.Players:GetPlayerFromCharacter(object)
 				and isEnemy(object)
 			then
 				local enemyHumanoid = object:FindFirstChildOfClass("Humanoid")
@@ -1744,7 +1758,7 @@ local function armReplayToken(reason: string)
 		RuntimeState.ReplayLastGuiScanAt = -math.huge
 		RuntimeState.ReplayOpenerMissingReported = false
 		print("[REPLAY] ARMED reason=" .. reason)
-		telemetry("REPLAY_ARM", reason)
+		RuntimeUtil.telemetry("REPLAY_ARM", reason)
 		RuntimeState.sendStatusWebhook("REPLAY_ARMED")
 	end
 end
@@ -1980,7 +1994,7 @@ local function getVimClickPoint(guiObject: GuiObject, xRatio: number, yRatio: nu
 		end
 		current = current.Parent
 	end
-	local inset = select(1, GuiService:GetGuiInset())
+	local inset = select(1, Services.Gui:GetGuiInset())
 	if screenGui and not screenGui.IgnoreGuiInset then
 		point += inset
 	end
@@ -2015,29 +2029,29 @@ local function tryStartDungeon(): boolean
 		print(string.format("[START] finalClick=%.1f,%.1f", clickX, clickY))
 	end
 	local physicalClickIssued = pcall(function()
-		VirtualInputManager:SendMouseMoveEvent(clickX, clickY, game)
+		Services.VirtualInput:SendMouseMoveEvent(clickX, clickY, game)
 	end)
 	if physicalClickIssued then
 		local executionGeneration = RuntimeState.Generation
 		task.delay(0.05, function()
-			if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+			if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
 				return
 			end
 			pcall(function()
-				VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
+				Services.VirtualInput:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
 			end)
 			task.delay(0.04, function()
-				if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+				if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
 					return
 				end
 				pcall(function()
-					VirtualInputManager:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
+					Services.VirtualInput:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
 				end)
 			end)
 		end)
 	end
 	if button then
-		telemetry("START", button:GetFullName())
+		RuntimeUtil.telemetry("START", button:GetFullName())
 		if not physicalClickIssued then
 			local signalIssued = false
 			if type(firesignal) == "function" then
@@ -2052,43 +2066,43 @@ local function tryStartDungeon(): boolean
 			end
 		end
 	else
-		telemetry("START", "visible text without clickable ancestor")
+		RuntimeUtil.telemetry("START", "visible text without clickable ancestor")
 	end
 	return true
 end
 
 local function clearAimObjects()
-	if AimAlignment then
-		AimAlignment:Destroy()
-		AimAlignment = nil
+	if AimState.Alignment then
+		AimState.Alignment:Destroy()
+		AimState.Alignment = nil
 	end
-	if AimAttachment then
-		AimAttachment:Destroy()
-		AimAttachment = nil
+	if AimState.Attachment then
+		AimState.Attachment:Destroy()
+		AimState.Attachment = nil
 	end
 end
 
 local function ensureAimObjects()
-	if not Root or AimAlignment then
+	if not Root or AimState.Alignment then
 		return
 	end
-	AimAttachment = Instance.new("Attachment")
-	AimAttachment.Name = "AutoFarmAimAttachment"
-	AimAttachment.Parent = Root
-	AimAlignment = Instance.new("AlignOrientation")
-	AimAlignment.Name = "AutoFarmAim"
-	AimAlignment.Attachment0 = AimAttachment
-	AimAlignment.Mode = Enum.OrientationAlignmentMode.OneAttachment
-	AimAlignment.MaxTorque = 100000
-	AimAlignment.Responsiveness = 35
-	AimAlignment.RigidityEnabled = false
-	AimAlignment.Enabled = false
-	AimAlignment.Parent = Root
+	AimState.Attachment = Instance.new("Attachment")
+	AimState.Attachment.Name = "AutoFarmAimAttachment"
+	AimState.Attachment.Parent = Root
+	AimState.Alignment = Instance.new("AlignOrientation")
+	AimState.Alignment.Name = "AutoFarmAim"
+	AimState.Alignment.Attachment0 = AimState.Attachment
+	AimState.Alignment.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	AimState.Alignment.MaxTorque = 100000
+	AimState.Alignment.Responsiveness = 35
+	AimState.Alignment.RigidityEnabled = false
+	AimState.Alignment.Enabled = false
+	AimState.Alignment.Parent = Root
 end
 
 local function restoreRotation()
-	if AimAlignment then
-		AimAlignment.Enabled = false
+	if AimState.Alignment then
+		AimState.Alignment.Enabled = false
 	end
 	if Humanoid then
 		Humanoid.AutoRotate = DefaultAutoRotate
@@ -2105,9 +2119,9 @@ local function faceTarget(enemyRoot: BasePart)
 	end
 	ensureAimObjects()
 	Humanoid.AutoRotate = false
-	if AimAlignment then
-		AimAlignment.Enabled = true
-		AimAlignment.CFrame = CFrame.lookAt(Vector3.zero, direction.Unit)
+	if AimState.Alignment then
+		AimState.Alignment.Enabled = true
+		AimState.Alignment.CFrame = CFrame.lookAt(Vector3.zero, direction.Unit)
 	end
 end
 
@@ -2124,8 +2138,8 @@ end
 
 local function sendKey(key: Enum.KeyCode)
 	pcall(function()
-		VirtualInputManager:SendKeyEvent(true, key, false, game)
-		VirtualInputManager:SendKeyEvent(false, key, false, game)
+		Services.VirtualInput:SendKeyEvent(true, key, false, game)
+		Services.VirtualInput:SendKeyEvent(false, key, false, game)
 	end)
 end
 
@@ -2137,7 +2151,7 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 				tool:Activate()
 			end)
 			if ok then
-				telemetry("SKILL_" .. toolName, "method=tool")
+				RuntimeUtil.telemetry("SKILL_" .. toolName, "method=tool")
 				return true
 			end
 		end
@@ -2150,31 +2164,31 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 		if ok then
 			local executionGeneration = RuntimeState.Generation
 			task.delay(0.03, function()
-				if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+				if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
 					return
 				end
 				pcall(function()
 					keyrelease(virtualKey)
 				end)
 			end)
-			telemetry("SKILL_" .. toolName, "method=keypress")
+			RuntimeUtil.telemetry("SKILL_" .. toolName, "method=keypress")
 			return true
 		end
 	end
 	local ok = pcall(function()
-		VirtualInputManager:SendKeyEvent(true, key, false, game)
+		Services.VirtualInput:SendKeyEvent(true, key, false, game)
 	end)
 	if ok then
 		local executionGeneration = RuntimeState.Generation
 		task.delay(0.03, function()
-			if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
+			if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
 				return
 			end
 			pcall(function()
-				VirtualInputManager:SendKeyEvent(false, key, false, game)
+				Services.VirtualInput:SendKeyEvent(false, key, false, game)
 			end)
 		end)
-		telemetry("SKILL_" .. toolName, "method=virtual-input")
+		RuntimeUtil.telemetry("SKILL_" .. toolName, "method=virtual-input")
 	end
 	return ok
 end
@@ -2190,16 +2204,16 @@ local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 		return
 	end
 	local now = os.clock()
-	if now >= NextQAt then
+	if now >= CombatState.NextQAt then
 		local minimum = math.max(0.1, Config.QCooldownMin)
 		local maximum = math.max(minimum, Config.QCooldownMax)
 		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
-			NextQAt = now + minimum + math.random() * (maximum - minimum)
+			CombatState.NextQAt = now + minimum + math.random() * (maximum - minimum)
 		end
 	end
-	if now >= NextEAt then
+	if now >= CombatState.NextEAt then
 		if activateSkill(Config.SkillEToolName, Enum.KeyCode.E) then
-			NextEAt = now + math.max(0.1, Config.ECooldown)
+			CombatState.NextEAt = now + math.max(0.1, Config.ECooldown)
 		end
 	end
 end
@@ -2208,11 +2222,11 @@ local function useNormalAttack(distance3D: number)
 	if
 		not validTarget(Target)
 		or distance3D > Config.AttackRange
-		or os.clock() - LastAttack < Config.AttackCooldown
+		or os.clock() - CombatState.LastAttack < Config.AttackCooldown
 	then
 		return
 	end
-	LastAttack = os.clock()
+	CombatState.LastAttack = os.clock()
 	if not Character then
 		return
 	end
@@ -2232,8 +2246,8 @@ local function useNormalAttack(distance3D: number)
 end
 
 local function resolvePlayerControls()
-	if PlayerControls then
-		return PlayerControls
+	if ControlState.Controls then
+		return ControlState.Controls
 	end
 	local playerScripts = Player:FindFirstChild("PlayerScripts")
 	local playerModuleScript = playerScripts and playerScripts:FindFirstChild("PlayerModule")
@@ -2245,37 +2259,37 @@ local function resolvePlayerControls()
 		return playerModule:GetControls()
 	end)
 	if ok and controls then
-		PlayerControls = controls
+		ControlState.Controls = controls
 		return controls
 	end
 	return nil
 end
 
 local function disablePlayerControls()
-	if PlayerControlsDisabled then
+	if ControlState.Disabled then
 		return
 	end
 	local controls = resolvePlayerControls()
 	if not controls or type(controls.Disable) ~= "function" then
-		if PlayerControlsResolvePending then
+		if ControlState.ResolvePending then
 			return
 		end
-		PlayerControlsResolvePending = true
+		ControlState.ResolvePending = true
 		local executionGeneration = RuntimeState.Generation
 		task.defer(function()
 			local playerScripts = Player:WaitForChild("PlayerScripts", 5)
 			if playerScripts then
 				playerScripts:WaitForChild("PlayerModule", 5)
 			end
-			PlayerControlsResolvePending = false
-			if isCurrentExecution() and RuntimeState.Generation == executionGeneration and Running and not PlayerControlsDisabled then
+			ControlState.ResolvePending = false
+			if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration and Running and not ControlState.Disabled then
 				local retryControls = resolvePlayerControls()
 				if retryControls and type(retryControls.Disable) == "function" then
 					local ok = pcall(function()
 						retryControls:Disable()
 					end)
 					if ok then
-						PlayerControlsDisabled = true
+						ControlState.Disabled = true
 					end
 				end
 			end
@@ -2286,24 +2300,24 @@ local function disablePlayerControls()
 		controls:Disable()
 	end)
 	if ok then
-		PlayerControlsDisabled = true
+		ControlState.Disabled = true
 	end
 end
 
 local function enablePlayerControls()
-	if not PlayerControlsDisabled then
+	if not ControlState.Disabled then
 		return
 	end
-	local controls = PlayerControls or resolvePlayerControls()
+	local controls = ControlState.Controls or resolvePlayerControls()
 	if not controls or type(controls.Enable) ~= "function" then
-		PlayerControlsDisabled = false
+		ControlState.Disabled = false
 		return
 	end
 	local ok = pcall(function()
 		controls:Enable()
 	end)
 	if ok then
-		PlayerControlsDisabled = false
+		ControlState.Disabled = false
 	end
 end
 
@@ -2332,7 +2346,7 @@ stopTranslation = function()
 end
 
 local function disposePath()
-	disconnect(PathBlockedConnection)
+	ConnectionUtil.disconnect(PathBlockedConnection)
 	PathBlockedConnection = nil
 	if ActivePath then
 		ActivePath:Destroy()
@@ -2359,7 +2373,7 @@ setNavigationState = function(newState: string)
 	if State == newState then
 		return
 	end
-	telemetry("STATE", State .. " -> " .. newState)
+	RuntimeUtil.telemetry("STATE", State .. " -> " .. newState)
 	State = newState
 end
 
@@ -2527,7 +2541,7 @@ local function requestPath(goal: Vector3): boolean
 	LastPathBuildAt = now
 	disposePath()
 	task.spawn(function()
-		local newPath = PathfindingService:CreatePath({
+		local newPath = Services.Pathfinding:CreatePath({
 			AgentRadius = Config.AgentRadius,
 			AgentHeight = Config.AgentHeight,
 			AgentCanJump = true,
@@ -2537,7 +2551,7 @@ local function requestPath(goal: Vector3): boolean
 		local ok = pcall(function()
 			newPath:ComputeAsync(origin, goal)
 		end)
-		if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration or requestId ~= PathRequestSerial then
+		if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration or requestId ~= PathRequestSerial then
 			newPath:Destroy()
 			return
 		end
@@ -2773,7 +2787,7 @@ local function resetNavigationForTarget(newTarget: Model?)
 	end
 	clearExploreObjective()
 	if newTarget then
-		telemetry("EXPLORE_TARGET", "target=" .. newTarget:GetFullName())
+		RuntimeUtil.telemetry("EXPLORE_TARGET", "target=" .. newTarget:GetFullName())
 		local targetHumanoid = newTarget:FindFirstChildOfClass("Humanoid")
 		if targetHumanoid then
 			TargetDiedConnection = targetHumanoid.Died:Connect(function()
@@ -2878,7 +2892,7 @@ resetRuntimeForNewDungeon = function()
 	LastTargetAcquireAt = -math.huge
 	RuntimeState.LastFallbackTargetScanAt = -math.huge
 	NoTargetSince = now
-	NextQAt, NextEAt, LastAttack = 0, 0, 0
+	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
 	State = NavigationState.IDLE
 	stopTranslation()
 	table.clear(EnemySet)
@@ -2925,7 +2939,7 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.VerticalPathGoal = nil
 	local function refreshRoundTargets()
 		if
-			not isCurrentExecution()
+			not RuntimeUtil.isCurrentExecution()
 			or RuntimeState.Generation ~= executionGeneration
 			or not Running
 			or resetSerial ~= RuntimeState.RoundResetSerial
@@ -2976,7 +2990,7 @@ resetRuntimeForNewDungeon = function()
 end
 
 local function leaveDodge()
-	telemetry("DODGE_EXIT", ActiveHazard and ("inactive=" .. ActiveHazard:GetFullName()) or "no-active-hazard")
+	RuntimeUtil.telemetry("DODGE_EXIT", ActiveHazard and ("inactive=" .. ActiveHazard:GetFullName()) or "no-active-hazard")
 	ActiveHazard = nil
 	DodgeGoal = nil
 	RuntimeState.DodgeCommitUntil = 0
@@ -3071,7 +3085,7 @@ local function updateDodgeController(): boolean
 		LastDodgeGoalAttemptAt = os.clock()
 		cancelPathRequest()
 		ActiveHazard = hazard
-		telemetry(
+		RuntimeUtil.telemetry(
 			"DODGE_ENTER",
 			string.format(
 				"reason=%s class=%s name=%s parent=%s color=%s transparency=%.2f size=%s verticalDelta=%.1f edge=%.1f route=%.1f",
@@ -3111,7 +3125,7 @@ local function updateDodgeController(): boolean
 			end
 		end
 		setNavigationState(NavigationState.DODGE)
-		telemetry("DODGE_GOAL", DodgeGoal and tostring(DodgeGoal) or "no-safe-goal")
+		RuntimeUtil.telemetry("DODGE_GOAL", DodgeGoal and tostring(DodgeGoal) or "no-safe-goal")
 	end
 
 	if not DodgeGoal then
@@ -3186,7 +3200,7 @@ local function replayBlocksRecovery(): boolean
 end
 
 local function recoveryAbortReason(): string?
-	if not isCurrentExecution() then
+	if not RuntimeUtil.isCurrentExecution() then
 		return "shutdown"
 	end
 	if RuntimeState.RoundTransitionActive then
@@ -3219,7 +3233,7 @@ recoverByRespawn = function(
 	local roundSerial = RuntimeState.RoundResetSerial
 	RespawnInProgress = true
 	local function recoveryStillCurrent(): boolean
-		return isCurrentExecution()
+		return RuntimeUtil.isCurrentExecution()
 			and RuntimeState.Generation == executionGeneration
 			and RuntimeState.RoundResetSerial == roundSerial
 			and RuntimeState.RecoverySerial == recoverySerial
@@ -3608,7 +3622,7 @@ local function bindCharacter(character: Model)
 	end
 	local newHumanoid = character:FindFirstChildOfClass("Humanoid")
 	local newRoot = character:FindFirstChild("HumanoidRootPart")
-	if not isCurrentExecution() or serial ~= CharacterBindSerial or Player.Character ~= character then
+	if not RuntimeUtil.isCurrentExecution() or serial ~= CharacterBindSerial or Player.Character ~= character then
 		return
 	end
 	if not newHumanoid or not newHumanoid:IsA("Humanoid") or not newRoot or not newRoot:IsA("BasePart") then
@@ -3627,7 +3641,7 @@ local function bindCharacter(character: Model)
 					RuntimeState.CharacterBindRetryCharacter = nil
 				end
 				if
-					isCurrentExecution()
+					RuntimeUtil.isCurrentExecution()
 					and RuntimeState.Generation == executionGeneration
 					and Player.Character == character
 				then
@@ -3643,20 +3657,20 @@ local function bindCharacter(character: Model)
 	RuntimeState.CharacterBindRetryPending = false
 	RuntimeState.CharacterBindRetryCharacter = nil
 	RuntimeState.LastCharacterBindWait = ""
-	disconnectAll(CharacterConnections)
+	ConnectionUtil.disconnectAll(UIState.CharacterConnections)
 	clearAimObjects()
 	restoreMovementSpeed()
 	cancelPathRequest()
 	-- A replay/reset can recreate PlayerModule controls while the old control
 	-- object is still marked disabled. Re-resolve it for the new character.
-	if PlayerControlsDisabled and PlayerControls then
+	if ControlState.Disabled and ControlState.Controls then
 		pcall(function()
-			PlayerControls:Enable()
+			ControlState.Controls:Enable()
 		end)
 	end
-	PlayerControls = nil
-	PlayerControlsDisabled = false
-	PlayerControlsResolvePending = false
+	ControlState.Controls = nil
+	ControlState.Disabled = false
+	ControlState.ResolvePending = false
 	Character = character
 	Humanoid = newHumanoid
 	Root = newRoot
@@ -3664,7 +3678,7 @@ local function bindCharacter(character: Model)
 		DefaultAutoRotate = Humanoid.AutoRotate
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 	end
-	NextQAt, NextEAt, LastAttack = 0, 0, 0
+	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
 	RespawnInProgress = false
 	ResetExecuting = false
 	NoTargetSince = os.clock()
@@ -3690,7 +3704,7 @@ local function bindCharacter(character: Model)
 	end
 	if Humanoid then
 		table.insert(
-			CharacterConnections,
+			UIState.CharacterConnections,
 			Humanoid.Died:Connect(function()
 				local executionGeneration = RuntimeState.Generation
 				RuntimeState.RespawnRushUntil = 0
@@ -3707,7 +3721,7 @@ local function bindCharacter(character: Model)
 					task.defer(function()
 						task.wait(0.65)
 						if
-							isCurrentExecution()
+							RuntimeUtil.isCurrentExecution()
 							and RuntimeState.Generation == executionGeneration
 							and Running
 							and not alive()
@@ -3761,7 +3775,7 @@ local function createHUD()
 		end
 	end
 	gui.Parent = guiParent
-	HUD = gui
+	UIState.HUD = gui
 	local frame = Instance.new("Frame")
 	frame.Size = UDim2.fromOffset(360, 220)
 	frame.AnchorPoint = Vector2.new(1, 0)
@@ -3803,7 +3817,7 @@ local function createHUD()
 	button.Parent = frame
 	Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
 	table.insert(
-		Connections,
+		UIState.Connections,
 		button.MouseButton1Click:Connect(function()
 			setRunning(not Running)
 		end)
@@ -3812,7 +3826,7 @@ local function createHUD()
 	local dragStart = Vector2.zero
 	local startPosition = frame.Position
 	table.insert(
-		Connections,
+		UIState.Connections,
 		title.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 then
 				dragging, dragStart, startPosition = true, input.Position, frame.Position
@@ -3820,8 +3834,8 @@ local function createHUD()
 		end)
 	)
 	table.insert(
-		Connections,
-		UserInputService.InputEnded:Connect(function(input)
+		UIState.Connections,
+		Services.Input.InputEnded:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 then
 				dragging = false
 				Config.HUDPosition = frame.Position
@@ -3829,8 +3843,8 @@ local function createHUD()
 		end)
 	)
 	table.insert(
-		Connections,
-		UserInputService.InputChanged:Connect(function(input)
+		UIState.Connections,
+		Services.Input.InputChanged:Connect(function(input)
 			if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
 				frame.Position = UDim2.new(
 					startPosition.X.Scale,
@@ -3844,8 +3858,8 @@ local function createHUD()
 	RuntimeState.HUDInfo = info
 	RuntimeState.HUDButton = button
 	table.insert(
-		Connections,
-		UserInputService.InputBegan:Connect(function(input, processed)
+		UIState.Connections,
+		Services.Input.InputBegan:Connect(function(input, processed)
 			if
 				not processed and (input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift)
 			then
@@ -3868,12 +3882,12 @@ local function shutdown()
 	restoreMovementSpeed()
 	restoreRotation()
 	enablePlayerControls()
-	disconnectAll(Connections)
-	disconnectAll(CharacterConnections)
+	ConnectionUtil.disconnectAll(UIState.Connections)
+	ConnectionUtil.disconnectAll(UIState.CharacterConnections)
 	clearAimObjects()
-	if HUD then
-		HUD:Destroy()
-		HUD = nil
+	if UIState.HUD then
+		UIState.HUD:Destroy()
+		UIState.HUD = nil
 	end
 	if Environment.AutoFarmV21Shutdown == shutdown then
 		Environment.AutoFarmV21Shutdown = nil
@@ -3885,7 +3899,7 @@ createHUD()
 print("[AF] HUD created")
 RuntimeState.sendStatusWebhook("SCRIPT_STARTED")
 table.insert(
-	Connections,
+	UIState.Connections,
 	workspace.DescendantAdded:Connect(function(instance)
 		-- Map/VFX BasicParts can arrive in large bursts after Replay. Enemy
 		-- registration only needs a Model (or its Humanoid once it is populated),
@@ -3893,7 +3907,7 @@ table.insert(
 		if instance:IsA("Model") then
 			local executionGeneration = RuntimeState.Generation
 			task.defer(function()
-				if isCurrentExecution() and RuntimeState.Generation == executionGeneration and instance:IsDescendantOf(workspace) then
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration and instance:IsDescendantOf(workspace) then
 					registerEnemy(instance)
 				end
 			end)
@@ -3902,7 +3916,7 @@ table.insert(
 			if model then
 				local executionGeneration = RuntimeState.Generation
 				task.defer(function()
-					if isCurrentExecution() and RuntimeState.Generation == executionGeneration and model:IsDescendantOf(workspace) then
+					if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration and model:IsDescendantOf(workspace) then
 						registerEnemy(model)
 					end
 				end)
@@ -3914,7 +3928,7 @@ table.insert(
 	end)
 )
 table.insert(
-	Connections,
+	UIState.Connections,
 	PlayerGui.DescendantAdded:Connect(function(instance)
 		if RuntimeState.ReplayPhase ~= "IDLE" and (instance:IsA("TextLabel") or instance:IsA("TextButton")) then
 			local text = instance.Text:lower():gsub("[%s%p_]", "")
@@ -3931,7 +3945,7 @@ table.insert(
 	end)
 )
 table.insert(
-	Connections,
+	UIState.Connections,
 	workspace.DescendantRemoving:Connect(function(instance)
 		if instance:IsA("Model") then
 			EnemySet[instance] = nil
@@ -3970,13 +3984,13 @@ table.insert(
 if Player.Character then
 	local executionGeneration = RuntimeState.Generation
 	task.defer(function()
-		if isCurrentExecution() and RuntimeState.Generation == executionGeneration and Player.Character then
+		if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration and Player.Character then
 			bindCharacter(Player.Character)
 		end
 	end)
 end
 table.insert(
-	Connections,
+	UIState.Connections,
 	Player.CharacterAdded:Connect(function(character)
 		local executionGeneration = RuntimeState.Generation
 		RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
@@ -3984,7 +3998,7 @@ table.insert(
 		RuntimeState.CharacterBindRetryPending = false
 		RuntimeState.CharacterBindRetryCharacter = nil
 		RuntimeState.LastCharacterBindWait = ""
-		disconnectAll(CharacterConnections)
+		ConnectionUtil.disconnectAll(UIState.CharacterConnections)
 		clearAimObjects()
 		restoreMovementSpeed()
 		cancelPathRequest()
@@ -3998,7 +4012,7 @@ table.insert(
 		setNavigationState(NavigationState.IDLE)
 		print("[CHAR] respawn")
 		task.defer(function()
-			if isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+			if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
 				bindCharacter(character)
 			end
 		end)
@@ -4007,14 +4021,14 @@ table.insert(
 
 local startupGeneration = RuntimeState.Generation
 task.defer(function()
-	if isCurrentExecution() and RuntimeState.Generation == startupGeneration then
+	if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == startupGeneration then
 		buildInitialCaches()
 	end
 end)
 print("[AF] startup complete")
 table.insert(
-	Connections,
-	RunService.Heartbeat:Connect(function(dt)
+	UIState.Connections,
+	Services.Run.Heartbeat:Connect(function(dt)
 		if not Enabled then
 			return
 		end
@@ -4027,10 +4041,10 @@ table.insert(
 		local now = os.clock()
 		if now - RuntimeState.LastStatsSampleAt >= 0.5 then
 			RuntimeState.LastStatsSampleAt = now
-			local pingMs = readPingMs()
+			local pingMs = RuntimeUtil.readPingMs()
 			if pingMs then
 				RuntimeState.PingMs = pingMs
-				telemetry("PING", tostring(pingMs))
+				RuntimeUtil.telemetry("PING", tostring(pingMs))
 			end
 		end
 		updateDungeonReplayState()
