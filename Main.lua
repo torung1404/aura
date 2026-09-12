@@ -3197,6 +3197,19 @@ local function updateDungeonReplayState()
 	end
 	RuntimeState.LastDungeonStateCheckAt = now
 	RuntimeState.refreshDungeonReferences()
+	if RuntimeState.RoundTransitionTimedOut then
+		local hasNewRoundEvidence = RuntimeState.ActiveDungeonRoot
+			or RuntimeState.EnemyFolderInstance
+			or RuntimeState.DungeonTimeInstance
+			or cachedStartScreen()
+		if hasNewRoundEvidence then
+			RuntimeState.RoundTransitionTimedOut = false
+			RuntimeState.DungeonFinishedLastState = false
+			RuntimeState.ReplayPhase = "IDLE"
+			print("[ROUND] new-evidence=resolved")
+			print("[ROUND] transition=END")
+		end
+	end
 	local fightingBoss = RuntimeState.FightingBossInstance
 	if fightingBoss and fightingBoss:IsA("BoolValue") then
 		if fightingBoss.Value then
