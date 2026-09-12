@@ -361,6 +361,7 @@ local RuntimeState = {
 	DodgeCachedPredicted = false,
 	DodgeCachedEdgeDistance = math.huge,
 	DodgeCachedRouteDistance = math.huge,
+	DodgeRaycastsUsed = 0,
 	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3 } },
 	VerticalPathTarget = nil :: Model?,
 	VerticalPathGoal = nil :: Vector3?,
@@ -943,6 +944,10 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	if flatDelta.Magnitude <= 0.1 then
 		return true
 	end
+	if RuntimeState.DodgeRaycastsUsed >= Config.DodgeRaycastBudget then
+		return false
+	end
+	RuntimeState.DodgeRaycastsUsed += 1
 	local obstacle = workspace:Raycast(Root.Position + Vector3.new(0, 2.5, 0), flatDelta, makeRaycastParams(nil))
 	if obstacle and obstacle.Distance < flatDelta.Magnitude - 1.5 then
 		return false
@@ -955,8 +960,12 @@ local function dodgeRouteClear(goal: Vector3): boolean
 		end
 	end
 	local previous = Root.Position
-	local count = math.max(3, math.ceil(flatDelta.Magnitude / 3))
+	local count = math.min(3, math.max(2, math.ceil(flatDelta.Magnitude / 6)))
 	for index = 1, count do
+		if RuntimeState.DodgeRaycastsUsed >= Config.DodgeRaycastBudget then
+			return false
+		end
+		RuntimeState.DodgeRaycastsUsed += 1
 		local grounded, found = projectToWalkableGround(Root.Position:Lerp(goal, index / count), Target)
 		if not found or math.abs(grounded.Y - previous.Y) > Config.ExploreMaxVerticalStep then
 			return false
@@ -2984,6 +2993,7 @@ local function updateDodgeController(): boolean
 	local hazard, predicted, edgeDistance, routeDistance
 	if evaluateNow then
 		RuntimeState.LastDodgeEvaluationAt = now
+		RuntimeState.DodgeRaycastsUsed = 0
 		hazard, predicted, edgeDistance, routeDistance = threateningHazard()
 		RuntimeState.DodgeCachedHazard = hazard
 		RuntimeState.DodgeCachedPredicted = predicted
