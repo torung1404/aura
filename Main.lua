@@ -124,6 +124,9 @@ if type(Environment.AutoFarmV21Shutdown) == "function" then
 end
 
 local CONFIG_FILE = "AutoFarmV21Config.json"
+-- Version only the Dodge preference so a forced OFF written by older releases
+-- is migrated once, while all current user choices continue to persist.
+local DODGE_CONFIG_VERSION = 1
 local SavedConfig: { [string]: any } = {}
 if type(isfile) == "function" and type(readfile) == "function" then
 	local ok, decoded = pcall(function()
@@ -137,15 +140,14 @@ if type(isfile) == "function" and type(readfile) == "function" then
 	end
 end
 
-local Config = Environment.AutoFarmConfigV21
-	or {
-		FarmEnabled = false,
-		ShowHUD = true,
-		HUDPosition = UDim2.fromScale(0.98, 0.04),
-	}
+-- Do not inherit a mutable getgenv config table from a previously loaded
+-- script. Runtime settings start clean and only the persisted config is merged.
+local Config = {
+	FarmEnabled = false,
+	ShowHUD = true,
+	HUDPosition = UDim2.fromScale(0.98, 0.04),
+}
 Environment.AutoFarmConfigV21 = Config
--- HUD uses a right-edge anchor. Override the legacy left-side position retained
--- in getgenv when an older version of the script is executed again.
 Config.HUDPosition = UDim2.fromScale(0.98, 0.04)
 for key, value in pairs(DEFAULT_CONFIG) do
 	if Config[key] == nil then
@@ -153,14 +155,25 @@ for key, value in pairs(DEFAULT_CONFIG) do
 	end
 end
 
+local savedDodgeSettingIsCurrent = SavedConfig.DodgeConfigVersion == DODGE_CONFIG_VERSION
 -- Keep user settings across source upgrades. Values with the wrong type are
--- ignored and the current default remains in place.
+-- ignored and the current default remains in place. A legacy Dodge false was
+-- generated while Dodge was force-disabled, so it is migrated to the new
+-- default once instead of being treated as a user toggle.
 for key, defaultValue in pairs(DEFAULT_CONFIG) do
 	local savedValue = SavedConfig[key]
-	if savedValue ~= nil and type(savedValue) == type(defaultValue) then
+	if
+		savedValue ~= nil
+		and type(savedValue) == type(defaultValue)
+		and (key ~= "DodgeEnabled" or savedDodgeSettingIsCurrent)
+	then
 		Config[key] = savedValue
 	end
 end
+if not savedDodgeSettingIsCurrent then
+	Config.DodgeEnabled = DEFAULT_CONFIG.DodgeEnabled
+end
+Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
@@ -203,6 +216,7 @@ local function saveConfig()
 			end
 		end
 		persisted.FarmEnabled = Config.FarmEnabled == true
+		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.NormalSkillRange = 80
 		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, HttpService:JSONEncode(persisted))
