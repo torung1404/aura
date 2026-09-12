@@ -355,6 +355,13 @@ local RuntimeState = {
 	RoundTransitionStartedAt = 0,
 	RoundTransitionDeadline = 0,
 	RoundTransitionTimedOut = false,
+	DodgeCommitUntil = 0,
+	LastDodgeEvaluationAt = -math.huge,
+	DodgeCachedHazard = nil :: BasePart?,
+	DodgeCachedPredicted = false,
+	DodgeCachedEdgeDistance = math.huge,
+	DodgeCachedRouteDistance = math.huge,
+	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3 } },
 	VerticalPathTarget = nil :: Model?,
 	VerticalPathGoal = nil :: Vector3?,
 }
