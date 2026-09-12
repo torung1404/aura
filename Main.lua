@@ -3085,6 +3085,11 @@ local function runRecoveryPolicy()
 	end
 end
 
+local function replayBlocksRecovery(): boolean
+	local phase = RuntimeState.ReplayPhase
+	return phase == "OPENING" or phase == "CONFIRMING" or phase == "WAIT_NEW_ROUND"
+end
+
 local function recoveryAbortReason(): string?
 	if not isCurrentExecution() then
 		return "shutdown"
@@ -3092,7 +3097,7 @@ local function recoveryAbortReason(): string?
 	if RuntimeState.RoundTransitionActive then
 		return "ROUND_TRANSITION"
 	end
-	if RuntimeState.ReplayPhase ~= "IDLE" then
+	if replayBlocksRecovery() then
 		return "replay=" .. RuntimeState.ReplayPhase
 	end
 	if os.clock() < RuntimeState.RespawnRushUntil then
@@ -3113,18 +3118,31 @@ recoverByRespawn = function(
 	if RespawnInProgress then
 		return
 	end
+	if recoveryAbortReason() then
+		return
+	end
 	RespawnInProgress = true
+	RuntimeState.RecoverySerial += 1
+	local recoverySerial = RuntimeState.RecoverySerial
 	local executionGeneration = RuntimeState.Generation
+	local roundSerial = RuntimeState.RoundResetSerial
+	local function recoveryStillCurrent(): boolean
+		return isCurrentExecution()
+			and RuntimeState.Generation == executionGeneration
+			and RuntimeState.RoundResetSerial == roundSerial
+			and RuntimeState.RecoverySerial == recoverySerial
+	end
 	task.spawn(function()
 		task.wait(0.4)
-		if not isCurrentExecution() or RuntimeState.Generation ~= executionGeneration or not Running then
-			RespawnInProgress = false
+		if not recoveryStillCurrent() or not Running then
 			return
 		end
 		local abortReason = recoveryAbortReason()
 		if abortReason then
 			print("[RECOVERY] abort=" .. abortReason)
-			RespawnInProgress = false
+			if recoveryStillCurrent() then
+				RespawnInProgress = false
+			end
 			return
 		end
 		if expectedTarget then
@@ -3172,21 +3190,26 @@ recoverByRespawn = function(
 		local resetCharacter = Character
 		for _, key in ipairs({ Enum.KeyCode.Escape, Enum.KeyCode.R, Enum.KeyCode.Return }) do
 			if
-				not isCurrentExecution()
-				or RuntimeState.Generation ~= executionGeneration
+				not recoveryStillCurrent()
 				or not Running
 				or Character ~= resetCharacter
 				or State == NavigationState.DODGE
 				or recoveryAbortReason()
 			then
-				break
+				if recoveryStillCurrent() then
+					ResetExecuting = false
+					RespawnInProgress = false
+				end
+				return
 			end
 			sendKey(key)
 			task.wait(0.5)
 		end
 		task.wait(3)
-		ResetExecuting = false
-		RespawnInProgress = false
+		if recoveryStillCurrent() then
+			ResetExecuting = false
+			RespawnInProgress = false
+		end
 	end)
 end
 
