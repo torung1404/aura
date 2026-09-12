@@ -21,9 +21,6 @@ local DEFAULT_CONFIG = {
 	IgnoredTargetKeywords = { "ancient spirit" },
 	BossKeywords = { "boss", "protector" },
 	FarmRange = 500,
-	-- A nearby enemy is safer to engage than a distant locked target. This is a
-	-- target-selection priority only; it does not change Q/E skill range.
-	TargetPriorityRange = 80,
 	TargetAcquireInterval = 1,
 	GoalRefreshInterval = 0.15,
 	TargetLockRangeMultiplier = 1.25,
@@ -1235,6 +1232,21 @@ local function navigationGoalForTarget(enemyRoot: BasePart, target: Model, holdD
 	return desired
 end
 
+local function targetDistanceBucket(distance: number): number
+	if distance <= 50 then
+		return 1
+	elseif distance <= 100 then
+		return 2
+	elseif distance <= 150 then
+		return 3
+	elseif distance <= 200 then
+		return 4
+	elseif distance <= 300 then
+		return 5
+	end
+	return 6
+end
+
 local function acquireBestTarget(): Model?
 	if not Root then
 		return nil
@@ -1297,32 +1309,20 @@ local function acquireBestTarget(): Model?
 		end
 	end
 	table.sort(cheapCandidates, function(first, second)
-		local firstNearby = first.Distance <= Config.TargetPriorityRange
-		local secondNearby = second.Distance <= Config.TargetPriorityRange
-		if firstNearby ~= secondNearby then
-			return firstNearby
+		local firstBucket = targetDistanceBucket(first.Distance)
+		local secondBucket = targetDistanceBucket(second.Distance)
+		if firstBucket ~= secondBucket then
+			return firstBucket < secondBucket
 		end
-		return first.Distance < second.Distance
+		if first.Distance ~= second.Distance then
+			return first.Distance < second.Distance
+		end
+		return first.Vertical < second.Vertical
 	end)
-	local best = cheapCandidates[1]
-	if not best then
+	if not cheapCandidates[1] then
 		return nil
 	end
-	local nearestDistance = best.Distance
-	local bestIsNearby = nearestDistance <= Config.TargetPriorityRange
-	for index = 2, #cheapCandidates do
-		local candidate = cheapCandidates[index]
-		if bestIsNearby and candidate.Distance > Config.TargetPriorityRange then
-			break
-		end
-		if candidate.Distance - nearestDistance > 5 then
-			break
-		end
-		if candidate.Vertical < best.Vertical then
-			best = candidate
-		end
-	end
-	return best.Model
+	return cheapCandidates[1].Model
 end
 
 local function targetMetrics(target: Model?): (number, number)
@@ -3312,14 +3312,15 @@ local function updateTargetAndObjective()
 		local candidate = acquireBestTarget()
 		local _, currentDistance = targetMetrics(Target)
 		local _, candidateDistance = targetMetrics(candidate)
-		local candidateIsNearby = candidateDistance <= Config.TargetPriorityRange
-		local currentIsNearby = currentDistance <= Config.TargetPriorityRange
 		if
 			candidate
 			and candidate ~= Target
 			and (
-				(candidateIsNearby and not currentIsNearby)
-				or candidateDistance <= currentDistance - 10
+				targetDistanceBucket(candidateDistance) < targetDistanceBucket(currentDistance)
+				or (
+					targetDistanceBucket(candidateDistance) == targetDistanceBucket(currentDistance)
+					and candidateDistance <= currentDistance - 10
+				)
 			)
 		then
 			resetNavigationForTarget(candidate)
