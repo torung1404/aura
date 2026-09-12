@@ -69,7 +69,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = false,
+	DodgeEnabled = true,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -80,6 +80,9 @@ local DEFAULT_CONFIG = {
 	DodgeRefreshInterval = 0.12,
 	DodgeVerticalPadding = 6,
 	DodgeCandidateCount = 8,
+	DodgeCommitDuration = 0.35,
+	DodgeEvaluationInterval = 0.08,
+	DodgeRaycastBudget = 32,
 	ExploreCandidateCount = 12,
 	ExploreStepDistance = 28,
 	ExploreReachedDistance = 2,
@@ -159,8 +162,6 @@ for key, defaultValue in pairs(DEFAULT_CONFIG) do
 	end
 end
 Config.RespawnStuckTime = 12
--- Keep Dodge disabled even when an older saved/getgenv config has it enabled.
-Config.DodgeEnabled = false
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 80
@@ -636,7 +637,7 @@ local function isActiveHazardPart(part: BasePart): boolean
 	if not part:IsDescendantOf(workspace) or (Character and part:IsDescendantOf(Character)) then
 		return false
 	end
-	if part.Transparency >= 0.98 or part.Size.X <= 0.05 or part.Size.Y <= 0.05 or part.Size.Z <= 0.05 then
+	if part.Size.X <= 0.05 or part.Size.Y <= 0.05 or part.Size.Z <= 0.05 then
 		return false
 	end
 	local color = part.Color
@@ -648,15 +649,21 @@ local function isActiveHazardPart(part: BasePart): boolean
 		or not part.CanCollide
 		or part.AssemblyLinearVelocity.Magnitude >= 1
 		or (part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball))
-	return (hazardNameHint(part) and effectGeometry)
-		or (visiblyRed and broadAndThin)
-		or (visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
+	local structuralEvidence = hazardNameHint(part) and effectGeometry
+	return structuralEvidence
+		or (part.Transparency < 0.98 and visiblyRed and broadAndThin)
+		or (part.Transparency < 0.98 and visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
 end
 
 local function registerHazard(instance: Instance)
 	-- Cache structural candidates, not only parts that happen to be red at creation time.
 	if instance:IsA("BasePart") and isHazardCandidate(instance) then
 		HazardSet[instance] = true
+		RuntimeState.HazardMetadata[instance] = {
+			CFrame = instance.CFrame,
+			SampleAt = os.clock(),
+			Velocity = instance.AssemblyLinearVelocity,
+		}
 	end
 end
 
@@ -693,8 +700,33 @@ local function hazardVerticalHalfExtent(part: BasePart): number
 		+ math.abs(part.CFrame.LookVector:Dot(worldUp)) * part.Size.Z * 0.5
 end
 
+local function hazardVelocity(part: BasePart): Vector3
+	local metadata = RuntimeState.HazardMetadata[part]
+	local now = os.clock()
+	local engineVelocity = part.AssemblyLinearVelocity
+	if metadata then
+		local elapsed = now - metadata.SampleAt
+		if elapsed > 0.01 and elapsed <= 0.5 then
+			local estimated = (part.Position - metadata.CFrame.Position) / elapsed
+			if estimated.Magnitude <= 160 and engineVelocity.Magnitude < 0.1 then
+				engineVelocity = estimated
+			end
+		end
+		metadata.CFrame = part.CFrame
+		metadata.SampleAt = now
+		metadata.Velocity = engineVelocity
+	else
+		RuntimeState.HazardMetadata[part] = {
+			CFrame = part.CFrame,
+			SampleAt = now,
+			Velocity = engineVelocity,
+		}
+	end
+	return engineVelocity
+end
+
 local function hazardThreatensHeight(part: BasePart, position: Vector3, lookaheadSeconds: number?): boolean
-	local predictedPosition = part.Position + part.AssemblyLinearVelocity * (lookaheadSeconds or 0)
+	local predictedPosition = part.Position + hazardVelocity(part) * (lookaheadSeconds or 0)
 	return math.abs(position.Y - predictedPosition.Y)
 		<= hazardVerticalHalfExtent(part) + rootGroundOffset() + Config.DodgeVerticalPadding
 end
@@ -717,7 +749,7 @@ RuntimeState.hazardIsPrecast = function(part: BasePart): boolean
 end
 
 RuntimeState.hazardEdgeDistance = function(part: BasePart, position: Vector3, lookaheadSeconds: number?): number
-	local futureCFrame = part.CFrame + part.AssemblyLinearVelocity * (lookaheadSeconds or 0)
+	local futureCFrame = part.CFrame + hazardVelocity(part) * (lookaheadSeconds or 0)
 	local half = part.Size * 0.5
 	if part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball) then
 		local radiusX = math.abs(futureCFrame.RightVector.X) * half.X
@@ -739,8 +771,9 @@ end
 
 RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3): number
 	local minimum = math.huge
-	for index = 0, 4 do
-		local alpha = index / 4
+	local sampleCount = math.clamp(math.ceil((second - first).Magnitude / 4), 3, 12)
+	for index = 0, sampleCount do
+		local alpha = index / sampleCount
 		local point = first:Lerp(second, alpha)
 		if hazardThreatensHeight(part, point, Config.DodgeLookaheadSeconds * alpha) then
 			minimum = math.min(
@@ -794,6 +827,7 @@ local function refreshNearbyActiveHazards()
 	for part in pairs(HazardSet) do
 		if not part:IsDescendantOf(workspace) then
 			HazardSet[part] = nil
+			RuntimeState.HazardMetadata[part] = nil
 		elseif
 			(part.Position - Root.Position).Magnitude <= Config.DodgeDetectionRadius + hazardRadius(part)
 			and isActiveHazardPart(part)
@@ -2121,7 +2155,7 @@ local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 	end
 	-- Skill range is independent from the hold distance: cast as soon as a valid
 	-- target enters Q/E range, including while the controller is approaching.
-	if State == NavigationState.DODGE or not Target or not validTarget(Target) or distance3D > activeSkillRange then
+	if not Target or not validTarget(Target) or distance3D > activeSkillRange then
 		return
 	end
 	local now = os.clock()
@@ -2141,8 +2175,7 @@ end
 
 local function useNormalAttack(distance3D: number)
 	if
-		State == NavigationState.DODGE
-		or not validTarget(Target)
+		not validTarget(Target)
 		or distance3D > Config.AttackRange
 		or os.clock() - LastAttack < Config.AttackCooldown
 	then
@@ -2750,6 +2783,9 @@ end
 local function clearDodgeObjective()
 	ActiveHazard = nil
 	DodgeGoal = nil
+	RuntimeState.DodgeCommitUntil = 0
+	RuntimeState.DodgeCachedHazard = nil
+	RuntimeState.LastDodgeEvaluationAt = -math.huge
 	LastHazardThreatAt = -math.huge
 	LastDodgeGoalAttemptAt = -math.huge
 end
@@ -2816,6 +2852,7 @@ resetRuntimeForNewDungeon = function()
 	table.clear(EnemySet)
 	table.clear(PendingEnemyModels)
 	table.clear(HazardSet)
+	table.clear(RuntimeState.HazardMetadata)
 	RuntimeState.DungeonFinishedInstance = nil
 	RuntimeState.PreviousDungeonFinishedInstance = nil
 	RuntimeState.DungeonFinishedLastState = false
@@ -2910,6 +2947,8 @@ local function leaveDodge()
 	telemetry("DODGE_EXIT", ActiveHazard and ("inactive=" .. ActiveHazard:GetFullName()) or "no-active-hazard")
 	ActiveHazard = nil
 	DodgeGoal = nil
+	RuntimeState.DodgeCommitUntil = 0
+	RuntimeState.DodgeCachedHazard = nil
 	-- Pause, rather than erase, the accumulated no-progress duration.
 	local pausedFor = math.max(0, os.clock() - DodgeStartedAt)
 	LastMeaningfulProgressAt += pausedFor
@@ -2933,7 +2972,25 @@ local function updateDodgeController(): boolean
 	if not Running or not alive() or not Root or not Humanoid then
 		return false
 	end
-	local hazard, predicted, edgeDistance, routeDistance = threateningHazard()
+	local now = os.clock()
+	local evaluateNow = now - RuntimeState.LastDodgeEvaluationAt >= Config.DodgeEvaluationInterval
+	local hazard, predicted, edgeDistance, routeDistance
+	if evaluateNow then
+		RuntimeState.LastDodgeEvaluationAt = now
+		hazard, predicted, edgeDistance, routeDistance = threateningHazard()
+		RuntimeState.DodgeCachedHazard = hazard
+		RuntimeState.DodgeCachedPredicted = predicted
+		RuntimeState.DodgeCachedEdgeDistance = edgeDistance
+		RuntimeState.DodgeCachedRouteDistance = routeDistance
+	else
+		hazard = RuntimeState.DodgeCachedHazard
+		predicted = RuntimeState.DodgeCachedPredicted
+		edgeDistance = RuntimeState.DodgeCachedEdgeDistance
+		routeDistance = RuntimeState.DodgeCachedRouteDistance
+	end
+	if hazard and not hazard:IsDescendantOf(workspace) then
+		hazard = nil
+	end
 	if not hazard then
 		if State == NavigationState.DODGE then
 			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis then
@@ -2965,7 +3022,11 @@ local function updateDodgeController(): boolean
 			ActiveHazard = hazard
 		end
 	end
-	local needsNewGoal = State ~= NavigationState.DODGE or goalUnsafe
+	local goalReached = DodgeGoal and (DodgeGoal - Root.Position).Magnitude <= 1.5
+	local needsNewGoal = State ~= NavigationState.DODGE
+		or goalUnsafe
+		or goalReached
+		or (now >= RuntimeState.DodgeCommitUntil and evaluateNow)
 	if needsNewGoal then
 		if State ~= NavigationState.DODGE then
 			DodgeStartedAt = os.clock()
@@ -2994,6 +3055,7 @@ local function updateDodgeController(): boolean
 			)
 		)
 		DodgeGoal = chooseNearestSafeDodgeGoal(hazard)
+		RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
 		if not DodgeGoal then
 			-- Use the outward edge only when it stays on this floor and the route is verified.
 			local outward = Vector3.new(Root.Position.X - hazard.Position.X, 0, Root.Position.Z - hazard.Position.Z)
@@ -3115,10 +3177,7 @@ recoverByRespawn = function(
 	exploreRecovery: boolean?,
 	globalStuckAt: number?
 )
-	if RespawnInProgress then
-		return
-	end
-	if recoveryAbortReason() then
+	if RespawnInProgress or recoveryAbortReason() then
 		return
 	end
 	RespawnInProgress = true
@@ -3132,47 +3191,53 @@ recoverByRespawn = function(
 			and RuntimeState.RoundResetSerial == roundSerial
 			and RuntimeState.RecoverySerial == recoverySerial
 	end
+	local function releaseRecoveryIfOwned()
+		if RuntimeState.RecoverySerial == recoverySerial then
+			RespawnInProgress = false
+			ResetExecuting = false
+		end
+	end
 	task.spawn(function()
 		task.wait(0.4)
 		if not recoveryStillCurrent() or not Running then
+			releaseRecoveryIfOwned()
 			return
 		end
 		local abortReason = recoveryAbortReason()
 		if abortReason then
 			print("[RECOVERY] abort=" .. abortReason)
-			if recoveryStillCurrent() then
-				RespawnInProgress = false
-			end
+			releaseRecoveryIfOwned()
 			return
 		end
 		if expectedTarget then
-			if
-				State == NavigationState.DODGE
+			if State == NavigationState.DODGE
 				or Target ~= expectedTarget
 				or LastMeaningfulProgressAt ~= expectedProgressAt
 				or os.clock() - LastMeaningfulProgressAt < Config.RespawnStuckTime
 			then
-				RespawnInProgress = false
+				releaseRecoveryIfOwned()
 				return
 			end
 		elseif exploreRecovery then
 			if State == NavigationState.DODGE or Target or LastExploreMeaningfulProgressAt ~= expectedProgressAt then
-				RespawnInProgress = false
+				releaseRecoveryIfOwned()
 				return
 			end
 		elseif globalStuckAt then
 			if RuntimeState.JumpStillSince ~= globalStuckAt then
-				RespawnInProgress = false
+				releaseRecoveryIfOwned()
 				return
 			end
 		elseif alive() then
-			RespawnInProgress = false
+			releaseRecoveryIfOwned()
+			return
+		end
+		if not recoveryStillCurrent() then
+			releaseRecoveryIfOwned()
 			return
 		end
 		ResetExecuting = true
 		print("[RECOVERY] reason=stuck")
-		-- Keep a living target across a forced character reset. Clearing it here
-		-- made CharacterAdded wait for normal acquisition after replay.
 		local retainedTarget = if validTarget(Target) then Target else nil
 		if retainedTarget then
 			cancelPathRequest()
@@ -3185,34 +3250,32 @@ recoverByRespawn = function(
 		else
 			resetNavigationForTarget(nil)
 		end
-		-- Roblox Reset Character sequence. A single confirmation avoids a stale
-		-- second Return selecting an unrelated dialog during a map transition.
 		local resetCharacter = Character
 		for _, key in ipairs({ Enum.KeyCode.Escape, Enum.KeyCode.R, Enum.KeyCode.Return }) do
-			if
-				not recoveryStillCurrent()
+			if not recoveryStillCurrent()
 				or not Running
 				or Character ~= resetCharacter
 				or State == NavigationState.DODGE
 				or recoveryAbortReason()
 			then
-				if recoveryStillCurrent() then
-					ResetExecuting = false
-					RespawnInProgress = false
-				end
+				releaseRecoveryIfOwned()
 				return
 			end
 			sendKey(key)
 			task.wait(0.5)
+			if not recoveryStillCurrent() or not Running then
+				releaseRecoveryIfOwned()
+				return
+			end
 		end
 		task.wait(3)
-		if recoveryStillCurrent() then
-			ResetExecuting = false
-			RespawnInProgress = false
+		if not recoveryStillCurrent() or not Running then
+			releaseRecoveryIfOwned()
+			return
 		end
+		releaseRecoveryIfOwned()
 	end)
 end
-
 local function updateDungeonReplayState()
 	local now = os.clock()
 	if now - RuntimeState.LastDungeonStateCheckAt < 0.25 then
@@ -3379,6 +3442,9 @@ local function updateTargetAndObjective()
 		end)
 	end
 	NoTargetSince = nil
+	if State == NavigationState.DODGE then
+		return
+	end
 	if
 		now - LastTargetAcquireAt >= Config.TargetAcquireInterval
 		and State ~= NavigationState.DODGE
@@ -3862,6 +3928,7 @@ table.insert(
 		end
 		if instance:IsA("BasePart") then
 			HazardSet[instance] = nil
+			RuntimeState.HazardMetadata[instance] = nil
 		end
 	end)
 )
@@ -3924,10 +3991,6 @@ table.insert(
 				or instantFPS
 		end
 		local now = os.clock()
-		-- Keep Dodge disabled even if stale runtime config changes it after startup.
-		if Config.DodgeEnabled ~= false then
-			Config.DodgeEnabled = false
-		end
 		if now - RuntimeState.LastStatsSampleAt >= 0.5 then
 			RuntimeState.LastStatsSampleAt = now
 			local pingMs = readPingMs()
@@ -3988,9 +4051,7 @@ table.insert(
 		end
 		updateGlobalStuckJump()
 		updateTargetAndObjective()
-		if Config.DodgeEnabled and updateDodgeController() then
-			return
-		end
+		local dodgeOwnsTranslation = Config.DodgeEnabled and updateDodgeController()
 		updateTargetFacing()
 		if Target and validTarget(Target) then
 			local enemyRoot = getTargetRoot(Target)
@@ -3999,6 +4060,9 @@ table.insert(
 				useCombatSkills(enemyRoot, distance)
 				useNormalAttack(distance)
 			end
+		end
+		if dodgeOwnsTranslation then
+			return
 		end
 		if State == NavigationState.DIRECT then
 			updateDirectMovement()
