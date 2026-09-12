@@ -66,7 +66,7 @@ local DEFAULT_CONFIG = {
 	SlowMovementSpeedThreshold = 10,
 	SlowMovementRepathDelay = 0.75,
 	SlowMovementRepathCooldown = 2,
-	RespawnStuckTime = 15,
+	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
 	DodgeEnabled = false,
@@ -158,7 +158,7 @@ for key, defaultValue in pairs(DEFAULT_CONFIG) do
 		Config[key] = savedValue
 	end
 end
-Config.RespawnStuckTime = 15
+Config.RespawnStuckTime = 12
 -- Keep Dodge disabled even when an older saved/getgenv config has it enabled.
 Config.DodgeEnabled = false
 Config.ApproachDistance = nil
