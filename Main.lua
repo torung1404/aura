@@ -1,5 +1,5 @@
 -- Main.lua — Delta Executor remote entrypoint.
--- One Heartbeat owns movement; DODGE preempts COMBAT, DIRECT, PATH, RECOVERY, and EXPLORE.
+-- One Heartbeat owns translation; DODGE preempts DIRECT, PATH, RECOVERY, and EXPLORE only.
 
 local Services = {
 	Players = game:GetService("Players"),
@@ -44,7 +44,7 @@ local DEFAULT_CONFIG = {
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
-	MovementSpeedMultiplier = 1.4,
+	MovementWalkSpeed = 24,
 	DirectReachedDistance = 0.75,
 	DirectVerticalTolerance = 7,
 	DirectDecisionInterval = 0.25,
@@ -79,6 +79,7 @@ local DEFAULT_CONFIG = {
 	DodgeExitHysteresis = 0.25,
 	DodgeSafePadding = 5,
 	DodgeDetectionRadius = 60,
+	DodgePriorityRadius = 50,
 	DodgeRefreshInterval = 0.12,
 	DodgeVerticalPadding = 6,
 	DodgeCandidateCount = 8,
@@ -182,6 +183,10 @@ Config.ApproachDistance = nil
 Config.NormalSkillRange = 80
 Config.BossSkillRange = 100
 Config.SkillRange = nil
+-- Old percent-based speed settings are intentionally ignored. Movement uses
+-- one fixed target speed so re-exec and respawn cannot compound a multiplier.
+Config.MovementSpeedMultiplier = nil
+Config.MovementWalkSpeed = 24
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
 if type(SavedConfig.FarmEnabled) == "boolean" then
@@ -388,6 +393,16 @@ local RuntimeState = {
 	DodgeBudgetExhausted = false,
 	DodgeEvaluationSerial = 0,
 	DodgeDirection = Vector3.zero,
+	LastSpeedReassertAt = -math.huge,
+	SpecialSkillRangeBosses = {
+		["ancient enchanted tree"] = true,
+		["enchanted forest dragon"] = true,
+		["midgardian champion"] = true,
+		["bob"] = true,
+		["bob the frost giant"] = true,
+		["odin"] = true,
+		["odin reincarnation"] = true,
+	},
 	SuppressObjectiveTranslation = false,
 	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3, EvaluationSerial: number } },
 	VerticalPathTarget = nil :: Model?,
@@ -529,10 +544,11 @@ local function isBossTarget(model: Model): boolean
 end
 
 local function skillRangeForTarget(target: Model): number
-	-- Only these named bosses have the extended skill range. Other bosses use
-	-- the same normal range as regular enemies.
-	local targetName = string.lower(target.Name)
-	if targetName == "ancient enchanted tree" or targetName == "enchanted forest dragon" then
+	-- Normalize punctuation only, then require an exact known boss name. This
+	-- keeps ordinary mobs from receiving the extended range by a loose match.
+	local targetName = string.lower(target.Name):gsub("[%p_]+", " "):gsub("%s+", " ")
+	targetName = targetName:match("^%s*(.-)%s*$") or targetName
+	if RuntimeState.SpecialSkillRangeBosses[targetName] then
 		return Config.BossSkillRange
 	end
 	return Config.NormalSkillRange
@@ -651,6 +667,12 @@ local function hazardNameHint(part: BasePart): boolean
 			or lowerName:find("projectile", 1, true)
 			or lowerName:find("shockwave", 1, true)
 			or lowerName:find("cross", 1, true)
+			or lowerName:find("wave", 1, true)
+			or lowerName:find("tornado", 1, true)
+			or lowerName:find("whirlwind", 1, true)
+			or lowerName:find("shuriken", 1, true)
+			or lowerName:find("orb", 1, true)
+			or lowerName:find("meteor", 1, true)
 		then
 			return true
 		end
@@ -669,7 +691,19 @@ RuntimeState.hazardKind = function(part: BasePart): string?
 		if name:find("precast", 1, true) or name:find("telegraph", 1, true) or name:find("indicator", 1, true) or name:find("warning", 1, true) then
 			return "PRECAST"
 		end
-		if name:find("beam", 1, true) or name:find("laser", 1, true) or name:find("projectile", 1, true) or name:find("shockwave", 1, true) or name:find("cross", 1, true) then
+		if
+			name:find("beam", 1, true)
+			or name:find("laser", 1, true)
+			or name:find("projectile", 1, true)
+			or name:find("shockwave", 1, true)
+			or name:find("cross", 1, true)
+			or name:find("wave", 1, true)
+			or name:find("tornado", 1, true)
+			or name:find("whirlwind", 1, true)
+			or name:find("shuriken", 1, true)
+			or name:find("orb", 1, true)
+			or name:find("meteor", 1, true)
+		then
 			return "EFFECT"
 		end
 		current = current.Parent
@@ -843,6 +877,29 @@ RuntimeState.hazardEdgeDistance = function(part: BasePart, position: Vector3, lo
 		return -math.min(expanded.X - math.abs(localPoint.X), expanded.Y - math.abs(localPoint.Y), expanded.Z - math.abs(localPoint.Z))
 	end
 	return outside.Magnitude
+end
+
+-- For a long box/beam, exiting through its narrow horizontal side is safer
+-- and shorter than moving away from its centre along the beam's length.
+RuntimeState.hazardExitDirection = function(part: BasePart, position: Vector3): Vector3
+	local futureCFrame = RuntimeState.hazardFutureCFrame(part, 0)
+	if part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball) then
+		local radial = Vector3.new(position.X - futureCFrame.Position.X, 0, position.Z - futureCFrame.Position.Z)
+		return radial.Magnitude > 0.1 and radial.Unit or Vector3.new(1, 0, 0)
+	end
+	local localPoint = futureCFrame:PointToObjectSpace(position)
+	local half = part.Size * 0.5
+	local xMargin = half.X - math.abs(localPoint.X)
+	local zMargin = half.Z - math.abs(localPoint.Z)
+	local localDirection: Vector3
+	if xMargin <= zMargin then
+		localDirection = Vector3.new(localPoint.X >= 0 and 1 or -1, 0, 0)
+	else
+		localDirection = Vector3.new(0, 0, localPoint.Z >= 0 and 1 or -1)
+	end
+	local worldDirection = futureCFrame:VectorToWorldSpace(localDirection)
+	local flatDirection = Vector3.new(worldDirection.X, 0, worldDirection.Z)
+	return flatDirection.Magnitude > 0.1 and flatDirection.Unit or Vector3.new(1, 0, 0)
 end
 
 RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3, padding: number?): number
@@ -1028,12 +1085,24 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 			local triggerPadding = if RuntimeState.hazardIsPrecast(part)
 				then Config.DodgePreTriggerPadding
 				else Config.DodgeTriggerPadding
-			local predicted = routeClearance <= triggerPadding
+			local velocity = hazardVelocity(part)
+			local toPlayer = Vector3.new(Root.Position.X - part.Position.X, 0, Root.Position.Z - part.Position.Z)
+			local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+			local approachingSpeed = if toPlayer.Magnitude > 0.1 then horizontalVelocity:Dot(toPlayer.Unit) else 0
+			local timeToImpact = if approachingSpeed > 0.5
+				then math.max(0, edgeDistance) / approachingSpeed
+				else math.huge
+			local routeThreat = routeClearance <= triggerPadding
+			local nearbyThreat = edgeDistance <= Config.DodgePriorityRadius
+			local predicted = routeThreat or timeToImpact <= Config.DodgeLookaheadSeconds
 			local retainingActiveDodge = State == NavigationState.DODGE
 				and edgeDistance <= Config.DodgeSafePadding
-			local threatScore = math.min(edgeDistance, routeClearance)
+			-- Nearby hazards win first. A farther one is allowed to interrupt only
+			-- when its predicted path actually intersects the current route.
+			local threatScore = math.min(edgeDistance, routeClearance, timeToImpact * 10)
 			if
 				edgeDistance <= Config.DodgeDetectionRadius
+				and (nearbyThreat or routeThreat or retainingActiveDodge)
 				and (edgeDistance <= triggerPadding or predicted or retainingActiveDodge)
 				and threatScore < bestThreatScore
 			then
@@ -1112,8 +1181,8 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
 	if not Root then
 		return nil, false
 	end
-	local fromCenter = Vector3.new(Root.Position.X - hazard.Position.X, 0, Root.Position.Z - hazard.Position.Z)
-	local baseAngle = fromCenter.Magnitude > 0.1 and math.atan2(fromCenter.Z, fromCenter.X) or 0
+	local exitDirection = RuntimeState.hazardExitDirection(hazard, Root.Position)
+	local baseAngle = math.atan2(exitDirection.Z, exitDirection.X)
 	local bestGoal: Vector3? = nil
 	local bestScore = -math.huge
 	local footprint = playerFootprintRadius()
@@ -1153,7 +1222,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
 						)
 					end
 				end
-				local awayDirection = Vector3.new(math.cos(baseAngle), 0, math.sin(baseAngle))
+				local awayDirection = exitDirection
 				local candidateDirection = Vector3.new(grounded.X - Root.Position.X, 0, grounded.Z - Root.Position.Z)
 				local awayBias = candidateDirection.Magnitude > 0.1 and awayDirection:Dot(candidateDirection.Unit) or 0
 				local continuity = RuntimeState.DodgeDirection
@@ -1165,7 +1234,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
 					else 0
 				-- Safety is a hard gate above. Once every candidate has passed it,
 				-- prefer a short safe detour that preserves farm progress.
-				local score = math.min(minimumSafety, 20) * 1.5 - distance * 0.4 + awayBias + continuityBias + targetProgress * 2
+				local score = math.min(minimumSafety, 20) * 0.75 - distance * 0.3 + awayBias + continuityBias + targetProgress * 2
 				if not bestGoal or score > bestScore then
 					bestScore = score
 					bestGoal = grounded
@@ -2298,11 +2367,8 @@ end
 
 local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
-	if os.clock() < RuntimeState.RespawnRushUntil then
-		return
-	end
 	-- Skill range is independent from the hold distance: cast as soon as a valid
-	-- target enters Q/E range, including while the controller is approaching.
+	-- target enters Q/E range, including while respawn-rushing or dodging.
 	if not Target or not validTarget(Target) or distance3D > activeSkillRange then
 		return
 	end
@@ -2425,13 +2491,17 @@ local function enablePlayerControls()
 end
 
 local function applyMovementSpeed()
-	if not Humanoid or SpeedApplied then
+	if not Humanoid then
 		return
 	end
-	DefaultWalkSpeed = Humanoid.WalkSpeed
-	AppliedWalkSpeed = DefaultWalkSpeed * Config.MovementSpeedMultiplier
-	Humanoid.WalkSpeed = AppliedWalkSpeed
-	SpeedApplied = true
+	if not SpeedApplied then
+		DefaultWalkSpeed = Humanoid.WalkSpeed
+		SpeedApplied = true
+	end
+	AppliedWalkSpeed = 24
+	if math.abs(Humanoid.WalkSpeed - AppliedWalkSpeed) > 0.05 then
+		Humanoid.WalkSpeed = AppliedWalkSpeed
+	end
 end
 
 local function restoreMovementSpeed()
@@ -3210,10 +3280,7 @@ local function updateDodgeController(): boolean
 		local selectedGoal, budgetExhausted = chooseNearestSafeDodgeGoal(hazard)
 		if not selectedGoal and not budgetExhausted then
 			-- Use the outward edge only when it stays on this floor and the route is verified.
-			local outward = Vector3.new(Root.Position.X - hazard.Position.X, 0, Root.Position.Z - hazard.Position.Z)
-			if outward.Magnitude <= 0.1 then
-				outward = Vector3.new(1, 0, 0)
-			end
+			local outward = RuntimeState.hazardExitDirection(hazard, Root.Position)
 			local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, playerFootprintRadius())
 			local fallbackDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
 			local fallback = Root.Position + outward.Unit * fallbackDistance
@@ -4197,7 +4264,7 @@ table.insert(
 					elseif RuntimeState.ReplayPhase == "WAIT_NEW_ROUND" then "WAIT ROUND"
 					else RuntimeState.ReplayPhase
 				info.Text = string.format(
-					"State: %s | Target: %s\nDist: %s | Y: %s | Skill: %.0f | Kite: %.0f\nDodge: %s | Replay: %s\nFPS: %.0f | Ping: %.0f ms | Speed: +%.0f%%\nStuck: %.1f/%.0fs",
+					"State: %s | Target: %s\nDist: %s | Y: %s | Skill: %.0f | Kite: %.0f\nDodge: %s | Replay: %s\nFPS: %.0f | Ping: %.0f ms | Speed: %.0f\nStuck: %.1f/%.0fs",
 					State,
 					targetName,
 					distance and string.format("%.1f", distance) or "--",
@@ -4208,7 +4275,7 @@ table.insert(
 					replayLabel,
 					RuntimeState.SmoothedFPS,
 					RuntimeState.PingMs,
-					(Config.MovementSpeedMultiplier - 1) * 100,
+					Humanoid and Humanoid.WalkSpeed or Config.MovementWalkSpeed,
 					stuckSeconds,
 					Config.RespawnStuckTime
 				)
@@ -4218,6 +4285,12 @@ table.insert(
 		end
 		if not Running or not alive() then
 			return
+		end
+		-- Other game scripts can overwrite WalkSpeed after a spawn or transition.
+		-- Reassert at a small fixed interval, never as an unbounded per-frame write.
+		if now - RuntimeState.LastSpeedReassertAt >= 0.5 then
+			RuntimeState.LastSpeedReassertAt = now
+			applyMovementSpeed()
 		end
 		if ResetExecuting then
 			setNavigationState(NavigationState.IDLE)
