@@ -384,6 +384,7 @@ local RuntimeState = {
 	RoundTransitionDeadline = 0,
 	RoundTransitionTimedOut = false,
 	DodgeCommitUntil = 0,
+	DodgeHoldUntil = 0,
 	LastDodgeEvaluationAt = -math.huge,
 	DodgeCachedHazard = nil :: BasePart?,
 	DodgeCachedPredicted = false,
@@ -1070,18 +1071,13 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 	local bestThreatScore = math.huge
 	local footprint = playerFootprintRadius()
 	local movementGoal = upcomingMovementGoal()
-	local predictedEnd = Root.Position
-	if movementGoal then
-		local flat = Vector3.new(movementGoal.X - Root.Position.X, 0, movementGoal.Z - Root.Position.Z)
-		local lookahead = math.clamp((Humanoid and Humanoid.WalkSpeed or 16) * Config.DodgeLookaheadSeconds, 8, 36)
-		if flat.Magnitude > 0.1 then
-			predictedEnd = Root.Position + flat.Unit * math.min(flat.Magnitude, lookahead)
-		end
-	end
+	-- Use the complete current navigation segment, not only a short lookahead:
+	-- a beam can block the approach route before its edge reaches the player.
+	local approachEnd = movementGoal or Root.Position
 	for part in pairs(NearbyActiveHazards) do
 		if part:IsDescendantOf(workspace) and isActiveHazardPart(part) then
 			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
-			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, predictedEnd, footprint)
+			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
 			local triggerPadding = if RuntimeState.hazardIsPrecast(part)
 				then Config.DodgePreTriggerPadding
 				else Config.DodgeTriggerPadding
@@ -1177,14 +1173,14 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	return RuntimeState.dodgeHasGroundSupport(goal, nil)
 end
 
-local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
+local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean, string?, number?)
 	if not Root then
-		return nil, false
+		return nil, false, nil, nil
 	end
 	local exitDirection = RuntimeState.hazardExitDirection(hazard, Root.Position)
-	local baseAngle = math.atan2(exitDirection.Z, exitDirection.X)
 	local bestGoal: Vector3? = nil
 	local bestScore = -math.huge
+	local bestLabel: string? = nil
 	local footprint = playerFootprintRadius()
 	local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
 	local escapeDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
@@ -1192,18 +1188,50 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
 	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
 	local objective = targetRoot and targetRoot.Position or NavigationGoal
 	local currentTargetDistance = objective and flatPointDistance(Root.Position, objective) or nil
+	local forwardDirection = objective
+		and Vector3.new(objective.X - Root.Position.X, 0, objective.Z - Root.Position.Z)
+		or Vector3.zero
+	if forwardDirection.Magnitude > 0.1 then
+		forwardDirection = forwardDirection.Unit
+	else
+		forwardDirection = Vector3.zero
+	end
+	local candidateDirections: { { Direction: Vector3, Label: string } } = {}
+	local function addCandidateDirection(direction: Vector3, label: string)
+		local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+		if flatDirection.Magnitude > 0.1 then
+			table.insert(candidateDirections, { Direction = flatDirection.Unit, Label = label })
+		end
+	end
+	if forwardDirection.Magnitude > 0.1 then
+		-- Try diagonal exits first. They cross the narrow side of a line while
+		-- preserving approach progress; both sides are evaluated, never fixed.
+		addCandidateDirection(forwardDirection + exitDirection, "forward-left")
+		addCandidateDirection(forwardDirection - exitDirection, "forward-right")
+		addCandidateDirection(exitDirection, "lateral-left")
+		addCandidateDirection(-exitDirection, "lateral-right")
+		addCandidateDirection(forwardDirection, "forward")
+		addCandidateDirection(-forwardDirection + exitDirection, "retreat-left")
+		addCandidateDirection(-forwardDirection - exitDirection, "retreat-right")
+	else
+		addCandidateDirection(exitDirection, "lateral-left")
+		addCandidateDirection(-exitDirection, "lateral-right")
+	end
+	-- Keep a bounded fallback set for circular hazards or an objective that is
+	-- temporarily unavailable. These are only reached after lateral choices.
+	for angleIndex = 1, Config.DodgeCandidateCount do
+		if #candidateDirections >= Config.DodgeCandidateCount then
+			break
+		end
+		local angle = (angleIndex - 1) * math.pi * 2 / Config.DodgeCandidateCount
+		addCandidateDirection(Vector3.new(math.cos(angle), 0, math.sin(angle)), "fallback-" .. tostring(angleIndex))
+	end
 	for ringIndex, ringDistance in ipairs(ringDistances) do
-		for angleIndex = 0, Config.DodgeCandidateCount - 1 do
+		for directionIndex, candidateInfo in ipairs(candidateDirections) do
 			if RuntimeState.DodgeBudgetExhausted then
-				return bestGoal, true
+				return bestGoal, true, bestLabel, bestScore
 			end
-			local offsetIndex = 0
-			if angleIndex > 0 then
-				offsetIndex = if angleIndex % 2 == 1 then (angleIndex + 1) / 2 else -angleIndex / 2
-			end
-			local angle = baseAngle + offsetIndex * math.pi * 2 / Config.DodgeCandidateCount
-			local candidate = Root.Position
-				+ Vector3.new(math.cos(angle) * ringDistance, 0, math.sin(angle) * ringDistance)
+			local candidate = Root.Position + candidateInfo.Direction * ringDistance
 			local grounded, foundGround = RuntimeState.projectDodgeGround(candidate, nil)
 			local rejection = if not foundGround
 				then "no-ground"
@@ -1232,22 +1260,31 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
 				local targetProgress = if objective and currentTargetDistance
 					then currentTargetDistance - flatPointDistance(grounded, objective)
 					else 0
+				local forwardAlignment = if forwardDirection.Magnitude > 0.1 and candidateDirection.Magnitude > 0.1
+					then forwardDirection:Dot(candidateDirection.Unit)
+					else 0
 				-- Safety is a hard gate above. Once every candidate has passed it,
-				-- prefer a short safe detour that preserves farm progress.
-				local score = math.min(minimumSafety, 20) * 0.75 - distance * 0.3 + awayBias + continuityBias + targetProgress * 2
+				-- prefer a short diagonal detour that preserves approach progress.
+				local score = math.min(minimumSafety, 20) * 0.75
+					- distance * 0.3
+					+ awayBias
+					+ continuityBias
+					+ targetProgress * 2.5
+					+ forwardAlignment * 3
 				if not bestGoal or score > bestScore then
 					bestScore = score
 					bestGoal = grounded
+					bestLabel = candidateInfo.Label
 				end
 			else
-				RuntimeUtil.telemetry("DODGE_REJECT_" .. tostring(ringIndex) .. "_" .. tostring(angleIndex), rejection)
+				RuntimeUtil.telemetry("DODGE_REJECT_" .. tostring(ringIndex) .. "_" .. tostring(directionIndex), rejection)
 			end
 		end
 		if bestGoal then
-			return bestGoal, false
+			return bestGoal, false, bestLabel, bestScore
 		end
 	end
-	return bestGoal, RuntimeState.DodgeBudgetExhausted
+	return bestGoal, RuntimeState.DodgeBudgetExhausted, bestLabel, bestScore
 end
 
 RuntimeState.exploreCellKey = function(position: Vector3): string
@@ -3002,6 +3039,7 @@ local function clearDodgeObjective()
 	ActiveHazard = nil
 	DodgeGoal = nil
 	RuntimeState.DodgeCommitUntil = 0
+	RuntimeState.DodgeHoldUntil = 0
 	RuntimeState.DodgeCachedHazard = nil
 	RuntimeState.DodgeCachedPredicted = false
 	RuntimeState.DodgeCachedEdgeDistance = math.huge
@@ -3208,6 +3246,12 @@ local function updateDodgeController(): boolean
 			Humanoid:Move(cachedDirection.Magnitude > 1.5 and cachedDirection.Unit or Vector3.zero, false)
 			return true
 		end
+		if now < RuntimeState.DodgeHoldUntil then
+			LastMeaningfulProgressAt = now
+			RuntimeState.JumpStillSince = now
+			stopTranslation()
+			return true
+		end
 		return false
 	end
 	local hazard, predicted, edgeDistance, routeDistance
@@ -3224,12 +3268,14 @@ local function updateDodgeController(): boolean
 		hazard = nil
 	end
 	if not hazard then
+		RuntimeState.DodgeHoldUntil = 0
 		if State == NavigationState.DODGE then
 			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis and DodgeGoal then
 				local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
 				Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
 				return true
 			end
+			RuntimeUtil.telemetry("DODGE_ROUTE", "exit=direct-route-safe")
 			leaveDodge()
 		end
 		return false
@@ -3277,7 +3323,10 @@ local function updateDodgeController(): boolean
 				routeDistance
 			)
 		)
-		local selectedGoal, budgetExhausted = chooseNearestSafeDodgeGoal(hazard)
+		if routeDistance <= Config.DodgePreTriggerPadding then
+			RuntimeUtil.telemetry("DODGE_ROUTE", "route-blocked hazard=" .. hazard.Name)
+		end
+		local selectedGoal, budgetExhausted, selectedLabel, selectedScore = chooseNearestSafeDodgeGoal(hazard)
 		if not selectedGoal and not budgetExhausted then
 			-- Use the outward edge only when it stays on this floor and the route is verified.
 			local outward = RuntimeState.hazardExitDirection(hazard, Root.Position)
@@ -3299,21 +3348,30 @@ local function updateDodgeController(): boolean
 		if selectedGoal then
 			cancelPathRequest()
 			DodgeGoal = selectedGoal
+			RuntimeState.DodgeHoldUntil = 0
 			RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
 			setNavigationState(NavigationState.DODGE)
-			RuntimeUtil.telemetry("DODGE_GOAL", tostring(DodgeGoal))
+			RuntimeUtil.telemetry(
+				"DODGE_GOAL",
+				string.format("choose=%s score=%.1f goal=%s", selectedLabel or "fallback", selectedScore or 0, tostring(DodgeGoal))
+			)
 		else
 			-- No verified safe route is not an instruction to hold translation at
-			-- zero. Release Dodge and let normal movement make the next decision.
+			-- zero indefinitely. Hold only until the next bounded evaluation so a
+			-- blocked direct route cannot issue one unsafe approach frame.
 			ActiveHazard = nil
 			DodgeGoal = nil
 			RuntimeState.DodgeCommitUntil = 0
 			RuntimeState.DodgeCachedHazard = nil
+			RuntimeState.DodgeHoldUntil = now + Config.DodgeEvaluationInterval
+			LastMeaningfulProgressAt = now
+			RuntimeState.JumpStillSince = now
 			RuntimeUtil.telemetry("DODGE_GOAL", budgetExhausted and "budget-exhausted" or "no-safe-goal")
 			if State == NavigationState.DODGE then
 				setNavigationState(NavigationState.IDLE)
 			end
-			return false
+			stopTranslation()
+			return true
 		end
 	end
 	local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
