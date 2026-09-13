@@ -386,7 +386,10 @@ local RuntimeState = {
 	DodgeCachedEdgeDistance = math.huge,
 	DodgeCachedRouteDistance = math.huge,
 	DodgeRaycastsUsed = 0,
-	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3 } },
+	DodgeEvaluationSerial = 0,
+	DodgeDirection = Vector3.zero,
+	SuppressObjectiveTranslation = false,
+	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3, EvaluationSerial: number } },
 	VerticalPathTarget = nil :: Model?,
 	VerticalPathGoal = nil :: Vector3?,
 }
@@ -643,14 +646,27 @@ local function hazardNameHint(part: BasePart): boolean
 			or lowerName:find("precast", 1, true)
 			or lowerName:find("damagebox", 1, true)
 			or lowerName:find("damagepart", 1, true)
-			or lowerName:find("attack", 1, true)
-			or lowerName:find("skill", 1, true)
 		then
 			return true
 		end
 		current = current.Parent
 	end
 	return false
+end
+
+RuntimeState.hazardKind = function(part: BasePart): string?
+	local current: Instance? = part
+	while current and current ~= workspace do
+		local name = current.Name:lower()
+		if name:find("hitbox", 1, true) or name:find("damagebox", 1, true) or name:find("damagepart", 1, true) then
+			return "DAMAGE"
+		end
+		if name:find("precast", 1, true) or name:find("telegraph", 1, true) or name:find("indicator", 1, true) or name:find("warning", 1, true) then
+			return "PRECAST"
+		end
+		current = current.Parent
+	end
+	return nil
 end
 
 local function isHazardCandidate(part: BasePart): boolean
@@ -666,7 +682,8 @@ local function isHazardCandidate(part: BasePart): boolean
 		or not part.CanCollide
 		or part.AssemblyLinearVelocity.Magnitude >= 1
 		or (part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball))
-	return (hazardNameHint(part) and effectGeometry)
+	return (RuntimeState.hazardKind(part) ~= nil and effectGeometry)
+		or (hazardNameHint(part) and effectGeometry)
 		or (visiblyRed and broadAndThin)
 		or (visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
 end
@@ -687,6 +704,16 @@ local function isActiveHazardPart(part: BasePart): boolean
 		or not part.CanCollide
 		or part.AssemblyLinearVelocity.Magnitude >= 1
 		or (part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball))
+	local kind = RuntimeState.hazardKind(part)
+	-- Explicit damage geometry remains valid even when the server makes the
+	-- hitbox invisible. Telegraphs must remain visible, otherwise reused UI/VFX
+	-- parts would keep the player in DODGE after their cast has ended.
+	if kind == "DAMAGE" then
+		return effectGeometry
+	end
+	if kind == "PRECAST" then
+		return part.Transparency < 0.98 and effectGeometry
+	end
 	local structuralEvidence = hazardNameHint(part) and effectGeometry
 	return structuralEvidence
 		or (part.Transparency < 0.98 and visiblyRed and broadAndThin)
@@ -701,6 +728,7 @@ local function registerHazard(instance: Instance)
 			CFrame = instance.CFrame,
 			SampleAt = os.clock(),
 			Velocity = instance.AssemblyLinearVelocity,
+			EvaluationSerial = 0,
 		}
 	end
 end
@@ -740,85 +768,111 @@ end
 
 local function hazardVelocity(part: BasePart): Vector3
 	local metadata = RuntimeState.HazardMetadata[part]
+	local serial = RuntimeState.DodgeEvaluationSerial
+	if metadata and metadata.EvaluationSerial == serial then
+		return metadata.Velocity
+	end
 	local now = os.clock()
 	local engineVelocity = part.AssemblyLinearVelocity
 	if metadata then
 		local elapsed = now - metadata.SampleAt
 		if elapsed > 0.01 and elapsed <= 0.5 then
 			local estimated = (part.Position - metadata.CFrame.Position) / elapsed
-			if estimated.Magnitude <= 160 and engineVelocity.Magnitude < 0.1 then
+			if (part.Position - metadata.CFrame.Position).Magnitude <= 80 and estimated.Magnitude <= 160 and engineVelocity.Magnitude < 0.1 then
 				engineVelocity = estimated
 			end
 		end
 		metadata.CFrame = part.CFrame
 		metadata.SampleAt = now
 		metadata.Velocity = engineVelocity
+		metadata.EvaluationSerial = serial
 	else
 		RuntimeState.HazardMetadata[part] = {
 			CFrame = part.CFrame,
 			SampleAt = now,
 			Velocity = engineVelocity,
+			EvaluationSerial = serial,
 		}
 	end
 	return engineVelocity
 end
 
 local function hazardThreatensHeight(part: BasePart, position: Vector3, lookaheadSeconds: number?): boolean
-	local predictedPosition = part.Position + hazardVelocity(part) * (lookaheadSeconds or 0)
+	local predictedPosition = RuntimeState.hazardFutureCFrame(part, lookaheadSeconds).Position
 	return math.abs(position.Y - predictedPosition.Y)
 		<= hazardVerticalHalfExtent(part) + rootGroundOffset() + Config.DodgeVerticalPadding
 end
 
 RuntimeState.hazardIsPrecast = function(part: BasePart): boolean
-	local current: Instance? = part
-	while current and current ~= workspace do
-		local name = current.Name:lower()
-		if
-			name:find("precast", 1, true)
-			or name:find("telegraph", 1, true)
-			or name:find("indicator", 1, true)
-			or name:find("warning", 1, true)
-		then
-			return true
-		end
-		current = current.Parent
-	end
-	return false
+	return RuntimeState.hazardKind(part) == "PRECAST"
 end
 
-RuntimeState.hazardEdgeDistance = function(part: BasePart, position: Vector3, lookaheadSeconds: number?): number
-	local futureCFrame = part.CFrame + hazardVelocity(part) * (lookaheadSeconds or 0)
+RuntimeState.hazardFutureCFrame = function(part: BasePart, lookaheadSeconds: number?): CFrame
+	local velocity = hazardVelocity(part)
+	local metadata = RuntimeState.HazardMetadata[part]
+	local baseCFrame = metadata and metadata.CFrame or part.CFrame
+	return baseCFrame + velocity * (lookaheadSeconds or 0)
+end
+
+RuntimeState.hazardEdgeDistance = function(part: BasePart, position: Vector3, lookaheadSeconds: number?, padding: number?): number
+	local futureCFrame = RuntimeState.hazardFutureCFrame(part, lookaheadSeconds)
 	local half = part.Size * 0.5
+	local expansion = padding or 0
 	if part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball) then
-		local radiusX = math.abs(futureCFrame.RightVector.X) * half.X
-			+ math.abs(futureCFrame.UpVector.X) * half.Y
-			+ math.abs(futureCFrame.LookVector.X) * half.Z
-		local radiusZ = math.abs(futureCFrame.RightVector.Z) * half.X
-			+ math.abs(futureCFrame.UpVector.Z) * half.Y
-			+ math.abs(futureCFrame.LookVector.Z) * half.Z
-		return flatPointDistance(position, futureCFrame.Position) - math.max(radiusX, radiusZ)
+		return (position - futureCFrame.Position).Magnitude - math.max(half.X, half.Y, half.Z) - expansion
 	end
-	local localPoint = futureCFrame:PointToObjectSpace(Vector3.new(position.X, futureCFrame.Position.Y, position.Z))
-	local outsideX = math.abs(localPoint.X) - half.X
-	local outsideZ = math.abs(localPoint.Z) - half.Z
-	if outsideX <= 0 and outsideZ <= 0 then
-		return -math.min(-outsideX, -outsideZ)
+	local localPoint = futureCFrame:PointToObjectSpace(position)
+	local expanded = half + Vector3.new(expansion, expansion, expansion)
+	local outside = Vector3.new(
+		math.max(0, math.abs(localPoint.X) - expanded.X),
+		math.max(0, math.abs(localPoint.Y) - expanded.Y),
+		math.max(0, math.abs(localPoint.Z) - expanded.Z)
+	)
+	if outside.Magnitude <= 0 then
+		return -math.min(expanded.X - math.abs(localPoint.X), expanded.Y - math.abs(localPoint.Y), expanded.Z - math.abs(localPoint.Z))
 	end
-	return Vector2.new(math.max(0, outsideX), math.max(0, outsideZ)).Magnitude
+	return outside.Magnitude
 end
 
-RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3): number
+RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3, padding: number?): number
+	local futureCFrame = RuntimeState.hazardFutureCFrame(part, Config.DodgeLookaheadSeconds * 0.5)
+	local half = part.Size * 0.5 + Vector3.new(padding or 0, padding or 0, padding or 0)
+	if part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball) then
+		local delta = second - first
+		local lengthSquared = delta:Dot(delta)
+		local alpha = if lengthSquared > 0 then math.clamp((futureCFrame.Position - first):Dot(delta) / lengthSquared, 0, 1) else 0
+		return (first:Lerp(second, alpha) - futureCFrame.Position).Magnitude - math.max(half.X, half.Y, half.Z)
+	end
+	local localFirst = futureCFrame:PointToObjectSpace(first)
+	local localSecond = futureCFrame:PointToObjectSpace(second)
+	local localDelta = localSecond - localFirst
+	local enterAt, exitAt = 0, 1
+	for axis = 1, 3 do
+		local origin = if axis == 1 then localFirst.X elseif axis == 2 then localFirst.Y else localFirst.Z
+		local direction = if axis == 1 then localDelta.X elseif axis == 2 then localDelta.Y else localDelta.Z
+		local extent = if axis == 1 then half.X elseif axis == 2 then half.Y else half.Z
+		if math.abs(direction) < 0.0001 then
+			if origin < -extent or origin > extent then
+				enterAt, exitAt = 1, 0
+				break
+			end
+		else
+			local nearAt = (-extent - origin) / direction
+			local farAt = (extent - origin) / direction
+			if nearAt > farAt then nearAt, farAt = farAt, nearAt end
+			enterAt, exitAt = math.max(enterAt, nearAt), math.min(exitAt, farAt)
+			if enterAt > exitAt then break end
+		end
+	end
+	if enterAt <= exitAt and exitAt >= 0 and enterAt <= 1 then
+		return -0.001
+	end
 	local minimum = math.huge
-	local sampleCount = math.clamp(math.ceil((second - first).Magnitude / 4), 3, 12)
+	local sampleCount = math.clamp(math.ceil((second - first).Magnitude / 3), 3, 16)
 	for index = 0, sampleCount do
 		local alpha = index / sampleCount
 		local point = first:Lerp(second, alpha)
-		if hazardThreatensHeight(part, point, Config.DodgeLookaheadSeconds * alpha) then
-			minimum = math.min(
-				minimum,
-				RuntimeState.hazardEdgeDistance(part, point, Config.DodgeLookaheadSeconds * alpha)
-			)
-		end
+		minimum = math.min(minimum, RuntimeState.hazardEdgeDistance(part, point, Config.DodgeLookaheadSeconds * alpha, padding))
 	end
 	return minimum
 end
@@ -828,6 +882,25 @@ local function playerFootprintRadius(): number
 		return Config.DodgePlayerSafetyMargin
 	end
 	return math.max(Root.Size.X, Root.Size.Z) * 0.5 + Config.DodgePlayerSafetyMargin
+end
+
+RuntimeState.consumeDodgeRaycast = function(): boolean
+	if RuntimeState.DodgeRaycastsUsed >= Config.DodgeRaycastBudget then
+		return false
+	end
+	RuntimeState.DodgeRaycastsUsed += 1
+	return true
+end
+
+RuntimeState.projectDodgeGround = function(position: Vector3, target: Model?): (Vector3, boolean)
+	if not RuntimeState.consumeDodgeRaycast() then
+		return position, false
+	end
+	return projectToWalkableGround(position, target)
+end
+
+RuntimeState.dodgeHasGroundSupport = function(position: Vector3, target: Model?): boolean
+	return RuntimeState.consumeDodgeRaycast() and hasGroundSupport(position, target)
 end
 
 local function refreshNearbyActiveHazards()
@@ -888,8 +961,8 @@ local function pointIsSafeFromHazards(position: Vector3): boolean
 			part:IsDescendantOf(workspace)
 			and isActiveHazardPart(part)
 			and hazardThreatensHeight(part, position, Config.DodgeLookaheadSeconds)
-			and RuntimeState.hazardEdgeDistance(part, position, Config.DodgeLookaheadSeconds)
-				<= playerFootprintRadius() + Config.DodgeSafePadding
+			and RuntimeState.hazardEdgeDistance(part, position, Config.DodgeLookaheadSeconds, playerFootprintRadius())
+				<= Config.DodgeSafePadding
 		then
 			return false
 		end
@@ -938,8 +1011,8 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 	end
 	for part in pairs(NearbyActiveHazards) do
 		if part:IsDescendantOf(workspace) and isActiveHazardPart(part) then
-			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0) - footprint
-			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, predictedEnd) - footprint
+			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
+			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, predictedEnd, footprint)
 			local triggerPadding = if RuntimeState.hazardIsPrecast(part)
 				then Config.DodgePreTriggerPadding
 				else Config.DodgeTriggerPadding
@@ -974,10 +1047,9 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	if flatDelta.Magnitude <= 0.1 then
 		return true
 	end
-	if RuntimeState.DodgeRaycastsUsed >= Config.DodgeRaycastBudget then
+	if not RuntimeState.consumeDodgeRaycast() then
 		return false
 	end
-	RuntimeState.DodgeRaycastsUsed += 1
 	local obstacle = workspace:Raycast(Root.Position + Vector3.new(0, 2.5, 0), flatDelta, makeRaycastParams(nil))
 	if obstacle and obstacle.Distance < flatDelta.Magnitude - 1.5 then
 		return false
@@ -986,23 +1058,27 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	local previousClearances: { [BasePart]: number } = {}
 	for hazard in pairs(NearbyActiveHazards) do
 		if isActiveHazardPart(hazard) then
-			previousClearances[hazard] = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0) - footprint
+			previousClearances[hazard] = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
+			local destinationClearance = RuntimeState.hazardEdgeDistance(hazard, goal, Config.DodgeLookaheadSeconds, footprint)
+			local routeClearance = RuntimeState.segmentHazardClearance(hazard, Root.Position, goal, footprint)
+			if
+				routeClearance <= Config.DodgeSafePadding
+				and not (previousClearances[hazard] <= Config.DodgeSafePadding and destinationClearance > previousClearances[hazard] + 0.1)
+			then
+				return false
+			end
 		end
 	end
 	local previous = Root.Position
-	local count = math.min(3, math.max(2, math.ceil(flatDelta.Magnitude / 6)))
+	local count = math.min(8, math.max(3, math.ceil(flatDelta.Magnitude / 4)))
 	for index = 1, count do
-		if RuntimeState.DodgeRaycastsUsed >= Config.DodgeRaycastBudget then
-			return false
-		end
-		RuntimeState.DodgeRaycastsUsed += 1
-		local grounded, found = projectToWalkableGround(Root.Position:Lerp(goal, index / count), Target)
+		local grounded, found = RuntimeState.projectDodgeGround(Root.Position:Lerp(goal, index / count), Target)
 		if not found or math.abs(grounded.Y - previous.Y) > Config.ExploreMaxVerticalStep then
 			return false
 		end
 		for hazard in pairs(NearbyActiveHazards) do
 			if isActiveHazardPart(hazard) and hazardThreatensHeight(hazard, grounded) then
-				local clearance = RuntimeState.hazardEdgeDistance(hazard, grounded, 0) - footprint
+				local clearance = RuntimeState.hazardEdgeDistance(hazard, grounded, 0, footprint)
 				local prior = previousClearances[hazard] or math.huge
 				-- Leaving an overlapping hazard is allowed, but the route may not
 				-- move deeper into it or cross a different unsafe footprint.
@@ -1017,7 +1093,7 @@ local function dodgeRouteClear(goal: Vector3): boolean
 		end
 		previous = grounded
 	end
-	return hasGroundSupport(goal, nil)
+	return RuntimeState.dodgeHasGroundSupport(goal, nil)
 end
 
 local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
@@ -1029,7 +1105,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 	local bestGoal: Vector3? = nil
 	local bestScore = -math.huge
 	local footprint = playerFootprintRadius()
-	local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0) - footprint
+	local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
 	local escapeDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
 	local ringDistances = { escapeDistance, escapeDistance + 5, escapeDistance + 10 }
 	for ringIndex, ringDistance in ipairs(ringDistances) do
@@ -1041,7 +1117,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 			local angle = baseAngle + offsetIndex * math.pi * 2 / Config.DodgeCandidateCount
 			local candidate = Root.Position
 				+ Vector3.new(math.cos(angle) * ringDistance, 0, math.sin(angle) * ringDistance)
-			local grounded, foundGround = projectToWalkableGround(candidate, nil)
+			local grounded, foundGround = RuntimeState.projectDodgeGround(candidate, nil)
 			local rejection = if not foundGround
 				then "no-ground"
 				elseif math.abs(grounded.Y - Root.Position.Y) > Config.DirectVerticalTolerance then "wrong-floor"
@@ -1055,15 +1131,18 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 					if isActiveHazardPart(otherHazard) and hazardThreatensHeight(otherHazard, grounded) then
 						minimumSafety = math.min(
 							minimumSafety,
-							RuntimeState.hazardEdgeDistance(otherHazard, grounded, Config.DodgeLookaheadSeconds)
-								- footprint
+							RuntimeState.hazardEdgeDistance(otherHazard, grounded, Config.DodgeLookaheadSeconds, footprint)
 						)
 					end
 				end
 				local awayDirection = Vector3.new(math.cos(baseAngle), 0, math.sin(baseAngle))
 				local candidateDirection = Vector3.new(grounded.X - Root.Position.X, 0, grounded.Z - Root.Position.Z)
 				local awayBias = candidateDirection.Magnitude > 0.1 and awayDirection:Dot(candidateDirection.Unit) or 0
-				local score = math.min(minimumSafety, 40) * 4 - distance + awayBias * 3
+				local continuity = RuntimeState.DodgeDirection
+				local continuityBias = if continuity.Magnitude > 0.1 and candidateDirection.Magnitude > 0.1
+					then continuity.Unit:Dot(candidateDirection.Unit) * 2
+					else 0
+				local score = math.min(minimumSafety, 40) * 4 - distance + awayBias * 3 + continuityBias
 				if not bestGoal or score > bestScore then
 					bestScore = score
 					bestGoal = grounded
@@ -2831,7 +2910,12 @@ local function clearDodgeObjective()
 	DodgeGoal = nil
 	RuntimeState.DodgeCommitUntil = 0
 	RuntimeState.DodgeCachedHazard = nil
+	RuntimeState.DodgeCachedPredicted = false
+	RuntimeState.DodgeCachedEdgeDistance = math.huge
+	RuntimeState.DodgeCachedRouteDistance = math.huge
 	RuntimeState.LastDodgeEvaluationAt = -math.huge
+	RuntimeState.DodgeDirection = Vector3.zero
+	RuntimeState.DodgeRaycastsUsed = 0
 	LastHazardThreatAt = -math.huge
 	LastDodgeGoalAttemptAt = -math.huge
 end
@@ -2996,6 +3080,7 @@ local function leaveDodge()
 	DodgeGoal = nil
 	RuntimeState.DodgeCommitUntil = 0
 	RuntimeState.DodgeCachedHazard = nil
+	RuntimeState.DodgeDirection = Vector3.zero
 	-- Pause, rather than erase, the accumulated no-progress duration.
 	local pausedFor = math.max(0, os.clock() - DodgeStartedAt)
 	LastMeaningfulProgressAt += pausedFor
@@ -3025,6 +3110,7 @@ local function updateDodgeController(): boolean
 	if evaluateNow then
 		RuntimeState.LastDodgeEvaluationAt = now
 		RuntimeState.DodgeRaycastsUsed = 0
+		RuntimeState.DodgeEvaluationSerial += 1
 		hazard, predicted, edgeDistance, routeDistance = threateningHazard()
 		RuntimeState.DodgeCachedHazard = hazard
 		RuntimeState.DodgeCachedPredicted = predicted
@@ -3060,13 +3146,13 @@ local function updateDodgeController(): boolean
 	if
 		not goalUnsafe
 		and State == NavigationState.DODGE
-		and ActiveHazard ~= hazard
 		and DodgeGoal
+		and evaluateNow
 	then
 		goalUnsafe = not dodgeRouteClear(DodgeGoal)
 		if not goalUnsafe then
-			-- A newly detected hazard does not force a left/right flip when the
-			-- committed goal and its route are still safe.
+			-- Keep a committed safe route even if a secondary threat changes the
+			-- selected primary hazard; the route was checked against every hazard.
 			ActiveHazard = hazard
 		end
 	end
@@ -3079,7 +3165,7 @@ local function updateDodgeController(): boolean
 		if State ~= NavigationState.DODGE then
 			DodgeStartedAt = os.clock()
 		end
-		if State == NavigationState.DODGE and os.clock() - LastDodgeGoalAttemptAt < 0.2 then
+		if State == NavigationState.DODGE and not goalUnsafe and os.clock() - LastDodgeGoalAttemptAt < 0.2 then
 			Humanoid:Move(Vector3.zero, false)
 			return true
 		end
@@ -3110,12 +3196,11 @@ local function updateDodgeController(): boolean
 			if outward.Magnitude <= 0.1 then
 				outward = Vector3.new(1, 0, 0)
 			end
-			local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0)
-				- playerFootprintRadius()
+			local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, playerFootprintRadius())
 			local fallbackDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
 			local fallback = Root.Position + outward.Unit * fallbackDistance
 			fallback = Vector3.new(fallback.X, Root.Position.Y, fallback.Z)
-			local grounded, foundGround = projectToWalkableGround(fallback, nil)
+			local grounded, foundGround = RuntimeState.projectDodgeGround(fallback, nil)
 			if
 				foundGround
 				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
@@ -3137,6 +3222,7 @@ local function updateDodgeController(): boolean
 	if direction.Magnitude <= 1.5 then
 		Humanoid:Move(Vector3.zero, false)
 	else
+		RuntimeState.DodgeDirection = direction.Unit
 		Humanoid:Move(direction.Unit, false)
 	end
 	return true
@@ -3425,14 +3511,14 @@ local function updateTargetAndObjective()
 	local now = os.clock()
 	if tryStartDungeon() then
 		setNavigationState(NavigationState.IDLE)
-		stopTranslation()
+		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
 	end
 	if RuntimeState.RoundTransitionActive then
 		LastMeaningfulProgressAt = now
 		LowSpeedSince = nil
 		setNavigationState(NavigationState.IDLE)
-		stopTranslation()
+		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
 	end
 	if not validTarget(Target) then
@@ -3460,7 +3546,7 @@ local function updateTargetAndObjective()
 		NavigationGoal = nil
 		RecoveryGoal = nil
 		setNavigationState(NavigationState.IDLE)
-		stopTranslation()
+		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
 	end
 	local enemyRoot = getTargetRoot(Target)
@@ -3475,7 +3561,7 @@ local function updateTargetAndObjective()
 		else
 			NoTargetSince = now
 			setNavigationState(NavigationState.IDLE)
-			stopTranslation()
+			if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		end
 		return
 	end
@@ -3878,6 +3964,9 @@ local function shutdown()
 	Enabled, Running = false, false
 	RuntimeState.RespawnRushUntil = 0
 	clearDodgeObjective()
+	table.clear(NearbyActiveHazards)
+	table.clear(HazardSet)
+	table.clear(RuntimeState.HazardMetadata)
 	resetNavigationForTarget(nil)
 	stopTranslation()
 	restoreMovementSpeed()
@@ -3977,6 +4066,7 @@ table.insert(
 		end
 		if instance:IsA("BasePart") then
 			HazardSet[instance] = nil
+			NearbyActiveHazards[instance] = nil
 			RuntimeState.HazardMetadata[instance] = nil
 		end
 	end)
@@ -4010,6 +4100,11 @@ table.insert(
 		NavigationGoal = nil
 		RecoveryGoal = nil
 		RecoveryUntil = 0
+		clearDodgeObjective()
+		table.clear(NearbyActiveHazards)
+		table.clear(HazardSet)
+		table.clear(RuntimeState.HazardMetadata)
+		LastHazardRefreshAt = -math.huge
 		setNavigationState(NavigationState.IDLE)
 		print("[CHAR] respawn")
 		task.defer(function()
@@ -4099,8 +4194,12 @@ table.insert(
 			return
 		end
 		updateGlobalStuckJump()
+		-- Objective refresh may change navigation state, but its zero-move calls
+		-- are deferred until Dodge has accepted or declined translation ownership.
+		RuntimeState.SuppressObjectiveTranslation = true
 		updateTargetAndObjective()
-		local dodgeOwnsTranslation = Config.DodgeEnabled and updateDodgeController()
+		RuntimeState.SuppressObjectiveTranslation = false
+		local dodgeOwnsTranslation = updateDodgeController()
 		updateTargetFacing()
 		if Target and validTarget(Target) then
 			local enemyRoot = getTargetRoot(Target)
