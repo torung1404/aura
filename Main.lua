@@ -44,7 +44,7 @@ local DEFAULT_CONFIG = {
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
-	MovementWalkSpeed = 24,
+	MovementWalkSpeed = 23,
 	DirectReachedDistance = 0.75,
 	DirectVerticalTolerance = 7,
 	DirectDecisionInterval = 0.25,
@@ -186,7 +186,7 @@ Config.SkillRange = nil
 -- Old percent-based speed settings are intentionally ignored. Movement uses
 -- one fixed target speed so re-exec and respawn cannot compound a multiplier.
 Config.MovementSpeedMultiplier = nil
-Config.MovementWalkSpeed = 24
+Config.MovementWalkSpeed = 23
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
 if type(SavedConfig.FarmEnabled) == "boolean" then
@@ -2535,7 +2535,7 @@ local function applyMovementSpeed()
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 		SpeedApplied = true
 	end
-	AppliedWalkSpeed = 24
+	AppliedWalkSpeed = 23
 	if math.abs(Humanoid.WalkSpeed - AppliedWalkSpeed) > 0.05 then
 		Humanoid.WalkSpeed = AppliedWalkSpeed
 	end
