@@ -71,7 +71,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = true,
+	DodgeEnabled = false,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -385,6 +385,7 @@ local RuntimeState = {
 	DodgeCachedEdgeDistance = math.huge,
 	DodgeCachedRouteDistance = math.huge,
 	DodgeRaycastsUsed = 0,
+	DodgeBudgetExhausted = false,
 	DodgeEvaluationSerial = 0,
 	DodgeDirection = Vector3.zero,
 	SuppressObjectiveTranslation = false,
@@ -645,6 +646,11 @@ local function hazardNameHint(part: BasePart): boolean
 			or lowerName:find("precast", 1, true)
 			or lowerName:find("damagebox", 1, true)
 			or lowerName:find("damagepart", 1, true)
+			or lowerName:find("beam", 1, true)
+			or lowerName:find("laser", 1, true)
+			or lowerName:find("projectile", 1, true)
+			or lowerName:find("shockwave", 1, true)
+			or lowerName:find("cross", 1, true)
 		then
 			return true
 		end
@@ -662,6 +668,9 @@ RuntimeState.hazardKind = function(part: BasePart): string?
 		end
 		if name:find("precast", 1, true) or name:find("telegraph", 1, true) or name:find("indicator", 1, true) or name:find("warning", 1, true) then
 			return "PRECAST"
+		end
+		if name:find("beam", 1, true) or name:find("laser", 1, true) or name:find("projectile", 1, true) or name:find("shockwave", 1, true) or name:find("cross", 1, true) then
+			return "EFFECT"
 		end
 		current = current.Parent
 	end
@@ -713,8 +722,11 @@ local function isActiveHazardPart(part: BasePart): boolean
 	if kind == "PRECAST" then
 		return part.Transparency < 0.98 and effectGeometry
 	end
+	if kind == "EFFECT" then
+		return part.Transparency < 0.98 and effectGeometry
+	end
 	local structuralEvidence = hazardNameHint(part) and effectGeometry
-	return structuralEvidence
+	return (part.Transparency < 0.98 and structuralEvidence)
 		or (part.Transparency < 0.98 and visiblyRed and broadAndThin)
 		or (part.Transparency < 0.98 and visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
 end
@@ -885,6 +897,7 @@ end
 
 RuntimeState.consumeDodgeRaycast = function(): boolean
 	if RuntimeState.DodgeRaycastsUsed >= Config.DodgeRaycastBudget then
+		RuntimeState.DodgeBudgetExhausted = true
 		return false
 	end
 	RuntimeState.DodgeRaycastsUsed += 1
@@ -1095,9 +1108,9 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	return RuntimeState.dodgeHasGroundSupport(goal, nil)
 end
 
-local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
+local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean)
 	if not Root then
-		return nil
+		return nil, false
 	end
 	local fromCenter = Vector3.new(Root.Position.X - hazard.Position.X, 0, Root.Position.Z - hazard.Position.Z)
 	local baseAngle = fromCenter.Magnitude > 0.1 and math.atan2(fromCenter.Z, fromCenter.X) or 0
@@ -1107,8 +1120,14 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 	local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
 	local escapeDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
 	local ringDistances = { escapeDistance, escapeDistance + 5, escapeDistance + 10 }
+	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
+	local objective = targetRoot and targetRoot.Position or NavigationGoal
+	local currentTargetDistance = objective and flatPointDistance(Root.Position, objective) or nil
 	for ringIndex, ringDistance in ipairs(ringDistances) do
 		for angleIndex = 0, Config.DodgeCandidateCount - 1 do
+			if RuntimeState.DodgeBudgetExhausted then
+				return bestGoal, true
+			end
 			local offsetIndex = 0
 			if angleIndex > 0 then
 				offsetIndex = if angleIndex % 2 == 1 then (angleIndex + 1) / 2 else -angleIndex / 2
@@ -1141,7 +1160,12 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 				local continuityBias = if continuity.Magnitude > 0.1 and candidateDirection.Magnitude > 0.1
 					then continuity.Unit:Dot(candidateDirection.Unit) * 2
 					else 0
-				local score = math.min(minimumSafety, 40) * 4 - distance + awayBias * 3 + continuityBias
+				local targetProgress = if objective and currentTargetDistance
+					then currentTargetDistance - flatPointDistance(grounded, objective)
+					else 0
+				-- Safety is a hard gate above. Once every candidate has passed it,
+				-- prefer a short safe detour that preserves farm progress.
+				local score = math.min(minimumSafety, 20) * 1.5 - distance * 0.4 + awayBias + continuityBias + targetProgress * 2
 				if not bestGoal or score > bestScore then
 					bestScore = score
 					bestGoal = grounded
@@ -1151,10 +1175,10 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): Vector3?
 			end
 		end
 		if bestGoal then
-			return bestGoal
+			return bestGoal, false
 		end
 	end
-	return bestGoal
+	return bestGoal, RuntimeState.DodgeBudgetExhausted
 end
 
 RuntimeState.exploreCellKey = function(position: Vector3): string
@@ -2915,6 +2939,7 @@ local function clearDodgeObjective()
 	RuntimeState.LastDodgeEvaluationAt = -math.huge
 	RuntimeState.DodgeDirection = Vector3.zero
 	RuntimeState.DodgeRaycastsUsed = 0
+	RuntimeState.DodgeBudgetExhausted = false
 	LastHazardThreatAt = -math.huge
 	LastDodgeGoalAttemptAt = -math.huge
 end
@@ -3075,11 +3100,7 @@ end
 
 local function leaveDodge()
 	RuntimeUtil.telemetry("DODGE_EXIT", ActiveHazard and ("inactive=" .. ActiveHazard:GetFullName()) or "no-active-hazard")
-	ActiveHazard = nil
-	DodgeGoal = nil
-	RuntimeState.DodgeCommitUntil = 0
-	RuntimeState.DodgeCachedHazard = nil
-	RuntimeState.DodgeDirection = Vector3.zero
+	clearDodgeObjective()
 	-- Pause, rather than erase, the accumulated no-progress duration.
 	local pausedFor = math.max(0, os.clock() - DodgeStartedAt)
 	LastMeaningfulProgressAt += pausedFor
@@ -3104,35 +3125,39 @@ local function updateDodgeController(): boolean
 		return false
 	end
 	local now = os.clock()
-	local evaluateNow = now - RuntimeState.LastDodgeEvaluationAt >= Config.DodgeEvaluationInterval
-	local hazard, predicted, edgeDistance, routeDistance
-	if evaluateNow then
-		RuntimeState.LastDodgeEvaluationAt = now
-		RuntimeState.DodgeRaycastsUsed = 0
-		RuntimeState.DodgeEvaluationSerial += 1
-		hazard, predicted, edgeDistance, routeDistance = threateningHazard()
-		RuntimeState.DodgeCachedHazard = hazard
-		RuntimeState.DodgeCachedPredicted = predicted
-		RuntimeState.DodgeCachedEdgeDistance = edgeDistance
-		RuntimeState.DodgeCachedRouteDistance = routeDistance
-	else
-		hazard = RuntimeState.DodgeCachedHazard
-		predicted = RuntimeState.DodgeCachedPredicted
-		edgeDistance = RuntimeState.DodgeCachedEdgeDistance
-		routeDistance = RuntimeState.DodgeCachedRouteDistance
+	if now < RuntimeState.RespawnRushUntil then
+		if State == NavigationState.DODGE then
+			leaveDodge()
+		end
+		return false
 	end
+	local evaluateNow = now - RuntimeState.LastDodgeEvaluationAt >= Config.DodgeEvaluationInterval
+	if not evaluateNow then
+		if State == NavigationState.DODGE and DodgeGoal then
+			local cachedDirection = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
+			Humanoid:Move(cachedDirection.Magnitude > 1.5 and cachedDirection.Unit or Vector3.zero, false)
+			return true
+		end
+		return false
+	end
+	local hazard, predicted, edgeDistance, routeDistance
+	RuntimeState.LastDodgeEvaluationAt = now
+	RuntimeState.DodgeRaycastsUsed = 0
+	RuntimeState.DodgeBudgetExhausted = false
+	RuntimeState.DodgeEvaluationSerial += 1
+	hazard, predicted, edgeDistance, routeDistance = threateningHazard()
+	RuntimeState.DodgeCachedHazard = hazard
+	RuntimeState.DodgeCachedPredicted = predicted
+	RuntimeState.DodgeCachedEdgeDistance = edgeDistance
+	RuntimeState.DodgeCachedRouteDistance = routeDistance
 	if hazard and not hazard:IsDescendantOf(workspace) then
 		hazard = nil
 	end
 	if not hazard then
 		if State == NavigationState.DODGE then
-			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis then
-				if DodgeGoal then
-					local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
-					Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
-				else
-					Humanoid:Move(Vector3.zero, false)
-				end
+			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis and DodgeGoal then
+				local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
+				Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
 				return true
 			end
 			leaveDodge()
@@ -3141,17 +3166,17 @@ local function updateDodgeController(): boolean
 	end
 	LastHazardThreatAt = os.clock()
 
-	local goalUnsafe = not DodgeGoal or not pointIsSafeFromHazards(DodgeGoal)
-	if
-		not goalUnsafe
-		and State == NavigationState.DODGE
-		and DodgeGoal
-		and evaluateNow
-	then
-		goalUnsafe = not dodgeRouteClear(DodgeGoal)
-		if not goalUnsafe then
-			-- Keep a committed safe route even if a secondary threat changes the
-			-- selected primary hazard; the route was checked against every hazard.
+	local goalUnsafe = false
+	if State == NavigationState.DODGE then
+		if not DodgeGoal then
+			goalUnsafe = true
+		elseif not pointIsSafeFromHazards(DodgeGoal) then
+			goalUnsafe = true
+		elseif not dodgeRouteClear(DodgeGoal) and not RuntimeState.DodgeBudgetExhausted then
+			goalUnsafe = true
+		else
+			-- A budget-exhausted route check is UNKNOWN, not unsafe. Keep the
+			-- already validated route until the next bounded evaluation.
 			ActiveHazard = hazard
 		end
 	end
@@ -3159,17 +3184,12 @@ local function updateDodgeController(): boolean
 	local needsNewGoal = State ~= NavigationState.DODGE
 		or goalUnsafe
 		or goalReached
-		or (now >= RuntimeState.DodgeCommitUntil and evaluateNow)
+		or now >= RuntimeState.DodgeCommitUntil
 	if needsNewGoal then
 		if State ~= NavigationState.DODGE then
 			DodgeStartedAt = os.clock()
 		end
-		if State == NavigationState.DODGE and not goalUnsafe and os.clock() - LastDodgeGoalAttemptAt < 0.2 then
-			Humanoid:Move(Vector3.zero, false)
-			return true
-		end
 		LastDodgeGoalAttemptAt = os.clock()
-		cancelPathRequest()
 		ActiveHazard = hazard
 		RuntimeUtil.telemetry(
 			"DODGE_ENTER",
@@ -3187,9 +3207,8 @@ local function updateDodgeController(): boolean
 				routeDistance
 			)
 		)
-		DodgeGoal = chooseNearestSafeDodgeGoal(hazard)
-		RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
-		if not DodgeGoal then
+		local selectedGoal, budgetExhausted = chooseNearestSafeDodgeGoal(hazard)
+		if not selectedGoal and not budgetExhausted then
 			-- Use the outward edge only when it stays on this floor and the route is verified.
 			local outward = Vector3.new(Root.Position.X - hazard.Position.X, 0, Root.Position.Z - hazard.Position.Z)
 			if outward.Magnitude <= 0.1 then
@@ -3206,16 +3225,29 @@ local function updateDodgeController(): boolean
 				and pointIsSafeFromHazards(grounded)
 				and dodgeRouteClear(grounded)
 			then
-				DodgeGoal = grounded
+				selectedGoal = grounded
 			end
+			budgetExhausted = budgetExhausted or RuntimeState.DodgeBudgetExhausted
 		end
-		setNavigationState(NavigationState.DODGE)
-		RuntimeUtil.telemetry("DODGE_GOAL", DodgeGoal and tostring(DodgeGoal) or "no-safe-goal")
-	end
-
-	if not DodgeGoal then
-		Humanoid:Move(Vector3.zero, false)
-		return true
+		if selectedGoal then
+			cancelPathRequest()
+			DodgeGoal = selectedGoal
+			RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
+			setNavigationState(NavigationState.DODGE)
+			RuntimeUtil.telemetry("DODGE_GOAL", tostring(DodgeGoal))
+		else
+			-- No verified safe route is not an instruction to hold translation at
+			-- zero. Release Dodge and let normal movement make the next decision.
+			ActiveHazard = nil
+			DodgeGoal = nil
+			RuntimeState.DodgeCommitUntil = 0
+			RuntimeState.DodgeCachedHazard = nil
+			RuntimeUtil.telemetry("DODGE_GOAL", budgetExhausted and "budget-exhausted" or "no-safe-goal")
+			if State == NavigationState.DODGE then
+				setNavigationState(NavigationState.IDLE)
+			end
+			return false
+		end
 	end
 	local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
 	if direction.Magnitude <= 1.5 then
@@ -4191,6 +4223,9 @@ table.insert(
 			setNavigationState(NavigationState.IDLE)
 			stopTranslation()
 			return
+		end
+		if now < RuntimeState.RespawnRushUntil and State == NavigationState.DODGE then
+			leaveDodge()
 		end
 		updateGlobalStuckJump()
 		-- Objective refresh may change navigation state, but its zero-move calls
