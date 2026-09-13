@@ -26,9 +26,9 @@ local DEFAULT_CONFIG = {
 	TargetAcquireInterval = 1,
 	GoalRefreshInterval = 0.15,
 	TargetLockRangeMultiplier = 1.25,
-	PreferredCombatDistance = 75,
-	RetreatEnterDistance = 70,
-	RetreatExitDistance = 75,
+	PreferredCombatDistance = 70,
+	RetreatEnterDistance = 40,
+	RetreatExitDistance = 45,
 	AttackRange = 15,
 	NormalSkillRange = 80,
 	BossSkillRange = 100,
@@ -712,9 +712,47 @@ RuntimeState.hazardKind = function(part: BasePart): string?
 	return nil
 end
 
-local function isHazardCandidate(part: BasePart): boolean
+local function isRedFloorTelegraph(part: BasePart): boolean
+	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
+	table.sort(dimensions)
+	local color = part.Color
+	local visiblyRed = color.R >= 0.65 and color.R >= color.G * 1.35 and color.R >= color.B * 1.2
+	-- A translucent, non-colliding flat area is a generic telegraph shape. The
+	-- transparency and geometry requirements keep opaque red map decoration out.
+	return visiblyRed
+		and part.Transparency > 0.05
+		and part.Transparency < 0.98
+		and not part.CanCollide
+		and dimensions[1] <= 2.5
+		and dimensions[2] >= 3
+		and dimensions[3] >= 3
+end
+
+local function logHazardRegistration(part: BasePart, decision: string, reason: string)
+	if not Config.DebugTelemetry or not Root or (part.Position - Root.Position).Magnitude > Config.DodgeDetectionRadius then
+		return
+	end
+	RuntimeUtil.telemetry(
+		"HAZARD_" .. decision,
+		string.format(
+			"%s name=%s class=%s path=%s size=%s transparency=%.2f canCollide=%s canQuery=%s color=%s reason=%s",
+			decision:lower(),
+			part.Name,
+			part.ClassName,
+			part:GetFullName(),
+			tostring(part.Size),
+			part.Transparency,
+			tostring(part.CanCollide),
+			tostring(part.CanQuery),
+			tostring(part.Color),
+			reason
+		)
+	)
+end
+
+local function hazardCandidateReason(part: BasePart): string?
 	if not part:IsDescendantOf(workspace) or (Character and part:IsDescendantOf(Character)) then
-		return false
+		return nil
 	end
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
@@ -725,10 +763,26 @@ local function isHazardCandidate(part: BasePart): boolean
 		or not part.CanCollide
 		or part.AssemblyLinearVelocity.Magnitude >= 1
 		or (part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball))
-	return (RuntimeState.hazardKind(part) ~= nil and effectGeometry)
-		or (hazardNameHint(part) and effectGeometry)
-		or (visiblyRed and broadAndThin)
-		or (visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
+	if RuntimeState.hazardKind(part) ~= nil and effectGeometry then
+		return "named-effect-geometry"
+	end
+	if hazardNameHint(part) and effectGeometry then
+		return "name-hint-geometry"
+	end
+	if visiblyRed and broadAndThin then
+		return "red-broad-telegraph"
+	end
+	if visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder then
+		return "red-cylinder-telegraph"
+	end
+	if isRedFloorTelegraph(part) then
+		return "red-floor-telegraph"
+	end
+	return nil
+end
+
+local function isHazardCandidate(part: BasePart): boolean
+	return hazardCandidateReason(part) ~= nil
 end
 
 local function isActiveHazardPart(part: BasePart): boolean
@@ -764,11 +818,16 @@ local function isActiveHazardPart(part: BasePart): boolean
 	return (part.Transparency < 0.98 and structuralEvidence)
 		or (part.Transparency < 0.98 and visiblyRed and broadAndThin)
 		or (part.Transparency < 0.98 and visiblyRed and part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
+		or isRedFloorTelegraph(part)
 end
 
 local function registerHazard(instance: Instance)
 	-- Cache structural candidates, not only parts that happen to be red at creation time.
-	if instance:IsA("BasePart") and isHazardCandidate(instance) then
+	if not instance:IsA("BasePart") then
+		return
+	end
+	local reason = hazardCandidateReason(instance)
+	if reason then
 		HazardSet[instance] = true
 		RuntimeState.HazardMetadata[instance] = {
 			CFrame = instance.CFrame,
@@ -776,6 +835,9 @@ local function registerHazard(instance: Instance)
 			Velocity = instance.AssemblyLinearVelocity,
 			EvaluationSerial = 0,
 		}
+		logHazardRegistration(instance, "ACCEPT", reason)
+	else
+		logHazardRegistration(instance, "REJECT", "insufficient-structure")
 	end
 end
 
@@ -1000,6 +1062,9 @@ local function refreshNearbyActiveHazards()
 				or hazardThreatensHeight(part, Root.Position, Config.DodgeLookaheadSeconds)
 			)
 		then
+			if not HazardSet[part] then
+				registerHazard(part)
+			end
 			NearbyActiveHazards[part] = true
 			HazardSet[part] = true
 		end
@@ -1109,6 +1174,18 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 				nearestRouteDistance = routeClearance
 			end
 		end
+	end
+	if nearest then
+		RuntimeUtil.telemetry(
+			"DODGE_THREAT",
+			string.format(
+				"threat name=%s edge=%d predicted=%s route=%d",
+				nearest.Name,
+				math.floor(nearestEdge + 0.5),
+				tostring(nearestPredicted),
+				math.floor(nearestRouteDistance + 0.5)
+			)
+		)
 	end
 	return nearest, nearestPredicted, nearestEdge, nearestRouteDistance
 end
@@ -1649,9 +1726,14 @@ local function updateGlobalStuckJump()
 		return
 	end
 	local now = os.clock()
+	if now < RuntimeState.RespawnRushUntil then
+		RuntimeState.JumpStillSince = now
+		RuntimeState.JumpBestDistance = math.huge
+		RuntimeState.JumpBestVertical = math.huge
+		return
+	end
 	local translating = State == NavigationState.DIRECT
 		or State == NavigationState.STEER
-		or State == NavigationState.RETREAT
 		or State == NavigationState.PATH
 		or State == NavigationState.RECOVERY
 		or State == NavigationState.EXPLORE
@@ -3761,7 +3843,14 @@ local function updateTargetAndObjective()
 	end
 	local distance3D = (enemyRoot.Position - Root.Position).Magnitude
 	if now < RuntimeState.RespawnRushUntil then
-		local rushHoldDistance = math.max(Config.AttackRange, Config.DirectReachedDistance + 2)
+		if distance3D < Config.RetreatEnterDistance then
+			cancelPathRequest()
+			NavigationGoal = nil
+			RecoveryGoal = nil
+			setNavigationState(NavigationState.RETREAT)
+			return
+		end
+		local rushHoldDistance = Config.PreferredCombatDistance
 		if distance3D <= rushHoldDistance then
 			cancelPathRequest()
 			NavigationGoal = nil
@@ -3946,6 +4035,24 @@ local function bindCharacter(character: Model)
 		disablePlayerControls()
 	end
 	if Humanoid then
+		local boundHumanoid = Humanoid
+		table.insert(
+			UIState.CharacterConnections,
+			boundHumanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+				if
+					not Running
+					or boundHumanoid ~= Humanoid
+					or not RuntimeUtil.isCurrentExecution()
+					or math.abs(boundHumanoid.WalkSpeed - 23) <= 0.05
+				then
+					return
+				end
+				-- The write triggers this signal once more, then the tolerance guard
+				-- exits. Old-character connections are disposed before rebinding.
+				AppliedWalkSpeed = 23
+				boundHumanoid.WalkSpeed = 23
+			end)
+		)
 		table.insert(
 			UIState.CharacterConnections,
 			Humanoid.Died:Connect(function()
@@ -4168,8 +4275,16 @@ table.insert(
 				end)
 			end
 		end
-		if Config.DodgeEnabled then
-			registerHazard(instance)
+		if Config.DodgeEnabled and instance:IsA("BasePart") then
+			-- Effects can arrive before their final color/size is replicated. One
+			-- deferred registration observes the settled creation state without a
+			-- property connection per effect.
+			local executionGeneration = RuntimeState.Generation
+			task.defer(function()
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration and Config.DodgeEnabled and instance:IsDescendantOf(workspace) then
+					registerHazard(instance)
+				end
+			end)
 		end
 	end)
 )
