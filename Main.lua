@@ -86,6 +86,7 @@ local DEFAULT_CONFIG = {
 	DodgeCommitDuration = 0.35,
 	DodgeEvaluationInterval = 0.08,
 	DodgeRaycastBudget = 32,
+	RespawnRushPathProbeInterval = 0.12,
 	ExploreCandidateCount = 12,
 	ExploreStepDistance = 28,
 	ExploreReachedDistance = 2,
@@ -382,6 +383,9 @@ local RuntimeState = {
 	RoundResetSerial = 0,
 	RecoverySerial = 0,
 	RespawnRushUntil = 0,
+	LastRespawnRushPathProbeAt = -math.huge,
+	RespawnRushPathDirection = Vector3.zero,
+	RespawnRushPathClear = false,
 	RoundTransitionSerial = 0,
 	RoundTransitionStartedAt = 0,
 	RoundTransitionDeadline = 0,
@@ -2887,7 +2891,35 @@ local function requestPath(goal: Vector3): boolean
 end
 
 local function updatePathNavigation()
-	if State ~= NavigationState.PATH or not Root or not PathWaypoints then
+	if State ~= NavigationState.PATH or not Root or not Humanoid then
+		return
+	end
+	if not PathWaypoints then
+		-- ComputeAsync can take a visible fraction of the six-second spawn grace.
+		-- Keep a short, physically-clear approach command alive while it resolves;
+		-- the completed PATH remains authoritative as soon as its waypoints publish.
+		if PathComputing and os.clock() < RuntimeState.RespawnRushUntil and NavigationGoal then
+			local now = os.clock()
+			if now - RuntimeState.LastRespawnRushPathProbeAt >= Config.RespawnRushPathProbeInterval then
+				RuntimeState.LastRespawnRushPathProbeAt = now
+				local delta = Vector3.new(NavigationGoal.X - Root.Position.X, 0, NavigationGoal.Z - Root.Position.Z)
+				RuntimeState.RespawnRushPathDirection = if delta.Magnitude > 0.1 then delta.Unit else Vector3.zero
+				if delta.Magnitude > 0.1 then
+					local probeLength = math.min(delta.Magnitude, Config.DetourProbeDistance)
+					local obstacle = workspace:Raycast(
+						Root.Position + Vector3.new(0, 2.5, 0),
+						RuntimeState.RespawnRushPathDirection * probeLength,
+						makeRaycastParams(Target)
+					)
+					RuntimeState.RespawnRushPathClear = obstacle == nil
+				else
+					RuntimeState.RespawnRushPathClear = false
+				end
+			end
+			if RuntimeState.RespawnRushPathClear then
+				Humanoid:Move(RuntimeState.RespawnRushPathDirection, false)
+			end
+		end
 		return
 	end
 	if PathNeedsRebuild then
@@ -4367,6 +4399,9 @@ table.insert(
 	Player.CharacterAdded:Connect(function(character)
 		local executionGeneration = RuntimeState.Generation
 		RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
+		RuntimeState.LastRespawnRushPathProbeAt = -math.huge
+		RuntimeState.RespawnRushPathDirection = Vector3.zero
+		RuntimeState.RespawnRushPathClear = false
 		-- A recovery operation belongs to the old character. Invalidate it before
 		-- the new bind so it cannot reset or hold this respawn in place.
 		RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
