@@ -179,7 +179,7 @@ if not savedDodgeSettingIsCurrent then
 end
 -- Dodge is intentionally disabled while its runtime behavior is being tested.
 -- This overrides an older saved toggle on the next loader execution.
-Config.DodgeEnabled = false
+Config.DodgeEnabled = true
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
