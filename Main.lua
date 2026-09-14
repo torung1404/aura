@@ -44,7 +44,7 @@ local DEFAULT_CONFIG = {
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
-	MovementWalkSpeed = 23,
+	MovementSpeedMultiplier = 1.4,
 	DirectReachedDistance = 0.75,
 	DirectVerticalTolerance = 7,
 	DirectDecisionInterval = 0.25,
@@ -187,10 +187,10 @@ Config.ApproachDistance = nil
 Config.NormalSkillRange = 80
 Config.BossSkillRange = 100
 Config.SkillRange = nil
--- Keep one fixed AutoFarm target speed. Old multiplier settings must not
--- survive a re-exec and compound a game-side WalkSpeed change.
-Config.MovementSpeedMultiplier = nil
-Config.MovementWalkSpeed = 23
+-- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
+-- forty percent. Old fixed-speed values must not survive a re-exec.
+Config.MovementWalkSpeed = nil
+Config.MovementSpeedMultiplier = 1.4
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
 if type(SavedConfig.FarmEnabled) == "boolean" then
@@ -2627,7 +2627,7 @@ local function applyMovementSpeed()
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 		SpeedApplied = true
 	end
-	AppliedWalkSpeed = Config.MovementWalkSpeed
+	AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
 	if math.abs(Humanoid.WalkSpeed - AppliedWalkSpeed) > 0.05 then
 		Humanoid.WalkSpeed = AppliedWalkSpeed
 	end
@@ -4081,13 +4081,13 @@ local function bindCharacter(character: Model)
 					not Running
 					or boundHumanoid ~= Humanoid
 					or not RuntimeUtil.isCurrentExecution()
-					or math.abs(boundHumanoid.WalkSpeed - Config.MovementWalkSpeed) <= 0.05
+					or math.abs(boundHumanoid.WalkSpeed - 16 * Config.MovementSpeedMultiplier) <= 0.05
 				then
 					return
 				end
 				-- The write triggers this signal once more, then the tolerance guard
 				-- exits. Old-character connections are disposed before rebinding.
-				AppliedWalkSpeed = Config.MovementWalkSpeed
+				AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
 				boundHumanoid.WalkSpeed = AppliedWalkSpeed
 			end)
 		)
@@ -4505,7 +4505,7 @@ table.insert(
 					elseif RuntimeState.ReplayPhase == "WAIT_NEW_ROUND" then "WAIT ROUND"
 					else RuntimeState.ReplayPhase
 				info.Text = string.format(
-					"State: %s | Target: %s\nDist: %s | Y: %s | Skill: %.0f | Kite: %.0f\nDodge: %s | Replay: %s\nFPS: %.0f | Ping: %.0f ms | Speed: %.0f\nStuck: %.1f/%.0fs",
+					"State: %s | Target: %s\nDist: %s | Y: %s | Skill: %.0f | Kite: %.0f\nDodge: %s | Replay: %s\nFPS: %.0f | Ping: %.0f ms | Speed: +%.0f%%\nStuck: %.1f/%.0fs",
 					State,
 					targetName,
 					distance and string.format("%.1f", distance) or "--",
@@ -4516,7 +4516,7 @@ table.insert(
 					replayLabel,
 					RuntimeState.SmoothedFPS,
 					RuntimeState.PingMs,
-					Humanoid and Humanoid.WalkSpeed or Config.MovementWalkSpeed,
+					(Config.MovementSpeedMultiplier - 1) * 100,
 					stuckSeconds,
 					Config.RespawnStuckTime
 				)
