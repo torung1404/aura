@@ -86,7 +86,9 @@ local DEFAULT_CONFIG = {
 	DodgeCommitDuration = 0.35,
 	DodgeEvaluationInterval = 0.08,
 	DodgeRaycastBudget = 32,
+	DodgeNoGoalMaxHold = 0.4,
 	RespawnRushPathProbeInterval = 0.12,
+	DirectRouteCacheInterval = 0.12,
 	ExploreCandidateCount = 12,
 	ExploreStepDistance = 28,
 	ExploreReachedDistance = 2,
@@ -266,6 +268,7 @@ local PathIssuedAt = 0
 local PathBestWaypointDistance = math.huge
 local WaypointIssueSerial = 0
 local ActiveWaypointIssueSerial = 0
+local PathRequestStatus = "IDLE"
 
 local RecoveryGoal: Vector3? = nil
 local RecoveryUntil = 0
@@ -386,12 +389,16 @@ local RuntimeState = {
 	LastRespawnRushPathProbeAt = -math.huge,
 	RespawnRushPathDirection = Vector3.zero,
 	RespawnRushPathClear = false,
+	LastPathFallbackProbeAt = -math.huge,
+	PathFallbackDirection = Vector3.zero,
+	PathFallbackClear = false,
 	RoundTransitionSerial = 0,
 	RoundTransitionStartedAt = 0,
 	RoundTransitionDeadline = 0,
 	RoundTransitionTimedOut = false,
 	DodgeCommitUntil = 0,
 	DodgeHoldUntil = 0,
+	DodgeNoGoalSince = 0,
 	LastDodgeEvaluationAt = -math.huge,
 	DodgeCachedHazard = nil :: BasePart?,
 	DodgeCachedPredicted = false,
@@ -415,6 +422,13 @@ local RuntimeState = {
 	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3, EvaluationSerial: number } },
 	VerticalPathTarget = nil :: Model?,
 	VerticalPathGoal = nil :: Vector3?,
+	DirectRouteCacheAt = -math.huge,
+	DirectRouteCacheGoal = nil :: Vector3?,
+	DirectRouteCacheTarget = nil :: Model?,
+	DirectRouteCacheCharacter = nil :: Model?,
+	DirectRouteCacheRoot = nil :: BasePart?,
+	DirectRouteCacheDirection = Vector3.zero,
+	DirectRouteCacheResult = false,
 }
 
 local UIState = {
@@ -1200,23 +1214,23 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 	return nearest, nearestPredicted, nearestEdge, nearestRouteDistance
 end
 
-local function dodgeRouteClear(goal: Vector3): boolean
+local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 	if not Config.DodgeEnabled then
-		return true
+		return true, "SAFE"
 	end
 	if not Root then
-		return false
+		return false, "UNSAFE"
 	end
 	local flatDelta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
 	if flatDelta.Magnitude <= 0.1 then
-		return true
+		return true, "SAFE"
 	end
 	if not RuntimeState.consumeDodgeRaycast() then
-		return false
+		return nil, "UNKNOWN"
 	end
 	local obstacle = workspace:Raycast(Root.Position + Vector3.new(0, 2.5, 0), flatDelta, makeRaycastParams(nil))
 	if obstacle and obstacle.Distance < flatDelta.Magnitude - 1.5 then
-		return false
+		return false, "UNSAFE"
 	end
 	local footprint = playerFootprintRadius()
 	local previousClearances: { [BasePart]: number } = {}
@@ -1229,7 +1243,7 @@ local function dodgeRouteClear(goal: Vector3): boolean
 				routeClearance <= Config.DodgeSafePadding
 				and not (previousClearances[hazard] <= Config.DodgeSafePadding and destinationClearance > previousClearances[hazard] + 0.1)
 			then
-				return false
+				return false, "UNSAFE"
 			end
 		end
 	end
@@ -1237,8 +1251,14 @@ local function dodgeRouteClear(goal: Vector3): boolean
 	local count = math.min(8, math.max(3, math.ceil(flatDelta.Magnitude / 4)))
 	for index = 1, count do
 		local grounded, found = RuntimeState.projectDodgeGround(Root.Position:Lerp(goal, index / count), Target)
-		if not found or math.abs(grounded.Y - previous.Y) > Config.ExploreMaxVerticalStep then
-			return false
+		if not found then
+			if RuntimeState.DodgeBudgetExhausted then
+				return nil, "UNKNOWN"
+			end
+			return false, "UNSAFE"
+		end
+		if math.abs(grounded.Y - previous.Y) > Config.ExploreMaxVerticalStep then
+			return false, "UNSAFE"
 		end
 		for hazard in pairs(NearbyActiveHazards) do
 			if isActiveHazardPart(hazard) and hazardThreatensHeight(hazard, grounded) then
@@ -1250,19 +1270,26 @@ local function dodgeRouteClear(goal: Vector3): boolean
 					(prior <= Config.DodgeSafePadding and clearance < prior - 0.1)
 					or (prior > Config.DodgeSafePadding and clearance <= Config.DodgeSafePadding)
 				then
-					return false
+					return false, "UNSAFE"
 				end
 				previousClearances[hazard] = clearance
 			end
 		end
 		previous = grounded
 	end
-	return RuntimeState.dodgeHasGroundSupport(goal, nil)
+	local supported = RuntimeState.dodgeHasGroundSupport(goal, nil)
+	if not supported then
+		if RuntimeState.DodgeBudgetExhausted then
+			return nil, "UNKNOWN"
+		end
+		return false, "UNSAFE"
+	end
+	return true, "SAFE"
 end
 
-local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean, string?, number?)
+local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, string?, number?)
 	if not Root then
-		return nil, false, nil, nil
+		return nil, "UNSAFE", nil, nil
 	end
 	local exitDirection = RuntimeState.hazardExitDirection(hazard, Root.Position)
 	local bestGoal: Vector3? = nil
@@ -1286,23 +1313,36 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean,
 	local candidateDirections: { { Direction: Vector3, Label: string } } = {}
 	local function addCandidateDirection(direction: Vector3, label: string)
 		local flatDirection = Vector3.new(direction.X, 0, direction.Z)
-		if flatDirection.Magnitude > 0.1 then
-			table.insert(candidateDirections, { Direction = flatDirection.Unit, Label = label })
+		if flatDirection.Magnitude <= 0.1 then
+			return
 		end
+		local normalized = flatDirection.Unit
+		for _, existing in ipairs(candidateDirections) do
+			if existing.Direction:Dot(normalized) >= 0.98 then
+				return
+			end
+		end
+		table.insert(candidateDirections, { Direction = normalized, Label = label })
 	end
 	if forwardDirection.Magnitude > 0.1 then
-		-- Try diagonal exits first. They cross the narrow side of a line while
-		-- preserving approach progress; both sides are evaluated, never fixed.
-		addCandidateDirection(forwardDirection + exitDirection, "forward-left")
-		addCandidateDirection(forwardDirection - exitDirection, "forward-right")
-		addCandidateDirection(exitDirection, "lateral-left")
-		addCandidateDirection(-exitDirection, "lateral-right")
+		-- The approach basis is independent from the escape normal. A hazard's
+		-- outward direction is not guaranteed to be perpendicular to the target.
+		local rightDirection = Vector3.new(-forwardDirection.Z, 0, forwardDirection.X)
+		local leftDirection = -rightDirection
+		-- Try diagonal exits first. They preserve target progress while both true
+		-- sides of the approach route are evaluated.
+		addCandidateDirection(forwardDirection + leftDirection, "forward-left")
+		addCandidateDirection(forwardDirection + rightDirection, "forward-right")
+		addCandidateDirection(leftDirection, "left")
+		addCandidateDirection(rightDirection, "right")
+		addCandidateDirection(exitDirection, "exit")
+		addCandidateDirection(exitDirection + leftDirection, "exit-left")
+		addCandidateDirection(exitDirection + rightDirection, "exit-right")
 		addCandidateDirection(forwardDirection, "forward")
-		addCandidateDirection(-forwardDirection + exitDirection, "retreat-left")
-		addCandidateDirection(-forwardDirection - exitDirection, "retreat-right")
+		addCandidateDirection(-forwardDirection, "retreat")
 	else
-		addCandidateDirection(exitDirection, "lateral-left")
-		addCandidateDirection(-exitDirection, "lateral-right")
+		addCandidateDirection(exitDirection, "exit")
+		addCandidateDirection(-exitDirection, "opposite-exit")
 	end
 	-- Keep a bounded fallback set for circular hazards or an objective that is
 	-- temporarily unavailable. These are only reached after lateral choices.
@@ -1316,17 +1356,27 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean,
 	for ringIndex, ringDistance in ipairs(ringDistances) do
 		for directionIndex, candidateInfo in ipairs(candidateDirections) do
 			if RuntimeState.DodgeBudgetExhausted then
-				return bestGoal, true, bestLabel, bestScore
+				return bestGoal, "UNKNOWN", bestLabel, bestScore
 			end
 			local candidate = Root.Position + candidateInfo.Direction * ringDistance
 			local grounded, foundGround = RuntimeState.projectDodgeGround(candidate, nil)
-			local rejection = if not foundGround
-				then "no-ground"
-				elseif math.abs(grounded.Y - Root.Position.Y) > Config.DirectVerticalTolerance then "wrong-floor"
-				elseif not pointIsSafeFromHazards(grounded) then "hazard-overlap"
-				elseif not dodgeRouteClear(grounded) then "blocked-or-gap"
-				else nil
-			if not rejection then
+			local evaluation = "SAFE"
+			local rejection: string? = nil
+			if not foundGround then
+				evaluation = if RuntimeState.DodgeBudgetExhausted then "UNKNOWN" else "UNSAFE"
+				rejection = if evaluation == "UNKNOWN" then "ground-unknown" else "no-ground"
+			elseif math.abs(grounded.Y - Root.Position.Y) > Config.DirectVerticalTolerance then
+				evaluation, rejection = "UNSAFE", "wrong-floor"
+			elseif not pointIsSafeFromHazards(grounded) then
+				evaluation, rejection = "UNSAFE", "hazard-overlap"
+			else
+				local _, routeStatus = dodgeRouteClear(grounded)
+				if routeStatus ~= "SAFE" then
+					evaluation = routeStatus
+					rejection = if routeStatus == "UNKNOWN" then "route-unknown" else "blocked-or-gap"
+				end
+			end
+			if evaluation == "SAFE" then
 				local distance = flatPointDistance(Root.Position, grounded)
 				local minimumSafety = math.huge
 				for otherHazard in pairs(NearbyActiveHazards) do
@@ -1363,15 +1413,18 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, boolean,
 					bestGoal = grounded
 					bestLabel = candidateInfo.Label
 				end
-			else
+			elseif evaluation == "UNSAFE" then
 				RuntimeUtil.telemetry("DODGE_REJECT_" .. tostring(ringIndex) .. "_" .. tostring(directionIndex), rejection)
 			end
 		end
 		if bestGoal then
-			return bestGoal, false, bestLabel, bestScore
+			return bestGoal, "SAFE", bestLabel, bestScore
 		end
 	end
-	return bestGoal, RuntimeState.DodgeBudgetExhausted, bestLabel, bestScore
+	if RuntimeState.DodgeBudgetExhausted then
+		return bestGoal, "UNKNOWN", bestLabel, bestScore
+	end
+	return bestGoal, "UNSAFE", bestLabel, bestScore
 end
 
 RuntimeState.exploreCellKey = function(position: Vector3): string
@@ -1536,7 +1589,17 @@ local function updateExploreMovement()
 	Humanoid:Move(direction.Unit, false)
 end
 
-local function directRouteClear(goal: Vector3, target: Model?): boolean
+local function invalidateDirectRouteCache()
+	RuntimeState.DirectRouteCacheAt = -math.huge
+	RuntimeState.DirectRouteCacheGoal = nil
+	RuntimeState.DirectRouteCacheTarget = nil
+	RuntimeState.DirectRouteCacheCharacter = nil
+	RuntimeState.DirectRouteCacheRoot = nil
+	RuntimeState.DirectRouteCacheDirection = Vector3.zero
+	RuntimeState.DirectRouteCacheResult = false
+end
+
+local function computeDirectRouteClear(goal: Vector3, target: Model?): boolean
 	if not Root or math.abs(goal.Y - Root.Position.Y) > Config.DirectVerticalTolerance then
 		return false
 	end
@@ -1563,6 +1626,36 @@ local function directRouteClear(goal: Vector3, target: Model?): boolean
 		previous = ground
 	end
 	return hasGroundSupport(goal, target)
+end
+
+local function directRouteClear(goal: Vector3, target: Model?): boolean
+	if not Root then
+		return false
+	end
+	local now = os.clock()
+	local cachedGoal = RuntimeState.DirectRouteCacheGoal
+	local flatDelta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
+	local direction = if flatDelta.Magnitude > 0.1 then flatDelta.Unit else Vector3.zero
+	if
+		cachedGoal
+		and now - RuntimeState.DirectRouteCacheAt < Config.DirectRouteCacheInterval
+		and RuntimeState.DirectRouteCacheTarget == target
+		and RuntimeState.DirectRouteCacheCharacter == Character
+		and RuntimeState.DirectRouteCacheRoot == Root
+		and (cachedGoal - goal).Magnitude <= Config.DirectGoalChangeDistance
+		and RuntimeState.DirectRouteCacheDirection:Dot(direction) >= 0.995
+	then
+		return RuntimeState.DirectRouteCacheResult
+	end
+	local result = computeDirectRouteClear(goal, target)
+	RuntimeState.DirectRouteCacheAt = now
+	RuntimeState.DirectRouteCacheGoal = goal
+	RuntimeState.DirectRouteCacheTarget = target
+	RuntimeState.DirectRouteCacheCharacter = Character
+	RuntimeState.DirectRouteCacheRoot = Root
+	RuntimeState.DirectRouteCacheDirection = direction
+	RuntimeState.DirectRouteCacheResult = result
+	return result
 end
 
 local function navigationGoalForTarget(enemyRoot: BasePart, target: Model, holdDistance: number?): Vector3
@@ -2663,11 +2756,15 @@ local function disposePath()
 	PathBestWaypointDistance = math.huge
 	ActivePathGeneration = 0
 	ActiveWaypointIssueSerial = 0
+	RuntimeState.LastPathFallbackProbeAt = -math.huge
+	RuntimeState.PathFallbackDirection = Vector3.zero
+	RuntimeState.PathFallbackClear = false
 end
 
 local function cancelPathRequest()
 	PathRequestSerial += 1
 	PathComputing = false
+	PathRequestStatus = "IDLE"
 	disposePath()
 end
 
@@ -2826,11 +2923,17 @@ local function issueCurrentWaypoint()
 end
 
 local function requestPath(goal: Vector3): boolean
-	if not alive() or not Target or PathComputing then
+	if not alive() or not Target then
+		PathRequestStatus = "REJECTED"
+		return false
+	end
+	if PathComputing then
+		PathRequestStatus = "COMPUTING"
 		return false
 	end
 	local now = os.clock()
 	if now - LastPathBuildAt < Config.PathRebuildCooldown then
+		PathRequestStatus = "COOLDOWN"
 		return false
 	end
 	PathRequestSerial += 1
@@ -2840,6 +2943,7 @@ local function requestPath(goal: Vector3): boolean
 	local origin = Root.Position
 	local executionGeneration = RuntimeState.Generation
 	PathComputing = true
+	PathRequestStatus = "COMPUTING"
 	LastPathBuildAt = now
 	disposePath()
 	task.spawn(function()
@@ -2859,11 +2963,13 @@ local function requestPath(goal: Vector3): boolean
 		end
 		PathComputing = false
 		if not Enabled or not Running or not alive() or Target ~= expectedTarget or Character ~= expectedCharacter then
+			PathRequestStatus = "REJECTED"
 			newPath:Destroy()
 			return
 		end
 		local waypoints = ok and newPath.Status == Enum.PathStatus.Success and newPath:GetWaypoints() or nil
 		if not waypoints or #waypoints < 2 then
+			PathRequestStatus = "FAILED"
 			newPath:Destroy()
 			RecoveryGoal = nil
 			RecoveryUntil = 0
@@ -2873,6 +2979,7 @@ local function requestPath(goal: Vector3): boolean
 		ActivePath = newPath
 		ActivePathGeneration = requestId
 		PathWaypoints = waypoints
+		PathRequestStatus = "READY"
 		PathIndex = 2
 		PathGoal = goal
 		PathIssuedIndex = 0
@@ -2890,35 +2997,49 @@ local function requestPath(goal: Vector3): boolean
 	return true
 end
 
+local function updatePathFallback(goal: Vector3)
+	if not Root or not Humanoid then
+		return
+	end
+	local now = os.clock()
+	if now - RuntimeState.LastPathFallbackProbeAt >= Config.RespawnRushPathProbeInterval then
+		RuntimeState.LastPathFallbackProbeAt = now
+		local delta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
+		RuntimeState.PathFallbackDirection = if delta.Magnitude > 0.1 then delta.Unit else Vector3.zero
+		RuntimeState.PathFallbackClear = false
+		if delta.Magnitude > 0.1 then
+			local probeDistance = math.min(delta.Magnitude, Config.DetourProbeDistance)
+			local candidate = Root.Position + RuntimeState.PathFallbackDirection * probeDistance
+			local grounded, foundGround = projectToWalkableGround(candidate, Target)
+			if foundGround and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance then
+				-- directRouteClear performs the obstacle, supported-ground, and ledge checks
+				-- over this bounded fallback instead of issuing a blind Move command.
+				RuntimeState.PathFallbackClear = directRouteClear(grounded, Target)
+			end
+		end
+	end
+	if RuntimeState.PathFallbackClear then
+		Humanoid:Move(RuntimeState.PathFallbackDirection, false)
+	else
+		stopTranslation()
+	end
+end
+
 local function updatePathNavigation()
 	if State ~= NavigationState.PATH or not Root or not Humanoid then
 		return
 	end
 	if not PathWaypoints then
-		-- ComputeAsync can take a visible fraction of the six-second spawn grace.
-		-- Keep a short, physically-clear approach command alive while it resolves;
-		-- the completed PATH remains authoritative as soon as its waypoints publish.
-		if PathComputing and os.clock() < RuntimeState.RespawnRushUntil and NavigationGoal then
-			local now = os.clock()
-			if now - RuntimeState.LastRespawnRushPathProbeAt >= Config.RespawnRushPathProbeInterval then
-				RuntimeState.LastRespawnRushPathProbeAt = now
-				local delta = Vector3.new(NavigationGoal.X - Root.Position.X, 0, NavigationGoal.Z - Root.Position.Z)
-				RuntimeState.RespawnRushPathDirection = if delta.Magnitude > 0.1 then delta.Unit else Vector3.zero
-				if delta.Magnitude > 0.1 then
-					local probeLength = math.min(delta.Magnitude, Config.DetourProbeDistance)
-					local obstacle = workspace:Raycast(
-						Root.Position + Vector3.new(0, 2.5, 0),
-						RuntimeState.RespawnRushPathDirection * probeLength,
-						makeRaycastParams(Target)
-					)
-					RuntimeState.RespawnRushPathClear = obstacle == nil
-				else
-					RuntimeState.RespawnRushPathClear = false
-				end
+		if NavigationGoal then
+			if not PathComputing then
+				requestPath(NavigationGoal)
 			end
-			if RuntimeState.RespawnRushPathClear then
-				Humanoid:Move(RuntimeState.RespawnRushPathDirection, false)
-			end
+			-- COMPUTING and COOLDOWN both retain a bounded, verified fallback. A
+			-- failed request publishes RECOVERY in its callback, so PATH never has a
+			-- silent no-waypoint return.
+			updatePathFallback(NavigationGoal)
+		else
+			stopTranslation()
 		end
 		return
 	end
@@ -3099,6 +3220,7 @@ end
 local function resetNavigationForTarget(newTarget: Model?)
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
+	invalidateDirectRouteCache()
 	if Target ~= newTarget and TargetDiedConnection then
 		TargetDiedConnection:Disconnect()
 		TargetDiedConnection = nil
@@ -3160,6 +3282,7 @@ local function clearDodgeObjective()
 	DodgeGoal = nil
 	RuntimeState.DodgeCommitUntil = 0
 	RuntimeState.DodgeHoldUntil = 0
+	RuntimeState.DodgeNoGoalSince = 0
 	RuntimeState.DodgeCachedHazard = nil
 	RuntimeState.DodgeCachedPredicted = false
 	RuntimeState.DodgeCachedEdgeDistance = math.huge
@@ -3178,6 +3301,7 @@ resetRuntimeForNewDungeon = function()
 	local resetSerial = RuntimeState.RoundResetSerial
 	local executionGeneration = RuntimeState.Generation
 	local now = os.clock()
+	invalidateDirectRouteCache()
 	print("[ROUND] transition=BEGIN")
 	RuntimeState.RoundTransitionActive = true
 	RuntimeState.RoundBootstrapUntil = now + 7
@@ -3367,8 +3491,6 @@ local function updateDodgeController(): boolean
 			return true
 		end
 		if now < RuntimeState.DodgeHoldUntil then
-			LastMeaningfulProgressAt = now
-			RuntimeState.JumpStillSince = now
 			stopTranslation()
 			return true
 		end
@@ -3389,6 +3511,7 @@ local function updateDodgeController(): boolean
 	end
 	if not hazard then
 		RuntimeState.DodgeHoldUntil = 0
+		RuntimeState.DodgeNoGoalSince = 0
 		if State == NavigationState.DODGE then
 			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis and DodgeGoal then
 				local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
@@ -3403,14 +3526,19 @@ local function updateDodgeController(): boolean
 	LastHazardThreatAt = os.clock()
 
 	local goalUnsafe = false
+	local cachedGoalUnknown = false
 	if State == NavigationState.DODGE then
 		if not DodgeGoal then
 			goalUnsafe = true
 		elseif not pointIsSafeFromHazards(DodgeGoal) then
 			goalUnsafe = true
-		elseif not dodgeRouteClear(DodgeGoal) and not RuntimeState.DodgeBudgetExhausted then
-			goalUnsafe = true
 		else
+			local _, routeStatus = dodgeRouteClear(DodgeGoal)
+			if routeStatus == "UNSAFE" then
+				goalUnsafe = true
+			elseif routeStatus == "UNKNOWN" then
+				cachedGoalUnknown = true
+			end
 			-- A budget-exhausted route check is UNKNOWN, not unsafe. Keep the
 			-- already validated route until the next bounded evaluation.
 			ActiveHazard = hazard
@@ -3420,8 +3548,9 @@ local function updateDodgeController(): boolean
 	local needsNewGoal = State ~= NavigationState.DODGE
 		or goalUnsafe
 		or goalReached
-		or now >= RuntimeState.DodgeCommitUntil
+		or (now >= RuntimeState.DodgeCommitUntil and not cachedGoalUnknown)
 	if needsNewGoal then
+		local reusableGoal = if State == NavigationState.DODGE and DodgeGoal and not goalUnsafe then DodgeGoal else nil
 		if State ~= NavigationState.DODGE then
 			DodgeStartedAt = os.clock()
 		end
@@ -3446,8 +3575,15 @@ local function updateDodgeController(): boolean
 		if routeDistance <= Config.DodgePreTriggerPadding then
 			RuntimeUtil.telemetry("DODGE_ROUTE", "route-blocked hazard=" .. hazard.Name)
 		end
-		local selectedGoal, budgetExhausted, selectedLabel, selectedScore = chooseNearestSafeDodgeGoal(hazard)
-		if not selectedGoal and not budgetExhausted then
+		local selectedGoal, candidateStatus, selectedLabel, selectedScore = chooseNearestSafeDodgeGoal(hazard)
+		if not selectedGoal and candidateStatus == "UNKNOWN" and reusableGoal then
+			-- Keep the previously verified route when this evaluation cannot finish;
+			-- budget exhaustion is not evidence that the cached goal became unsafe.
+			selectedGoal = reusableGoal
+			selectedLabel = "cached"
+			selectedScore = nil
+		end
+		if not selectedGoal and candidateStatus == "UNSAFE" then
 			-- Use the outward edge only when it stays on this floor and the route is verified.
 			local outward = RuntimeState.hazardExitDirection(hazard, Root.Position)
 			local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, playerFootprintRadius())
@@ -3459,16 +3595,17 @@ local function updateDodgeController(): boolean
 				foundGround
 				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
 				and pointIsSafeFromHazards(grounded)
-				and dodgeRouteClear(grounded)
+				and select(2, dodgeRouteClear(grounded)) == "SAFE"
 			then
 				selectedGoal = grounded
+				candidateStatus = "SAFE"
 			end
-			budgetExhausted = budgetExhausted or RuntimeState.DodgeBudgetExhausted
 		end
 		if selectedGoal then
 			cancelPathRequest()
 			DodgeGoal = selectedGoal
 			RuntimeState.DodgeHoldUntil = 0
+			RuntimeState.DodgeNoGoalSince = 0
 			RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
 			setNavigationState(NavigationState.DODGE)
 			RuntimeUtil.telemetry(
@@ -3476,22 +3613,29 @@ local function updateDodgeController(): boolean
 				string.format("choose=%s score=%.1f goal=%s", selectedLabel or "fallback", selectedScore or 0, tostring(DodgeGoal))
 			)
 		else
-			-- No verified safe route is not an instruction to hold translation at
-			-- zero indefinitely. Hold only until the next bounded evaluation so a
-			-- blocked direct route cannot issue one unsafe approach frame.
+			-- UNKNOWN means the current evaluation ran out of evidence, not that all
+			-- unchecked routes are unsafe. Hold only for a bounded window, without
+			-- renewing watchdog progress; then use the existing recovery/path policy.
 			ActiveHazard = nil
 			DodgeGoal = nil
 			RuntimeState.DodgeCommitUntil = 0
 			RuntimeState.DodgeCachedHazard = nil
-			RuntimeState.DodgeHoldUntil = now + Config.DodgeEvaluationInterval
-			LastMeaningfulProgressAt = now
-			RuntimeState.JumpStillSince = now
-			RuntimeUtil.telemetry("DODGE_GOAL", budgetExhausted and "budget-exhausted" or "no-safe-goal")
-			if State == NavigationState.DODGE then
-				setNavigationState(NavigationState.IDLE)
+			if RuntimeState.DodgeNoGoalSince <= 0 then
+				RuntimeState.DodgeNoGoalSince = now
 			end
-			stopTranslation()
-			return true
+			local holdDeadline = RuntimeState.DodgeNoGoalSince + Config.DodgeNoGoalMaxHold
+			if now < holdDeadline then
+				RuntimeState.DodgeHoldUntil = math.min(now + Config.DodgeEvaluationInterval, holdDeadline)
+				RuntimeUtil.telemetry("DODGE_GOAL", candidateStatus == "UNKNOWN" and "budget-or-data-unknown" or "no-safe-goal")
+				stopTranslation()
+				return true
+			end
+			RuntimeState.DodgeHoldUntil = 0
+			RuntimeState.DodgeNoGoalSince = 0
+			-- Do not resume a confirmed-danger DIRECT command after a no-goal hold.
+			-- Recovery owns the next movement and can request an existing safe path.
+			beginLocalRecovery(NavigationGoal or Root.Position)
+			return false
 		end
 	end
 	local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
@@ -4044,6 +4188,7 @@ local function bindCharacter(character: Model)
 	Character = character
 	Humanoid = newHumanoid
 	Root = newRoot
+	invalidateDirectRouteCache()
 	if Humanoid then
 		DefaultAutoRotate = Humanoid.AutoRotate
 		DefaultWalkSpeed = Humanoid.WalkSpeed
@@ -4418,6 +4563,7 @@ table.insert(
 		Character = nil
 		Humanoid = nil
 		Root = nil
+		invalidateDirectRouteCache()
 		GoalTarget = nil
 		NavigationGoal = nil
 		RecoveryGoal = nil
