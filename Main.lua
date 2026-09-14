@@ -44,7 +44,7 @@ local DEFAULT_CONFIG = {
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
-	MovementSpeedMultiplier = 1.4,
+	MovementSpeedMultiplier = 1.3,
 	DirectReachedDistance = 0.75,
 	DirectVerticalTolerance = 7,
 	DirectDecisionInterval = 0.25,
@@ -190,7 +190,7 @@ Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
 -- forty percent. Old fixed-speed values must not survive a re-exec.
 Config.MovementWalkSpeed = nil
-Config.MovementSpeedMultiplier = 1.4
+Config.MovementSpeedMultiplier = 1.3
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
 if type(SavedConfig.FarmEnabled) == "boolean" then
