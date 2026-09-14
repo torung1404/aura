@@ -44,7 +44,7 @@ local DEFAULT_CONFIG = {
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
-	MovementSpeedMultiplier = 1.4,
+	MovementWalkSpeed = 23,
 	DirectReachedDistance = 0.75,
 	DirectVerticalTolerance = 7,
 	DirectDecisionInterval = 0.25,
@@ -186,10 +186,10 @@ Config.ApproachDistance = nil
 Config.NormalSkillRange = 80
 Config.BossSkillRange = 100
 Config.SkillRange = nil
--- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
--- forty percent. Old fixed-speed values must not survive a re-exec.
-Config.MovementWalkSpeed = nil
-Config.MovementSpeedMultiplier = 1.4
+-- Keep one fixed AutoFarm target speed. Old multiplier settings must not
+-- survive a re-exec and compound a game-side WalkSpeed change.
+Config.MovementSpeedMultiplier = nil
+Config.MovementWalkSpeed = 23
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
 if type(SavedConfig.FarmEnabled) == "boolean" then
@@ -720,15 +720,18 @@ local function isRedFloorTelegraph(part: BasePart): boolean
 	table.sort(dimensions)
 	local color = part.Color
 	local visiblyRed = color.R >= 0.65 and color.R >= color.G * 1.35 and color.R >= color.B * 1.2
-	-- A translucent, non-colliding flat area is a generic telegraph shape. The
-	-- transparency and geometry requirements keep opaque red map decoration out.
+	-- A translucent, non-colliding floor footprint is a generic telegraph shape.
+	-- The old 2.5-stud thickness limit missed some cylinder/mesh AoEs whose
+	-- bounding box includes visual depth. Keep the footprint and opacity gates so
+	-- static red map decoration is not classified from color alone.
+	local flatFootprint = dimensions[2] >= 3
+		and dimensions[3] >= 3
+		and dimensions[1] <= math.max(4, math.min(dimensions[2], dimensions[3]) * 0.4)
 	return visiblyRed
 		and part.Transparency > 0.05
 		and part.Transparency < 0.98
 		and not part.CanCollide
-		and dimensions[1] <= 2.5
-		and dimensions[2] >= 3
-		and dimensions[3] >= 3
+		and flatFootprint
 end
 
 local function logHazardRegistration(part: BasePart, decision: string, reason: string)
@@ -2620,7 +2623,7 @@ local function applyMovementSpeed()
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 		SpeedApplied = true
 	end
-	AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
+	AppliedWalkSpeed = Config.MovementWalkSpeed
 	if math.abs(Humanoid.WalkSpeed - AppliedWalkSpeed) > 0.05 then
 		Humanoid.WalkSpeed = AppliedWalkSpeed
 	end
@@ -4046,13 +4049,13 @@ local function bindCharacter(character: Model)
 					not Running
 					or boundHumanoid ~= Humanoid
 					or not RuntimeUtil.isCurrentExecution()
-					or math.abs(boundHumanoid.WalkSpeed - 16 * Config.MovementSpeedMultiplier) <= 0.05
+					or math.abs(boundHumanoid.WalkSpeed - Config.MovementWalkSpeed) <= 0.05
 				then
 					return
 				end
 				-- The write triggers this signal once more, then the tolerance guard
 				-- exits. Old-character connections are disposed before rebinding.
-				AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
+				AppliedWalkSpeed = Config.MovementWalkSpeed
 				boundHumanoid.WalkSpeed = AppliedWalkSpeed
 			end)
 		)
@@ -4440,7 +4443,7 @@ table.insert(
 					elseif RuntimeState.ReplayPhase == "WAIT_NEW_ROUND" then "WAIT ROUND"
 					else RuntimeState.ReplayPhase
 				info.Text = string.format(
-					"State: %s | Target: %s\nDist: %s | Y: %s | Skill: %.0f | Kite: %.0f\nDodge: %s | Replay: %s\nFPS: %.0f | Ping: %.0f ms | Speed: +%.0f%%\nStuck: %.1f/%.0fs",
+					"State: %s | Target: %s\nDist: %s | Y: %s | Skill: %.0f | Kite: %.0f\nDodge: %s | Replay: %s\nFPS: %.0f | Ping: %.0f ms | Speed: %.0f\nStuck: %.1f/%.0fs",
 					State,
 					targetName,
 					distance and string.format("%.1f", distance) or "--",
@@ -4451,7 +4454,7 @@ table.insert(
 					replayLabel,
 					RuntimeState.SmoothedFPS,
 					RuntimeState.PingMs,
-					(Config.MovementSpeedMultiplier - 1) * 100,
+					Humanoid and Humanoid.WalkSpeed or Config.MovementWalkSpeed,
 					stuckSeconds,
 					Config.RespawnStuckTime
 				)
