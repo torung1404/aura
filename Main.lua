@@ -4063,7 +4063,11 @@ local function bindCharacter(character: Model)
 			UIState.CharacterConnections,
 			Humanoid.Died:Connect(function()
 				local executionGeneration = RuntimeState.Generation
-				RuntimeState.RespawnRushUntil = 0
+				local deadCharacter = Character
+				-- A new character can exist before its HumanoidRootPart replicates.
+				-- Keep recovery blocked throughout that hand-off: otherwise the delayed
+				-- death fallback can press reset again while bindCharacter is waiting.
+				RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
 				RuntimeState.sendStatusWebhook("CHARACTER_DIED")
 				-- Do not discard a living enemy just because this character died.
 				-- CharacterAdded will immediately resume the same target when possible.
@@ -4080,6 +4084,7 @@ local function bindCharacter(character: Model)
 							RuntimeUtil.isCurrentExecution()
 							and RuntimeState.Generation == executionGeneration
 							and Running
+							and Player.Character == deadCharacter
 							and not alive()
 						then
 							recoverByRespawn(nil, nil)
@@ -4362,6 +4367,11 @@ table.insert(
 	Player.CharacterAdded:Connect(function(character)
 		local executionGeneration = RuntimeState.Generation
 		RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
+		-- A recovery operation belongs to the old character. Invalidate it before
+		-- the new bind so it cannot reset or hold this respawn in place.
+		RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
+		RespawnInProgress = false
+		ResetExecuting = false
 		RuntimeState.CharacterBindRetryUntil = os.clock() + 8
 		RuntimeState.CharacterBindRetryPending = false
 		RuntimeState.CharacterBindRetryCharacter = nil
@@ -4384,6 +4394,23 @@ table.insert(
 		LastHazardRefreshAt = -math.huge
 		setNavigationState(NavigationState.IDLE)
 		print("[CHAR] respawn")
+		table.insert(
+			UIState.CharacterConnections,
+			character.ChildAdded:Connect(function(child)
+				if child:IsA("Humanoid") or child.Name == "HumanoidRootPart" then
+					local childGeneration = RuntimeState.Generation
+					task.defer(function()
+						if
+							RuntimeUtil.isCurrentExecution()
+							and RuntimeState.Generation == childGeneration
+							and Player.Character == character
+						then
+							bindCharacter(character)
+						end
+					end)
+				end
+			end)
+		)
 		task.defer(function()
 			if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
 				bindCharacter(character)
