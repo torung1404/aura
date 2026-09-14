@@ -89,6 +89,9 @@ local DEFAULT_CONFIG = {
 	DodgeNoGoalMaxHold = 0.4,
 	RespawnRushPathProbeInterval = 0.12,
 	DirectRouteCacheInterval = 0.12,
+	TargetRootStabilizeDuration = 0.45,
+	TargetRootMaxStabilizeDuration = 2,
+	TargetRootVerticalChange = 5,
 	ExploreCandidateCount = 12,
 	ExploreStepDistance = 28,
 	ExploreReachedDistance = 2,
@@ -422,11 +425,17 @@ local RuntimeState = {
 	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3, EvaluationSerial: number } },
 	VerticalPathTarget = nil :: Model?,
 	VerticalPathGoal = nil :: Vector3?,
+	TargetRootSampleTarget = nil :: Model?,
+	TargetRootSamplePosition = nil :: Vector3?,
+	TargetRootSampleAt = 0,
+	TargetRootStabilizeUntil = 0,
+	TargetRootStabilizeStartedAt = 0,
 	DirectRouteCacheAt = -math.huge,
 	DirectRouteCacheGoal = nil :: Vector3?,
 	DirectRouteCacheTarget = nil :: Model?,
 	DirectRouteCacheCharacter = nil :: Model?,
 	DirectRouteCacheRoot = nil :: BasePart?,
+	DirectRouteCacheOrigin = nil :: Vector3?,
 	DirectRouteCacheDirection = Vector3.zero,
 	DirectRouteCacheResult = false,
 }
@@ -1595,6 +1604,7 @@ local function invalidateDirectRouteCache()
 	RuntimeState.DirectRouteCacheTarget = nil
 	RuntimeState.DirectRouteCacheCharacter = nil
 	RuntimeState.DirectRouteCacheRoot = nil
+	RuntimeState.DirectRouteCacheOrigin = nil
 	RuntimeState.DirectRouteCacheDirection = Vector3.zero
 	RuntimeState.DirectRouteCacheResult = false
 end
@@ -1634,6 +1644,7 @@ local function directRouteClear(goal: Vector3, target: Model?): boolean
 	end
 	local now = os.clock()
 	local cachedGoal = RuntimeState.DirectRouteCacheGoal
+	local cachedOrigin = RuntimeState.DirectRouteCacheOrigin
 	local flatDelta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
 	local direction = if flatDelta.Magnitude > 0.1 then flatDelta.Unit else Vector3.zero
 	if
@@ -1642,6 +1653,8 @@ local function directRouteClear(goal: Vector3, target: Model?): boolean
 		and RuntimeState.DirectRouteCacheTarget == target
 		and RuntimeState.DirectRouteCacheCharacter == Character
 		and RuntimeState.DirectRouteCacheRoot == Root
+		and cachedOrigin
+		and (cachedOrigin - Root.Position).Magnitude <= 3
 		and (cachedGoal - goal).Magnitude <= Config.DirectGoalChangeDistance
 		and RuntimeState.DirectRouteCacheDirection:Dot(direction) >= 0.995
 	then
@@ -1653,6 +1666,7 @@ local function directRouteClear(goal: Vector3, target: Model?): boolean
 	RuntimeState.DirectRouteCacheTarget = target
 	RuntimeState.DirectRouteCacheCharacter = Character
 	RuntimeState.DirectRouteCacheRoot = Root
+	RuntimeState.DirectRouteCacheOrigin = Root.Position
 	RuntimeState.DirectRouteCacheDirection = direction
 	RuntimeState.DirectRouteCacheResult = result
 	return result
@@ -1813,6 +1827,57 @@ local function targetMetrics(target: Model?): (number, number)
 	end
 	local delta = enemyRoot.Position - Root.Position
 	return math.abs(delta.Y), delta.Magnitude
+end
+
+local function targetRootIsStabilizing(target: Model, enemyRoot: BasePart, now: number): boolean
+	if not Root then
+		return false
+	end
+	local previousTarget = RuntimeState.TargetRootSampleTarget
+	local previousPosition = RuntimeState.TargetRootSamplePosition
+	local previousAt = RuntimeState.TargetRootSampleAt
+	if previousTarget ~= target or not previousPosition then
+		RuntimeState.TargetRootSampleTarget = target
+		RuntimeState.TargetRootSamplePosition = enemyRoot.Position
+		RuntimeState.TargetRootSampleAt = now
+		local flatDistance = Vector3.new(
+			enemyRoot.Position.X - Root.Position.X,
+			0,
+			enemyRoot.Position.Z - Root.Position.Z
+		).Magnitude
+		if math.abs(enemyRoot.Position.Y - Root.Position.Y) > Config.DirectVerticalTolerance and flatDistance > 15 then
+			-- One short sample window prevents committing a long route to a freshly
+			-- replicated underground root, without assuming any boss-specific timing.
+			RuntimeState.TargetRootStabilizeUntil = now + math.min(0.2, Config.TargetRootStabilizeDuration)
+			RuntimeState.TargetRootStabilizeStartedAt = now
+			RuntimeUtil.telemetry("TARGET_ROOT", "root-stabilizing=" .. target.Name .. " initial-vertical")
+			return true
+		end
+		RuntimeState.TargetRootStabilizeUntil = 0
+		RuntimeState.TargetRootStabilizeStartedAt = 0
+		return false
+	end
+	local elapsed = now - previousAt
+	local verticalDelta = math.abs(enemyRoot.Position.Y - previousPosition.Y)
+	local horizontalDelta = Vector3.new(
+		enemyRoot.Position.X - previousPosition.X,
+		0,
+		enemyRoot.Position.Z - previousPosition.Z
+	).Magnitude
+	RuntimeState.TargetRootSamplePosition = enemyRoot.Position
+	RuntimeState.TargetRootSampleAt = now
+	if elapsed > 0 and elapsed <= 0.75 and verticalDelta >= Config.TargetRootVerticalChange and horizontalDelta <= verticalDelta then
+		if RuntimeState.TargetRootStabilizeStartedAt <= 0 then
+			RuntimeState.TargetRootStabilizeStartedAt = now
+		end
+		local deadline = RuntimeState.TargetRootStabilizeStartedAt + Config.TargetRootMaxStabilizeDuration
+		RuntimeState.TargetRootStabilizeUntil = math.min(now + Config.TargetRootStabilizeDuration, deadline)
+		RuntimeUtil.telemetry(
+			"TARGET_ROOT",
+			string.format("root-stabilizing=%s verticalDelta=%.1f", target.Name, verticalDelta)
+		)
+	end
+	return now < RuntimeState.TargetRootStabilizeUntil
 end
 
 local function updateGlobalStuckJump()
@@ -2925,25 +2990,30 @@ end
 local function requestPath(goal: Vector3): boolean
 	if not alive() or not Target then
 		PathRequestStatus = "REJECTED"
+		RuntimeUtil.telemetry("PATH", "result=rejected")
 		return false
 	end
 	if PathComputing then
 		PathRequestStatus = "COMPUTING"
+		RuntimeUtil.telemetry("PATH", "result=computing")
 		return false
 	end
 	local now = os.clock()
 	if now - LastPathBuildAt < Config.PathRebuildCooldown then
 		PathRequestStatus = "COOLDOWN"
+		RuntimeUtil.telemetry("PATH", "result=cooldown target=" .. Target.Name)
 		return false
 	end
 	PathRequestSerial += 1
 	local requestId = PathRequestSerial
 	local expectedTarget = Target
 	local expectedCharacter = Character
+	local expectedGoal = goal
 	local origin = Root.Position
 	local executionGeneration = RuntimeState.Generation
 	PathComputing = true
 	PathRequestStatus = "COMPUTING"
+	RuntimeUtil.telemetry("PATH", "result=started target=" .. expectedTarget.Name .. " goal=" .. tostring(goal))
 	LastPathBuildAt = now
 	disposePath()
 	task.spawn(function()
@@ -2962,7 +3032,15 @@ local function requestPath(goal: Vector3): boolean
 			return
 		end
 		PathComputing = false
-		if not Enabled or not Running or not alive() or Target ~= expectedTarget or Character ~= expectedCharacter then
+		if
+			not Enabled
+			or not Running
+			or not alive()
+			or Target ~= expectedTarget
+			or Character ~= expectedCharacter
+			or not NavigationGoal
+			or (NavigationGoal - expectedGoal).Magnitude >= Config.PathGoalChangeDistance
+		then
 			PathRequestStatus = "REJECTED"
 			newPath:Destroy()
 			return
@@ -2970,6 +3048,7 @@ local function requestPath(goal: Vector3): boolean
 		local waypoints = ok and newPath.Status == Enum.PathStatus.Success and newPath:GetWaypoints() or nil
 		if not waypoints or #waypoints < 2 then
 			PathRequestStatus = "FAILED"
+			RuntimeUtil.telemetry("PATH", "result=failed target=" .. expectedTarget.Name)
 			newPath:Destroy()
 			RecoveryGoal = nil
 			RecoveryUntil = 0
@@ -2980,6 +3059,7 @@ local function requestPath(goal: Vector3): boolean
 		ActivePathGeneration = requestId
 		PathWaypoints = waypoints
 		PathRequestStatus = "READY"
+		RuntimeUtil.telemetry("PATH", "result=published target=" .. expectedTarget.Name)
 		PathIndex = 2
 		PathGoal = goal
 		PathIssuedIndex = 0
@@ -3019,8 +3099,10 @@ local function updatePathFallback(goal: Vector3)
 		end
 	end
 	if RuntimeState.PathFallbackClear then
+		RuntimeUtil.telemetry("PATH_FALLBACK", "result=safe status=" .. PathRequestStatus)
 		Humanoid:Move(RuntimeState.PathFallbackDirection, false)
 	else
+		RuntimeUtil.telemetry("PATH_FALLBACK", "result=stop status=" .. PathRequestStatus)
 		stopTranslation()
 	end
 end
@@ -3220,6 +3302,11 @@ end
 local function resetNavigationForTarget(newTarget: Model?)
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
+	RuntimeState.TargetRootSampleTarget = nil
+	RuntimeState.TargetRootSamplePosition = nil
+	RuntimeState.TargetRootSampleAt = 0
+	RuntimeState.TargetRootStabilizeUntil = 0
+	RuntimeState.TargetRootStabilizeStartedAt = 0
 	invalidateDirectRouteCache()
 	if Target ~= newTarget and TargetDiedConnection then
 		TargetDiedConnection:Disconnect()
@@ -3236,6 +3323,9 @@ local function resetNavigationForTarget(newTarget: Model?)
 	if newTarget then
 		RuntimeState.LastStaleTarget = nil
 		print("[TARGET] acquired=" .. newTarget.Name)
+		RuntimeUtil.telemetry("TARGET", "acquired=" .. newTarget.Name)
+	else
+		RuntimeUtil.telemetry("TARGET", "stale=cleared")
 	end
 	clearExploreObjective()
 	if newTarget then
@@ -3268,6 +3358,8 @@ local function resetNavigationForTarget(newTarget: Model?)
 	LastDirectDecisionAt = 0
 	RecoveryGoal = nil
 	RecoveryUntil = 0
+	SteeringTried = false
+	PathRequestStatus = "IDLE"
 	cancelPathRequest()
 	LastPathBuildAt = -math.huge
 	resetProgress(newTarget, nil)
@@ -3398,6 +3490,11 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.LastStartMarkerScanAt = -math.huge
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
+	RuntimeState.TargetRootSampleTarget = nil
+	RuntimeState.TargetRootSamplePosition = nil
+	RuntimeState.TargetRootSampleAt = 0
+	RuntimeState.TargetRootStabilizeUntil = 0
+	RuntimeState.TargetRootStabilizeStartedAt = 0
 	local function refreshRoundTargets()
 		if
 			not RuntimeUtil.isCurrentExecution()
@@ -3469,6 +3566,10 @@ local function updateDodgeController(): boolean
 	if not Config.DodgeEnabled then
 		if State == NavigationState.DODGE then
 			leaveDodge()
+		elseif DodgeGoal or ActiveHazard or RuntimeState.DodgeHoldUntil > 0 then
+			-- Disabled Dodge must never leave a cached goal/hold that can influence
+			-- the normal dispatcher on a later frame.
+			clearDodgeObjective()
 		end
 		return false
 	end
@@ -3792,6 +3893,19 @@ recoverByRespawn = function(
 		end
 		ResetExecuting = true
 		print("[RECOVERY] reason=stuck")
+		local recoveryTargetRoot = Target and getTargetRoot(Target)
+		local recoveryDistance = recoveryTargetRoot and Root and (recoveryTargetRoot.Position - Root.Position).Magnitude
+		RuntimeUtil.telemetry(
+			"RECOVERY",
+			string.format(
+				"reason=stuck state=%s owner=%s target=%s distance=%s stuckFor=%.1f",
+				State,
+				State,
+				Target and Target.Name or "nil",
+				recoveryDistance and tostring(math.floor(recoveryDistance / 5) * 5) or "nil",
+				math.max(0, os.clock() - (expectedProgressAt or globalStuckAt or LastMeaningfulProgressAt))
+			)
+		)
 		local retainedTarget = if validTarget(Target) then Target else nil
 		if retainedTarget then
 			cancelPathRequest()
@@ -4024,6 +4138,25 @@ local function updateTargetAndObjective()
 		end
 	end
 	local distance3D = (enemyRoot.Position - Root.Position).Magnitude
+	if targetRootIsStabilizing(Target, enemyRoot, now) then
+		-- A newly spawned enemy can rise several studs while its horizontal position
+		-- is already visible. Do not path to the underground snapshot or retreat from
+		-- a far target; retain the target and release as soon as its root settles.
+		if PathComputing or PathWaypoints then
+			cancelPathRequest()
+		end
+		RuntimeState.VerticalPathTarget = nil
+		RuntimeState.VerticalPathGoal = nil
+		NavigationGoal = nil
+		RecoveryGoal = nil
+		RecoveryUntil = 0
+		LastMeaningfulProgressAt = now
+		setNavigationState(NavigationState.IDLE)
+		if not RuntimeState.SuppressObjectiveTranslation then
+			stopTranslation()
+		end
+		return
+	end
 	if now < RuntimeState.RespawnRushUntil then
 		if distance3D < Config.RetreatEnterDistance then
 			cancelPathRequest()
@@ -4060,6 +4193,14 @@ local function updateTargetAndObjective()
 		updateProgressTracking()
 		return
 	end
+	if State == NavigationState.RETREAT and distance3D >= Config.RetreatExitDistance then
+		-- RETREAT is valid only close to the current target. Never allow a stale
+		-- retreat owner to walk backward from a newly acquired or risen far target.
+		RecoveryGoal = nil
+		RecoveryUntil = 0
+		LastDirectDecisionAt = 0
+		setNavigationState(NavigationState.IDLE)
+	end
 	if State == NavigationState.RETREAT and distance3D < Config.RetreatExitDistance then
 		cancelPathRequest()
 		NavigationGoal = nil
@@ -4089,9 +4230,17 @@ local function updateTargetAndObjective()
 	local verticalDifference = math.abs(enemyRoot.Position.Y - Root.Position.Y)
 	local targetBelow = enemyRoot.Position.Y < Root.Position.Y - Config.DirectVerticalTolerance
 	if targetBelow and (flatDistance <= 15 or verticalDifference > flatDistance) then
-		if RuntimeState.VerticalPathTarget ~= Target or not RuntimeState.VerticalPathGoal then
+		local newVerticalGoal = navigationGoalForTarget(enemyRoot, Target)
+		if
+			RuntimeState.VerticalPathTarget ~= Target
+			or not RuntimeState.VerticalPathGoal
+			or (newVerticalGoal - RuntimeState.VerticalPathGoal).Magnitude >= Config.DirectGoalChangeDistance
+		then
 			RuntimeState.VerticalPathTarget = Target
-			RuntimeState.VerticalPathGoal = navigationGoalForTarget(enemyRoot, Target)
+			RuntimeState.VerticalPathGoal = newVerticalGoal
+			if PathGoal and (PathGoal - newVerticalGoal).Magnitude >= Config.PathGoalChangeDistance then
+				cancelPathRequest()
+			end
 		end
 		GoalTarget = Target
 		NavigationGoal = RuntimeState.VerticalPathGoal
@@ -4107,8 +4256,14 @@ local function updateTargetAndObjective()
 		runRecoveryPolicy()
 		return
 	end
-	RuntimeState.VerticalPathTarget = nil
-	RuntimeState.VerticalPathGoal = nil
+	if RuntimeState.VerticalPathTarget == Target then
+		RuntimeState.VerticalPathTarget = nil
+		RuntimeState.VerticalPathGoal = nil
+		if PathGoal then
+			PathNeedsRebuild = true
+		end
+		LastDirectDecisionAt = 0
+	end
 	if GoalTarget ~= Target or now - LastGoalRefreshAt >= Config.GoalRefreshInterval then
 		LastGoalRefreshAt = now
 		GoalTarget = Target
@@ -4189,6 +4344,11 @@ local function bindCharacter(character: Model)
 	Humanoid = newHumanoid
 	Root = newRoot
 	invalidateDirectRouteCache()
+	RuntimeState.TargetRootSampleTarget = nil
+	RuntimeState.TargetRootSamplePosition = nil
+	RuntimeState.TargetRootSampleAt = 0
+	RuntimeState.TargetRootStabilizeUntil = 0
+	RuntimeState.TargetRootStabilizeStartedAt = 0
 	if Humanoid then
 		DefaultAutoRotate = Humanoid.AutoRotate
 		DefaultWalkSpeed = Humanoid.WalkSpeed
@@ -4271,6 +4431,39 @@ local function bindCharacter(character: Model)
 			end)
 		)
 	end
+end
+
+local function telemetryMovementOwner(owner: string)
+	if not Config.DebugTelemetry or not Root then
+		return
+	end
+	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
+	local objective = NavigationGoal or (targetRoot and targetRoot.Position)
+	local targetDistance = targetRoot and (targetRoot.Position - Root.Position).Magnitude or math.huge
+	local towardDot = 0
+	if objective then
+		local direction = Vector3.new(objective.X - Root.Position.X, 0, objective.Z - Root.Position.Z)
+		local velocity = Root.AssemblyLinearVelocity
+		local moving = Vector3.new(velocity.X, 0, velocity.Z)
+		if direction.Magnitude > 0.1 and moving.Magnitude > 0.1 then
+			towardDot = direction.Unit:Dot(moving.Unit)
+		end
+	end
+	local goalLabel = if objective
+		then string.format("%d,%d,%d", math.floor(objective.X / 5), math.floor(objective.Y / 5), math.floor(objective.Z / 5))
+		else "nil"
+	RuntimeUtil.telemetry(
+		"MOVE",
+		string.format(
+			"state=%s owner=%s target=%s distance=%s goal=%s towardTargetDot=%.1f",
+			State,
+			owner,
+			Target and Target.Name or "nil",
+			targetDistance < math.huge and tostring(math.floor(targetDistance / 5) * 5) or "nil",
+			goalLabel,
+			towardDot
+		)
+	)
 end
 
 setRunning = function(value: boolean)
@@ -4694,6 +4887,7 @@ table.insert(
 		updateTargetAndObjective()
 		RuntimeState.SuppressObjectiveTranslation = false
 		local dodgeOwnsTranslation = updateDodgeController()
+		telemetryMovementOwner(dodgeOwnsTranslation and "DODGE" or State)
 		updateTargetFacing()
 		if Target and validTarget(Target) then
 			local enemyRoot = getTargetRoot(Target)
