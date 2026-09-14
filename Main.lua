@@ -71,7 +71,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = true,
+	DodgeEnabled = false,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -179,7 +179,7 @@ if not savedDodgeSettingIsCurrent then
 end
 -- Dodge is intentionally disabled while its runtime behavior is being tested.
 -- This overrides an older saved toggle on the next loader execution.
-Config.DodgeEnabled = true
+Config.DodgeEnabled = false
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
