@@ -188,6 +188,9 @@ if not savedDodgeSettingIsCurrent then
 	Config.DodgeEnabled = DEFAULT_CONFIG.DodgeEnabled
 end
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
+-- Dodge is intentionally disabled for the current runtime while movement is
+-- being tested. Do not let an older persisted ON toggle re-enable it on load.
+Config.DodgeEnabled = false
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
