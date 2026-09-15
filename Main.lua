@@ -30,13 +30,14 @@ local DEFAULT_CONFIG = {
 	RetreatEnterDistance = 40,
 	RetreatExitDistance = 45,
 	NormalKiteApproachDistance = 80,
-	NormalKiteRetreatDistance = 55,
+	NormalKiteRetreatDistance = 80,
 	AttackRange = 15,
-	NormalSkillRange = 80,
+	NormalSkillRange = 75,
 	BossSkillRange = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
 	RespawnRushDuration = 6,
+	HorizontalBeamGraceDuration = 3,
 	KiteDistance = 75,
 	KiteHysteresis = 3,
 	AttackCooldown = 0.12,
@@ -190,8 +191,10 @@ Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
-Config.NormalSkillRange = 80
+Config.NormalSkillRange = 75
 Config.BossSkillRange = 100
+Config.NormalKiteApproachDistance = 80
+Config.NormalKiteRetreatDistance = 80
 Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
 -- thirty percent. Old fixed-speed values must not survive a re-exec.
@@ -234,7 +237,7 @@ local function saveConfig()
 		end
 		persisted.FarmEnabled = Config.FarmEnabled == true
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
-		persisted.NormalSkillRange = 80
+		persisted.NormalSkillRange = 75
 		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
@@ -588,8 +591,8 @@ end
 
 local BossPolicies = {
 	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 80 },
-	["bob"] = { Mode = "BOB", SkillRange = 100 },
-	["bob the frost giant"] = { Mode = "BOB", SkillRange = 100 },
+	["bob"] = { Mode = "BOB", SkillRange = 90 },
+	["bob the frost giant"] = { Mode = "BOB", SkillRange = 90 },
 	["odin"] = { Mode = "ODIN", SkillRange = 100 },
 }
 
@@ -1444,16 +1447,38 @@ local function horizontalBeamThreat(): (BasePart?, boolean, number, number)
 	refreshNearbyActiveHazards()
 	local approachEnd = upcomingMovementGoal() or Root.Position
 	local footprint = playerFootprintRadius()
+	local bobIsCurrentTarget = Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "BOB"
 	for part in pairs(NearbyActiveHazards) do
 		if specialSkillKind(part) == "HORIZONTAL_BEAM" and isCanonicalActiveHazard(part) then
 			local edge = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
 			local route = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
-			if edge <= Config.DodgePriorityRadius or route <= Config.DodgeTriggerPadding then
+			-- This known Bob mechanic receives lateral evaluation as soon as its
+			-- active nearby instance exists; it does not wait for the generic 50-stud
+			-- priority gate.
+			if bobIsCurrentTarget or edge <= Config.DodgePriorityRadius or route <= Config.DodgeTriggerPadding then
 				return part, route <= Config.DodgeTriggerPadding, edge, route
 			end
 		end
 	end
 	return nil, false, math.huge, math.huge
+end
+
+local function hazardAssociatedWithTarget(part: BasePart, target: Model): boolean
+	local current: Instance? = part
+	while current and current ~= workspace do
+		if current == target then
+			return true
+		end
+		current = current.Parent
+	end
+	-- The two established first-boss runtime containers can be spawned outside
+	-- the character Model; treat them as Midgardian-associated without adding
+	-- any new guessed skill names.
+	if normalizedInstanceName(target) == "midgardian champion" then
+		local name = part:GetFullName():lower()
+		return name:find("firstbosspassivebeam", 1, true) ~= nil or name:find("firstbosscrisscross", 1, true) ~= nil
+	end
+	return false
 end
 
 local function dodgeRouteClear(goal: Vector3): (boolean?, string)
@@ -3862,6 +3887,13 @@ local function updateDodgeController(): boolean
 	local now = os.clock()
 	local graceHorizontalHazard: BasePart? = nil
 	if now < RuntimeState.RespawnRushUntil then
+		local respawnStartedAt = RuntimeState.RespawnRushUntil - Config.RespawnRushDuration
+		if now < respawnStartedAt + Config.HorizontalBeamGraceDuration then
+			if State == NavigationState.DODGE then
+				leaveDodge()
+			end
+			return false
+		end
 		graceHorizontalHazard = select(1, horizontalBeamThreat())
 		if not graceHorizontalHazard then
 			if State == NavigationState.DODGE then
@@ -3869,7 +3901,7 @@ local function updateDodgeController(): boolean
 			end
 			return false
 		end
-		-- HorizontalBeam is deliberately the single grace-period exception.
+		-- Only HorizontalBeam owns Dodge during respawn seconds three through six.
 		RuntimeUtil.telemetry("BOSS", "mode=horizontal-beam-grace")
 	elseif State == NavigationState.DODGE and not DodgeGoal then
 		-- Never preserve a no-goal Dodge owner across a non-evaluation frame.
@@ -3905,6 +3937,20 @@ local function updateDodgeController(): boolean
 	RuntimeState.DodgeCachedRouteDistance = routeDistance
 	if hazard and not hazard:IsDescendantOf(workspace) then
 		hazard = nil
+	end
+	if hazard and Target then
+		local policy = bossPolicyForTarget(Target)
+		local targetRoot = getTargetRoot(Target)
+		if
+			policy
+			and policy.Mode == "MIDGARDIAN"
+			and targetRoot
+			and (targetRoot.Position - Root.Position).Magnitude > 120
+			and hazardAssociatedWithTarget(hazard, Target)
+		then
+			RuntimeUtil.telemetry("BOSS", "mode=midgardian prediction=ignored-far")
+			hazard = nil
+		end
 	end
 	if not hazard then
 		RuntimeState.DodgeHoldUntil = 0
@@ -3999,9 +4045,15 @@ local function updateDodgeController(): boolean
 			if foundGround and pointIsSafeFromHazards(grounded) and select(2, dodgeRouteClear(grounded)) == "SAFE" then
 				selectedGoal, candidateStatus, selectedLabel = grounded, "SAFE", "locked-side"
 			else
-				-- Spread/Horizontal beams keep their chosen side through the active
-				-- sequence. A wall cannot make the controller flip through the beam.
-				candidateStatus = "UNKNOWN"
+				if specialMode == "HORIZONTAL_BEAM" then
+					-- HorizontalBeam may immediately evaluate the opposite A/D side when
+					-- a wall invalidates its committed lateral route.
+					lockedSpecialDirection = false
+					RuntimeUtil.telemetry("BOSS", "mode=horizontal-beam switch=wall")
+				else
+					-- SpreadBeam keeps its side through the pulse sequence.
+					candidateStatus = "UNKNOWN"
+				end
 			end
 		end
 		if not selectedGoal and not lockedSpecialDirection then
@@ -4506,7 +4558,14 @@ local function updateTargetAndObjective()
 	local bossPolicy = bossPolicyForTarget(Target)
 	if not bossPolicy then
 		if distance3D < Config.NormalKiteRetreatDistance then
-			if RuntimeState.KiteMode == "RETREAT_DIAGONAL" and RuntimeState.KiteGoal and now - LastGoalRefreshAt < Config.GoalRefreshInterval then
+			if
+				RuntimeState.KiteMode == "RETREAT_DIAGONAL"
+				and RuntimeState.KiteGoal
+				and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+				and directRouteClear(RuntimeState.KiteGoal, Target)
+				and pointIsSafeFromHazards(RuntimeState.KiteGoal)
+				and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
+			then
 				NavigationGoal = RuntimeState.KiteGoal
 				setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
@@ -4523,7 +4582,14 @@ local function updateTargetAndObjective()
 				return
 			end
 		elseif distance3D <= Config.NormalKiteApproachDistance then
-			if RuntimeState.KiteMode == "FORWARD_DIAGONAL" and RuntimeState.KiteGoal and now - LastGoalRefreshAt < Config.GoalRefreshInterval then
+			if
+				RuntimeState.KiteMode == "FORWARD_DIAGONAL"
+				and RuntimeState.KiteGoal
+				and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+				and directRouteClear(RuntimeState.KiteGoal, Target)
+				and pointIsSafeFromHazards(RuntimeState.KiteGoal)
+				and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
+			then
 				NavigationGoal = RuntimeState.KiteGoal
 				setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
@@ -4541,7 +4607,14 @@ local function updateTargetAndObjective()
 			end
 		end
 	elseif bossPolicy.Mode == "MIDGARDIAN" and distance3D <= 80 then
-		if RuntimeState.KiteMode == "ORBIT" and RuntimeState.KiteGoal and now - LastGoalRefreshAt < Config.GoalRefreshInterval then
+		if
+			RuntimeState.KiteMode == "ORBIT"
+			and RuntimeState.KiteGoal
+			and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+			and directRouteClear(RuntimeState.KiteGoal, Target)
+			and pointIsSafeFromHazards(RuntimeState.KiteGoal)
+			and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
+		then
 			NavigationGoal = RuntimeState.KiteGoal
 			setNavigationState(NavigationState.DIRECT)
 			updateProgressTracking()
