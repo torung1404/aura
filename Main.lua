@@ -29,6 +29,8 @@ local DEFAULT_CONFIG = {
 	PreferredCombatDistance = 70,
 	RetreatEnterDistance = 40,
 	RetreatExitDistance = 45,
+	NormalKiteApproachDistance = 80,
+	NormalKiteRetreatDistance = 55,
 	AttackRange = 15,
 	NormalSkillRange = 80,
 	BossSkillRange = 100,
@@ -71,7 +73,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = false,
+	DodgeEnabled = true,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -135,7 +137,7 @@ end
 local CONFIG_FILE = "AutoFarmV21Config.json"
 -- Version only the Dodge preference. Existing forced-OFF files migrate once;
 -- afterward the user's saved toggle remains authoritative.
-local DODGE_CONFIG_VERSION = 3
+local DODGE_CONFIG_VERSION = 4
 local SavedConfig: { [string]: any } = {}
 if type(isfile) == "function" and type(readfile) == "function" then
 	local ok, decoded = pcall(function()
@@ -182,9 +184,6 @@ end
 if not savedDodgeSettingIsCurrent then
 	Config.DodgeEnabled = DEFAULT_CONFIG.DodgeEnabled
 end
--- Dodge is intentionally disabled while its runtime behavior is being tested.
--- This overrides an older saved toggle on the next loader execution.
-Config.DodgeEnabled = false
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
@@ -193,7 +192,7 @@ Config.NormalSkillRange = 80
 Config.BossSkillRange = 100
 Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
--- forty percent. Old fixed-speed values must not survive a re-exec.
+-- thirty percent. Old fixed-speed values must not survive a re-exec.
 Config.MovementWalkSpeed = nil
 Config.MovementSpeedMultiplier = 1.3
 Config.WebhookEnabled = nil
@@ -411,16 +410,16 @@ local RuntimeState = {
 	DodgeBudgetExhausted = false,
 	DodgeEvaluationSerial = 0,
 	DodgeDirection = Vector3.zero,
+	BossDodgeSource = nil :: Instance?,
+	BossDodgeMode = "",
+	BossDodgeDirection = Vector3.zero,
+	KiteGoal = nil :: Vector3?,
+	KiteDirection = Vector3.zero,
+	KiteMode = "",
+	PlayerSafetyRadius = 0,
+	PlayerSafetyCharacter = nil :: Model?,
+	PlayerSafetySampleAt = -math.huge,
 	LastSpeedReassertAt = -math.huge,
-	SpecialSkillRangeBosses = {
-		["ancient enchanted tree"] = true,
-		["enchanted forest dragon"] = true,
-		["midgardian champion"] = true,
-		["bob"] = true,
-		["bob the frost giant"] = true,
-		["odin"] = true,
-		["odin reincarnation"] = true,
-	},
 	SuppressObjectiveTranslation = false,
 	HazardMetadata = {} :: { [BasePart]: { CFrame: CFrame, SampleAt: number, Velocity: Vector3, EvaluationSerial: number } },
 	VerticalPathTarget = nil :: Model?,
@@ -451,6 +450,7 @@ local setNavigationState
 local stopTranslation
 local resetRuntimeForNewDungeon
 local getTargetRoot
+local chooseKiteGoal
 
 local RuntimeUtil = {}
 
@@ -574,15 +574,25 @@ local function isBossTarget(model: Model): boolean
 	return false
 end
 
+local function normalizedInstanceName(instance: Instance): string
+	local name = string.lower(instance.Name):gsub("[%p_]+", " "):gsub("%s+", " ")
+	return name:match("^%s*(.-)%s*$") or name
+end
+
+local BossPolicies = {
+	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 80 },
+	["bob"] = { Mode = "BOB", SkillRange = 100 },
+	["bob the frost giant"] = { Mode = "BOB", SkillRange = 100 },
+	["odin"] = { Mode = "ODIN", SkillRange = 100 },
+}
+
+local function bossPolicyForTarget(target: Model?): { Mode: string, SkillRange: number }?
+	return target and BossPolicies[normalizedInstanceName(target)] or nil
+end
+
 local function skillRangeForTarget(target: Model): number
-	-- Normalize punctuation only, then require an exact known boss name. This
-	-- keeps ordinary mobs from receiving the extended range by a loose match.
-	local targetName = string.lower(target.Name):gsub("[%p_]+", " "):gsub("%s+", " ")
-	targetName = targetName:match("^%s*(.-)%s*$") or targetName
-	if RuntimeState.SpecialSkillRangeBosses[targetName] then
-		return Config.BossSkillRange
-	end
-	return Config.NormalSkillRange
+	local policy = bossPolicyForTarget(target)
+	return policy and policy.SkillRange or Config.NormalSkillRange
 end
 
 getTargetRoot = function(model: Model): BasePart?
@@ -742,6 +752,64 @@ RuntimeState.hazardKind = function(part: BasePart): string?
 	return nil
 end
 
+local function skillModelForPart(part: BasePart): Model?
+	local current: Instance? = part
+	while current and current ~= workspace do
+		if current:IsA("Model") then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+local function specialSkillKind(part: BasePart): string?
+	local current: Instance? = part
+	while current and current ~= workspace do
+		local name = current.Name:lower()
+		if name:find("secondbosshorizontalbeam", 1, true) then return "HORIZONTAL_BEAM" end
+		if name:find("secondbossspreadbeam", 1, true) then return "SPREAD_BEAM" end
+		if name:find("secondbossmovingbeam", 1, true) then return "MOVING_BEAM" end
+		if name:find("groundaura", 1, true) then return "GROUND_AURA" end
+		if name:find("thirdbossmultirings", 1, true) then return "MULTIRINGS" end
+		current = current.Parent
+	end
+	return nil
+end
+
+local function ignoredSkillPart(part: BasePart): boolean
+	local current: Instance? = part
+	while current and current ~= workspace do
+		local name = current.Name:lower()
+		if name:find("secondbosschasingorb", 1, true)
+			or name:find("thirdbossmissile", 1, true)
+			or name:find("thirdbossbeampart", 1, true) then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+local function canonicalHazardPart(part: BasePart): BasePart
+	local model = skillModelForPart(part)
+	if not model or model.Name:lower() ~= "northernmageshot" then
+		return part
+	end
+	-- One Northern Mage shot has a trajectory anchor, a precast and an active
+	-- hitbox. Prefer the damaging volume, then its telegraph; never count all
+	-- three as unrelated hazards.
+	local hitbox = model:FindFirstChild("hitBox", true)
+	if hitbox and hitbox:IsA("BasePart") and hitbox:IsDescendantOf(workspace) then
+		return hitbox
+	end
+	local precast = model:FindFirstChild("precast", true)
+	if precast and precast:IsA("BasePart") and precast:IsDescendantOf(workspace) then
+		return precast
+	end
+	return part
+end
+
 local function isRedFloorTelegraph(part: BasePart): boolean
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
@@ -787,6 +855,9 @@ local function hazardCandidateReason(part: BasePart): string?
 	if not part:IsDescendantOf(workspace) or (Character and part:IsDescendantOf(Character)) then
 		return nil
 	end
+	if ignoredSkillPart(part) then
+		return nil
+	end
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
 	local broadAndThin = dimensions[1] <= 5 and dimensions[2] >= 5 and dimensions[3] >= 5
@@ -822,6 +893,9 @@ local function isActiveHazardPart(part: BasePart): boolean
 	if not part:IsDescendantOf(workspace) or (Character and part:IsDescendantOf(Character)) then
 		return false
 	end
+	if ignoredSkillPart(part) then
+		return false
+	end
 	if part.Size.X <= 0.05 or part.Size.Y <= 0.05 or part.Size.Z <= 0.05 then
 		return false
 	end
@@ -854,6 +928,10 @@ local function isActiveHazardPart(part: BasePart): boolean
 		or isRedFloorTelegraph(part)
 end
 
+local function isCanonicalActiveHazard(part: BasePart): boolean
+	return canonicalHazardPart(part) == part and isActiveHazardPart(part)
+end
+
 local function registerHazard(instance: Instance)
 	-- Cache structural candidates, not only parts that happen to be red at creation time.
 	if not instance:IsA("BasePart") then
@@ -869,6 +947,14 @@ local function registerHazard(instance: Instance)
 			EvaluationSerial = 0,
 		}
 		logHazardRegistration(instance, "ACCEPT", reason)
+		local model = skillModelForPart(instance)
+		if model and (model.Name:lower() == "northernmageshot" or specialSkillKind(instance)) then
+			local parts = 0
+			for _, descendant in ipairs(model:GetDescendants()) do
+				if descendant:IsA("BasePart") then parts += 1 end
+			end
+			RuntimeUtil.telemetry("SKILL_" .. model:GetDebugId(), "register model=" .. model.Name .. " parts=" .. tostring(parts))
+		end
 	else
 		logHazardRegistration(instance, "REJECT", "insufficient-structure")
 	end
@@ -1045,7 +1131,25 @@ local function playerFootprintRadius(): number
 	if not Root then
 		return Config.DodgePlayerSafetyMargin
 	end
-	return math.max(Root.Size.X, Root.Size.Z) * 0.5 + Config.DodgePlayerSafetyMargin
+	local now = os.clock()
+	if RuntimeState.PlayerSafetyCharacter ~= Character or now - RuntimeState.PlayerSafetySampleAt >= 0.5 then
+		local radius = math.max(Root.Size.X, Root.Size.Z) * 0.5
+		if Character then
+			-- The root alone is too small for wide avatar accessories/limbs. This is
+			-- sampled at a bounded rate, not in the per-candidate hot path.
+			for _, descendant in ipairs(Character:GetDescendants()) do
+				if descendant:IsA("BasePart") then
+					radius = math.max(radius, math.max(descendant.Size.X, descendant.Size.Z) * 0.5)
+				end
+			end
+		end
+		RuntimeState.PlayerSafetyRadius = radius
+		RuntimeState.PlayerSafetyCharacter = Character
+		RuntimeState.PlayerSafetySampleAt = now
+	end
+	local effectiveSpeed = 16 * Config.MovementSpeedMultiplier
+	local pingMargin = math.clamp(effectiveSpeed * (RuntimeState.PingMs / 1000), 0, 4)
+	return RuntimeState.PlayerSafetyRadius + Config.DodgePlayerSafetyMargin + pingMargin
 end
 
 RuntimeState.consumeDodgeRaycast = function(): boolean
@@ -1089,7 +1193,7 @@ local function refreshNearbyActiveHazards()
 	overlap.MaxParts = 100
 	for _, part in ipairs(workspace:GetPartBoundsInRadius(Root.Position, Config.DodgeDetectionRadius, overlap)) do
 		if
-			isActiveHazardPart(part)
+			isCanonicalActiveHazard(part)
 			and (
 				hazardThreatensHeight(part, Root.Position)
 				or hazardThreatensHeight(part, Root.Position, Config.DodgeLookaheadSeconds)
@@ -1104,12 +1208,12 @@ local function refreshNearbyActiveHazards()
 	end
 	-- Structural candidates also cover effects excluded from spatial queries.
 	for part in pairs(HazardSet) do
-		if not part:IsDescendantOf(workspace) then
+		if not part:IsDescendantOf(workspace) or ignoredSkillPart(part) then
 			HazardSet[part] = nil
 			RuntimeState.HazardMetadata[part] = nil
 		elseif
 			(part.Position - Root.Position).Magnitude <= Config.DodgeDetectionRadius + hazardRadius(part)
-			and isActiveHazardPart(part)
+			and isCanonicalActiveHazard(part)
 			and (
 				hazardThreatensHeight(part, Root.Position)
 				or hazardThreatensHeight(part, Root.Position, Config.DodgeLookaheadSeconds)
@@ -1127,7 +1231,7 @@ local function pointIsSafeFromHazards(position: Vector3): boolean
 	for part in pairs(NearbyActiveHazards) do
 		if
 			part:IsDescendantOf(workspace)
-			and isActiveHazardPart(part)
+			and isCanonicalActiveHazard(part)
 			and hazardThreatensHeight(part, position, Config.DodgeLookaheadSeconds)
 			and RuntimeState.hazardEdgeDistance(part, position, Config.DodgeLookaheadSeconds, playerFootprintRadius())
 				<= Config.DodgeSafePadding
@@ -1169,10 +1273,24 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 	local bestThreatScore = math.huge
 	local footprint = playerFootprintRadius()
 	local movementGoal = upcomingMovementGoal()
+	local groupedSkills: { [Model]: boolean } = {}
 	-- Use the complete current navigation segment, not only a short lookahead:
 	-- a beam can block the approach route before its edge reaches the player.
 	local approachEnd = movementGoal or Root.Position
 	for part in pairs(NearbyActiveHazards) do
+		local canonical = canonicalHazardPart(part)
+		local skillModel = skillModelForPart(canonical)
+		if skillModel and groupedSkills[skillModel] then
+			continue
+		end
+		if canonical ~= part then
+			continue
+		end
+		if skillModel then
+			groupedSkills[skillModel] = true
+			local phase = RuntimeState.hazardIsPrecast(part) and "precast" or "active"
+			RuntimeUtil.telemetry("SKILL_PHASE_" .. skillModel:GetDebugId(), "phase=" .. phase .. " name=" .. skillModel.Name)
+		end
 		if part:IsDescendantOf(workspace) and isActiveHazardPart(part) then
 			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
 			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
@@ -1223,6 +1341,25 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 	return nearest, nearestPredicted, nearestEdge, nearestRouteDistance
 end
 
+local function horizontalBeamThreat(): (BasePart?, boolean, number, number)
+	if not Root then
+		return nil, false, math.huge, math.huge
+	end
+	refreshNearbyActiveHazards()
+	local approachEnd = upcomingMovementGoal() or Root.Position
+	local footprint = playerFootprintRadius()
+	for part in pairs(NearbyActiveHazards) do
+		if specialSkillKind(part) == "HORIZONTAL_BEAM" and isActiveHazardPart(part) then
+			local edge = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
+			local route = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
+			if edge <= Config.DodgePriorityRadius or route <= Config.DodgeTriggerPadding then
+				return part, route <= Config.DodgeTriggerPadding, edge, route
+			end
+		end
+	end
+	return nil, false, math.huge, math.huge
+end
+
 local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 	if not Config.DodgeEnabled then
 		return true, "SAFE"
@@ -1244,7 +1381,7 @@ local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 	local footprint = playerFootprintRadius()
 	local previousClearances: { [BasePart]: number } = {}
 	for hazard in pairs(NearbyActiveHazards) do
-		if isActiveHazardPart(hazard) then
+		if isCanonicalActiveHazard(hazard) then
 			previousClearances[hazard] = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
 			local destinationClearance = RuntimeState.hazardEdgeDistance(hazard, goal, Config.DodgeLookaheadSeconds, footprint)
 			local routeClearance = RuntimeState.segmentHazardClearance(hazard, Root.Position, goal, footprint)
@@ -1270,7 +1407,7 @@ local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 			return false, "UNSAFE"
 		end
 		for hazard in pairs(NearbyActiveHazards) do
-			if isActiveHazardPart(hazard) and hazardThreatensHeight(hazard, grounded) then
+			if isCanonicalActiveHazard(hazard) and hazardThreatensHeight(hazard, grounded) then
 				local clearance = RuntimeState.hazardEdgeDistance(hazard, grounded, 0, footprint)
 				local prior = previousClearances[hazard] or math.huge
 				-- Leaving an overlapping hazard is allowed, but the route may not
@@ -1333,7 +1470,14 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 		end
 		table.insert(candidateDirections, { Direction = normalized, Label = label })
 	end
-	if forwardDirection.Magnitude > 0.1 then
+	local beamSideOnly = specialSkillKind(hazard) == "HORIZONTAL_BEAM" or specialSkillKind(hazard) == "SPREAD_BEAM"
+	if forwardDirection.Magnitude > 0.1 and beamSideOnly then
+		-- Bob's horizontal/spread sequences require a persistent A/D-style exit;
+		-- do not let target-progress scoring turn their first choice into a diagonal.
+		local rightDirection = Vector3.new(-forwardDirection.Z, 0, forwardDirection.X)
+		addCandidateDirection(-rightDirection, "left")
+		addCandidateDirection(rightDirection, "right")
+	elseif forwardDirection.Magnitude > 0.1 then
 		-- The approach basis is independent from the escape normal. A hazard's
 		-- outward direction is not guaranteed to be perpendicular to the target.
 		local rightDirection = Vector3.new(-forwardDirection.Z, 0, forwardDirection.X)
@@ -1389,7 +1533,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 				local distance = flatPointDistance(Root.Position, grounded)
 				local minimumSafety = math.huge
 				for otherHazard in pairs(NearbyActiveHazards) do
-					if isActiveHazardPart(otherHazard) and hazardThreatensHeight(otherHazard, grounded) then
+					if isCanonicalActiveHazard(otherHazard) and hazardThreatensHeight(otherHazard, grounded) then
 						minimumSafety = math.min(
 							minimumSafety,
 							RuntimeState.hazardEdgeDistance(otherHazard, grounded, Config.DodgeLookaheadSeconds, footprint)
@@ -2881,6 +3025,15 @@ local function updateProgressTracking()
 		return
 	end
 	local now = os.clock()
+	if RuntimeState.KiteMode ~= "" and State == NavigationState.DIRECT then
+		local velocity = Root.AssemblyLinearVelocity
+		if Vector3.new(velocity.X, 0, velocity.Z).Magnitude >= Config.SlowMovementSpeedThreshold then
+			-- A short moving kite goal is intentionally regenerated as the enemy and
+			-- player move. Treat real horizontal motion as progress; do not reset this
+			-- timer merely because a new local goal was selected.
+			LastMeaningfulProgressAt = now
+		end
+	end
 	if ProgressTarget ~= Target or not ProgressGoalAnchor then
 		resetProgress(Target, NavigationGoal)
 		return
@@ -3300,6 +3453,9 @@ local function decideNavigation()
 end
 
 local function resetNavigationForTarget(newTarget: Model?)
+	RuntimeState.KiteGoal = nil
+	RuntimeState.KiteDirection = Vector3.zero
+	RuntimeState.KiteMode = ""
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
 	RuntimeState.TargetRootSampleTarget = nil
@@ -3381,6 +3537,9 @@ local function clearDodgeObjective()
 	RuntimeState.DodgeCachedRouteDistance = math.huge
 	RuntimeState.LastDodgeEvaluationAt = -math.huge
 	RuntimeState.DodgeDirection = Vector3.zero
+	RuntimeState.BossDodgeSource = nil
+	RuntimeState.BossDodgeMode = ""
+	RuntimeState.BossDodgeDirection = Vector3.zero
 	RuntimeState.DodgeRaycastsUsed = 0
 	RuntimeState.DodgeBudgetExhausted = false
 	LastHazardThreatAt = -math.huge
@@ -3394,6 +3553,9 @@ resetRuntimeForNewDungeon = function()
 	local executionGeneration = RuntimeState.Generation
 	local now = os.clock()
 	invalidateDirectRouteCache()
+	RuntimeState.PlayerSafetyCharacter = nil
+	RuntimeState.PlayerSafetyRadius = 0
+	RuntimeState.PlayerSafetySampleAt = -math.huge
 	print("[ROUND] transition=BEGIN")
 	RuntimeState.RoundTransitionActive = true
 	RuntimeState.RoundBootstrapUntil = now + 7
@@ -3578,10 +3740,20 @@ local function updateDodgeController(): boolean
 		return false
 	end
 	local now = os.clock()
+	local graceHorizontalHazard: BasePart? = nil
 	if now < RuntimeState.RespawnRushUntil then
-		if State == NavigationState.DODGE then
-			leaveDodge()
+		graceHorizontalHazard = select(1, horizontalBeamThreat())
+		if not graceHorizontalHazard then
+			if State == NavigationState.DODGE then
+				leaveDodge()
+			end
+			return false
 		end
+		-- HorizontalBeam is deliberately the single grace-period exception.
+		RuntimeUtil.telemetry("BOSS", "mode=horizontal-beam-grace")
+	elseif State == NavigationState.DODGE and not DodgeGoal then
+		-- Never preserve a no-goal Dodge owner across a non-evaluation frame.
+		leaveDodge()
 		return false
 	end
 	local evaluateNow = now - RuntimeState.LastDodgeEvaluationAt >= Config.DodgeEvaluationInterval
@@ -3602,7 +3774,11 @@ local function updateDodgeController(): boolean
 	RuntimeState.DodgeRaycastsUsed = 0
 	RuntimeState.DodgeBudgetExhausted = false
 	RuntimeState.DodgeEvaluationSerial += 1
-	hazard, predicted, edgeDistance, routeDistance = threateningHazard()
+	if graceHorizontalHazard then
+		hazard, predicted, edgeDistance, routeDistance = horizontalBeamThreat()
+	else
+		hazard, predicted, edgeDistance, routeDistance = threateningHazard()
+	end
 	RuntimeState.DodgeCachedHazard = hazard
 	RuntimeState.DodgeCachedPredicted = predicted
 	RuntimeState.DodgeCachedEdgeDistance = edgeDistance
@@ -3676,7 +3852,31 @@ local function updateDodgeController(): boolean
 		if routeDistance <= Config.DodgePreTriggerPadding then
 			RuntimeUtil.telemetry("DODGE_ROUTE", "route-blocked hazard=" .. hazard.Name)
 		end
-		local selectedGoal, candidateStatus, selectedLabel, selectedScore = chooseNearestSafeDodgeGoal(hazard)
+		local specialMode = specialSkillKind(hazard)
+		local specialSource: Instance = skillModelForPart(hazard) or hazard
+		local selectedGoal: Vector3? = nil
+		local candidateStatus = "UNSAFE"
+		local selectedLabel: string? = nil
+		local selectedScore: number? = nil
+		local lockedSpecialDirection =
+			(specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM")
+			and RuntimeState.BossDodgeSource == specialSource
+			and RuntimeState.BossDodgeMode == specialMode
+			and RuntimeState.BossDodgeDirection.Magnitude > 0.1
+		if lockedSpecialDirection then
+			local continued = Root.Position + RuntimeState.BossDodgeDirection.Unit * 8
+			local grounded, foundGround = RuntimeState.projectDodgeGround(continued, Target)
+			if foundGround and pointIsSafeFromHazards(grounded) and select(2, dodgeRouteClear(grounded)) == "SAFE" then
+				selectedGoal, candidateStatus, selectedLabel = grounded, "SAFE", "locked-side"
+			else
+				-- Spread/Horizontal beams keep their chosen side through the active
+				-- sequence. A wall cannot make the controller flip through the beam.
+				candidateStatus = "UNKNOWN"
+			end
+		end
+		if not selectedGoal and not lockedSpecialDirection then
+			selectedGoal, candidateStatus, selectedLabel, selectedScore = chooseNearestSafeDodgeGoal(hazard)
+		end
 		if not selectedGoal and candidateStatus == "UNKNOWN" and reusableGoal then
 			-- Keep the previously verified route when this evaluation cannot finish;
 			-- budget exhaustion is not evidence that the cached goal became unsafe.
@@ -3708,6 +3908,15 @@ local function updateDodgeController(): boolean
 			RuntimeState.DodgeHoldUntil = 0
 			RuntimeState.DodgeNoGoalSince = 0
 			RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
+			if specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM" then
+				local movement = Vector3.new(selectedGoal.X - Root.Position.X, 0, selectedGoal.Z - Root.Position.Z)
+				if movement.Magnitude > 0.1 then
+					RuntimeState.BossDodgeSource = specialSource
+					RuntimeState.BossDodgeMode = specialMode
+					RuntimeState.BossDodgeDirection = movement.Unit
+					RuntimeUtil.telemetry("BOSS", "mode=" .. string.lower(specialMode))
+				end
+			end
 			setNavigationState(NavigationState.DODGE)
 			RuntimeUtil.telemetry(
 				"DODGE_GOAL",
@@ -4157,42 +4366,67 @@ local function updateTargetAndObjective()
 		end
 		return
 	end
-	if now < RuntimeState.RespawnRushUntil then
-		if distance3D < Config.RetreatEnterDistance then
-			cancelPathRequest()
-			NavigationGoal = nil
-			RecoveryGoal = nil
-			setNavigationState(NavigationState.RETREAT)
-			return
-		end
-		local rushHoldDistance = Config.PreferredCombatDistance
-		if distance3D <= rushHoldDistance then
-			cancelPathRequest()
-			NavigationGoal = nil
-			RecoveryGoal = nil
-			setNavigationState(NavigationState.COMBAT)
-			resetProgress(Target, nil)
-			return
-		end
-		RecoveryGoal = nil
-		SteeringTried = false
-		GoalTarget = Target
-		NavigationGoal = navigationGoalForTarget(enemyRoot, Target, rushHoldDistance)
-		-- During spawn protection, keep moving toward the retained target, but do
-		-- not ram a BasicPart: direct is used only when the route is clear.
-		if directRouteClear(NavigationGoal, Target) then
-			if State ~= NavigationState.DIRECT then
-				cancelPathRequest()
+	-- Spawn protection suppresses generic Dodge, not the combat movement policy:
+	-- the same approach/kite bands below must start as soon as the new root binds.
+	local bossPolicy = bossPolicyForTarget(Target)
+	if not bossPolicy then
+		if distance3D < Config.NormalKiteRetreatDistance then
+			if RuntimeState.KiteMode == "RETREAT_DIAGONAL" and RuntimeState.KiteGoal and now - LastGoalRefreshAt < Config.GoalRefreshInterval then
+				NavigationGoal = RuntimeState.KiteGoal
+				setNavigationState(NavigationState.DIRECT)
+				updateProgressTracking()
+				return
 			end
-			setNavigationState(NavigationState.DIRECT)
-		elseif not PathComputing and (State ~= NavigationState.PATH or not PathWaypoints) then
-			cancelPathRequest()
-			setNavigationState(NavigationState.PATH)
-			requestPath(NavigationGoal)
+			LastGoalRefreshAt = now
+			local kiteGoal, kiteDirection = chooseKiteGoal(enemyRoot, true)
+			if kiteGoal and kiteDirection then
+				cancelPathRequest()
+				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = kiteGoal, kiteDirection, "RETREAT_DIAGONAL"
+				NavigationGoal = kiteGoal
+				setNavigationState(NavigationState.DIRECT)
+				updateProgressTracking()
+				return
+			end
+		elseif distance3D <= Config.NormalKiteApproachDistance then
+			if RuntimeState.KiteMode == "FORWARD_DIAGONAL" and RuntimeState.KiteGoal and now - LastGoalRefreshAt < Config.GoalRefreshInterval then
+				NavigationGoal = RuntimeState.KiteGoal
+				setNavigationState(NavigationState.DIRECT)
+				updateProgressTracking()
+				return
+			end
+			LastGoalRefreshAt = now
+			local kiteGoal, kiteDirection = chooseKiteGoal(enemyRoot, false)
+			if kiteGoal and kiteDirection then
+				cancelPathRequest()
+				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = kiteGoal, kiteDirection, "FORWARD_DIAGONAL"
+				NavigationGoal = kiteGoal
+				setNavigationState(NavigationState.DIRECT)
+				updateProgressTracking()
+				return
+			end
 		end
-		updateProgressTracking()
-		return
+	elseif bossPolicy.Mode == "MIDGARDIAN" and distance3D <= 80 then
+		if RuntimeState.KiteMode == "ORBIT" and RuntimeState.KiteGoal and now - LastGoalRefreshAt < Config.GoalRefreshInterval then
+			NavigationGoal = RuntimeState.KiteGoal
+			setNavigationState(NavigationState.DIRECT)
+			updateProgressTracking()
+			return
+		end
+		LastGoalRefreshAt = now
+		local orbitGoal, orbitDirection = chooseKiteGoal(enemyRoot, false, true)
+		if orbitGoal and orbitDirection then
+			cancelPathRequest()
+			RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = orbitGoal, orbitDirection, "ORBIT"
+			NavigationGoal = orbitGoal
+			setNavigationState(NavigationState.DIRECT)
+			RuntimeUtil.telemetry("BOSS", "mode=orbit name=" .. Target.Name)
+			updateProgressTracking()
+			return
+		end
 	end
+	RuntimeState.KiteGoal = nil
+	RuntimeState.KiteDirection = Vector3.zero
+	RuntimeState.KiteMode = ""
 	if State == NavigationState.RETREAT and distance3D >= Config.RetreatExitDistance then
 		-- RETREAT is valid only close to the current target. Never allow a stale
 		-- retreat owner to walk backward from a newly acquired or risen far target.
@@ -4344,6 +4578,9 @@ local function bindCharacter(character: Model)
 	Humanoid = newHumanoid
 	Root = newRoot
 	invalidateDirectRouteCache()
+	RuntimeState.PlayerSafetyCharacter = nil
+	RuntimeState.PlayerSafetyRadius = 0
+	RuntimeState.PlayerSafetySampleAt = -math.huge
 	RuntimeState.TargetRootSampleTarget = nil
 	RuntimeState.TargetRootSamplePosition = nil
 	RuntimeState.TargetRootSampleAt = 0
@@ -4431,6 +4668,47 @@ local function bindCharacter(character: Model)
 			end)
 		)
 	end
+end
+
+chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: boolean?): (Vector3?, Vector3?)
+	if not Root then
+		return nil, nil
+	end
+	local toEnemy = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z)
+	if toEnemy.Magnitude <= 0.1 then
+		return nil, nil
+	end
+	local forward = toEnemy.Unit
+	local right = Vector3.new(-forward.Z, 0, forward.X)
+	local base = retreat and -forward or forward
+	-- Both true sides are evaluated. A blocked left/right therefore naturally
+	-- selects its opposite rather than hard-coding an A or D preference.
+	local directions = if lateralOnly
+		then { right, -right }
+		else { (base + right).Unit, (base - right).Unit, right, -right }
+	local bestGoal: Vector3? = nil
+	local bestDirection: Vector3? = nil
+	local bestScore = -math.huge
+	for _, direction in ipairs(directions) do
+		local proposed = Root.Position + direction * 9
+		local grounded, foundGround = projectToWalkableGround(proposed, Target)
+		if foundGround
+			and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+			and hasGroundSupport(grounded, Target)
+			and directRouteClear(grounded, Target)
+			and pointIsSafeFromHazards(grounded)
+		then
+			local continuity = RuntimeState.KiteDirection.Magnitude > 0.1
+				and RuntimeState.KiteDirection:Dot(direction)
+				or 0
+			local progress = lateralOnly and 0 or forward:Dot(direction) * (retreat and -1 or 1)
+			local score = progress * 4 + continuity
+			if score > bestScore then
+				bestGoal, bestDirection, bestScore = grounded, direction, score
+			end
+		end
+	end
+	return bestGoal, bestDirection
 end
 
 local function telemetryMovementOwner(owner: string)
@@ -4876,9 +5154,6 @@ table.insert(
 			setNavigationState(NavigationState.IDLE)
 			stopTranslation()
 			return
-		end
-		if now < RuntimeState.RespawnRushUntil and State == NavigationState.DODGE then
-			leaveDodge()
 		end
 		updateGlobalStuckJump()
 		-- Objective refresh may change navigation state, but its zero-move calls
