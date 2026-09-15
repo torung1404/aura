@@ -1230,17 +1230,43 @@ local function refreshNearbyActiveHazards()
 	end
 end
 
-local function pointIsSafeFromHazards(position: Vector3): boolean
+local function dodgeDestinationSafety(position: Vector3): (boolean, number, number)
 	if not Config.DodgeEnabled then
-		return true
+		return true, 0, math.huge
 	end
+	local overlaps = 0
+	local minimumClearance = math.huge
+	local footprint = playerFootprintRadius()
 	for part in pairs(NearbyActiveHazards) do
 		if
 			part:IsDescendantOf(workspace)
 			and isCanonicalActiveHazard(part)
 			and hazardThreatensHeight(part, position, Config.DodgeLookaheadSeconds)
-			and RuntimeState.hazardEdgeDistance(part, position, Config.DodgeLookaheadSeconds, playerFootprintRadius())
-				<= Config.DodgeSafePadding
+		then
+			local clearance = RuntimeState.hazardEdgeDistance(part, position, Config.DodgeLookaheadSeconds, footprint)
+			minimumClearance = math.min(minimumClearance, clearance)
+			if clearance <= Config.DodgeSafePadding then
+				overlaps += 1
+			end
+		end
+	end
+	return overlaps == 0, overlaps, minimumClearance
+end
+
+local function pointIsSafeFromHazards(position: Vector3): boolean
+	return select(1, dodgeDestinationSafety(position))
+end
+
+local function kiteRouteIsSafeFromHazards(goal: Vector3): boolean
+	if not Config.DodgeEnabled or not Root then
+		return true
+	end
+	local footprint = playerFootprintRadius()
+	for hazard in pairs(NearbyActiveHazards) do
+		if
+			isCanonicalActiveHazard(hazard)
+			and hazardThreatensHeight(hazard, Root.Position)
+			and RuntimeState.segmentHazardClearance(hazard, Root.Position, goal, footprint) <= Config.DodgeSafePadding
 		then
 			return false
 		end
@@ -1265,6 +1291,31 @@ local function upcomingMovementGoal(): Vector3?
 		return DodgeGoal
 	end
 	return Root.Position
+end
+
+local function dodgeCanResumeNormalMovement(): boolean
+	if not Root or not select(1, dodgeDestinationSafety(Root.Position)) then
+		return false
+	end
+	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
+	local goal = NavigationGoal or (targetRoot and targetRoot.Position)
+	if not goal then
+		return true
+	end
+	local flatDelta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
+	if flatDelta.Magnitude <= 0.1 then
+		return true
+	end
+	local immediateGoal = Root.Position + flatDelta.Unit * math.min(8, flatDelta.Magnitude)
+	local footprint = playerFootprintRadius()
+	for hazard in pairs(NearbyActiveHazards) do
+		if isCanonicalActiveHazard(hazard) and hazardThreatensHeight(hazard, Root.Position) then
+			if RuntimeState.segmentHazardClearance(hazard, Root.Position, immediateGoal, footprint) <= Config.DodgeSafePadding then
+				return false
+			end
+		end
+	end
+	return true
 end
 
 local function threateningHazard(): (BasePart?, boolean, number, number)
@@ -1447,9 +1498,19 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 	local bestGoal: Vector3? = nil
 	local bestScore = -math.huge
 	local bestLabel: string? = nil
+	local partialGoal: Vector3? = nil
+	local partialOverlaps = math.huge
+	local partialClearance = -math.huge
+	local partialLabel: string? = nil
 	local footprint = playerFootprintRadius()
 	local currentClearance = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
-	local escapeDistance = math.max(4, Config.DodgeSafePadding - currentClearance + 2)
+	-- Current clearance already includes the full player footprint and capped ping
+	-- margin. Escape rings therefore start at the distance needed to cross the
+	-- actual boundary plus safe padding, rather than a fixed four-stud nudge.
+	local escapeDistance = math.max(
+		Config.DodgeSafePadding + 1,
+		Config.DodgeSafePadding - currentClearance + 2
+	)
 	local ringDistances = { escapeDistance, escapeDistance + 5, escapeDistance + 10 }
 	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
 	local objective = targetRoot and targetRoot.Position or NavigationGoal
@@ -1515,6 +1576,9 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 	for ringIndex, ringDistance in ipairs(ringDistances) do
 		for directionIndex, candidateInfo in ipairs(candidateDirections) do
 			if RuntimeState.DodgeBudgetExhausted then
+				if partialGoal then
+					return partialGoal, "PARTIAL", partialLabel, partialClearance
+				end
 				return bestGoal, "UNKNOWN", bestLabel, bestScore
 			end
 			local candidate = Root.Position + candidateInfo.Direction * ringDistance
@@ -1527,7 +1591,18 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 			elseif math.abs(grounded.Y - Root.Position.Y) > Config.DirectVerticalTolerance then
 				evaluation, rejection = "UNSAFE", "wrong-floor"
 			elseif not pointIsSafeFromHazards(grounded) then
-				evaluation, rejection = "UNSAFE", "hazard-overlap"
+				local _, routeStatus = dodgeRouteClear(grounded)
+				if routeStatus == "SAFE" then
+					local _, overlaps, minimumClearance = dodgeDestinationSafety(grounded)
+					if overlaps < partialOverlaps or (overlaps == partialOverlaps and minimumClearance > partialClearance) then
+						partialGoal, partialOverlaps, partialClearance, partialLabel =
+							grounded, overlaps, minimumClearance, candidateInfo.Label
+					end
+					evaluation, rejection = "PARTIAL", "still-overlap"
+				else
+					evaluation = routeStatus
+					rejection = if routeStatus == "UNKNOWN" then "route-unknown" else "hazard-overlap"
+				end
 			else
 				local _, routeStatus = dodgeRouteClear(grounded)
 				if routeStatus ~= "SAFE" then
@@ -1579,6 +1654,9 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 		if bestGoal then
 			return bestGoal, "SAFE", bestLabel, bestScore
 		end
+	end
+	if partialGoal then
+		return partialGoal, "PARTIAL", partialLabel, partialClearance
 	end
 	if RuntimeState.DodgeBudgetExhausted then
 		return bestGoal, "UNKNOWN", bestLabel, bestScore
@@ -3359,18 +3437,14 @@ local function updateRecoveryMovement()
 	if State == NavigationState.RETREAT and Target and validTarget(Target) then
 		local enemyRoot = getTargetRoot(Target)
 		if enemyRoot then
-			local away = Vector3.new(Root.Position.X - enemyRoot.Position.X, 0, Root.Position.Z - enemyRoot.Position.Z)
-			local direction = away.Magnitude > 0.1 and away.Unit or Vector3.xAxis
-			local retreatPoint, foundGround = projectToWalkableGround(Root.Position + direction * 7, Target)
-			if
-				foundGround
-				and math.abs(retreatPoint.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-				and hasGroundSupport(retreatPoint, Target)
-				and directRouteClear(retreatPoint, Target)
-			then
-				Humanoid:Move(direction, false)
+			local retreatGoal, retreatDirection = chooseKiteGoal(enemyRoot, true)
+			if retreatGoal and retreatDirection then
+				RuntimeState.KiteGoal = retreatGoal
+				RuntimeState.KiteDirection = retreatDirection
+				RuntimeState.KiteMode = "RETREAT_DIAGONAL"
+				Humanoid:Move(retreatDirection, false)
 			else
-				Humanoid:Move(Vector3.zero, false)
+				stopTranslation()
 			end
 			return
 		end
@@ -3796,6 +3870,14 @@ local function updateDodgeController(): boolean
 		RuntimeState.DodgeHoldUntil = 0
 		RuntimeState.DodgeNoGoalSince = 0
 		if State == NavigationState.DODGE then
+			if not dodgeCanResumeNormalMovement() then
+				RuntimeUtil.telemetry("DODGE_ROUTE", "continue=resume-route-unsafe")
+				if DodgeGoal then
+					local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
+					Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
+					return true
+				end
+			end
 			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis and DodgeGoal then
 				local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
 				Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
@@ -3827,7 +3909,15 @@ local function updateDodgeController(): boolean
 			ActiveHazard = hazard
 		end
 	end
+	local currentFootprintSafe, currentOverlaps, currentMinimumClearance = dodgeDestinationSafety(Root.Position)
+	RuntimeUtil.telemetry(
+		"DODGE_OVERLAPS",
+		string.format("overlaps=%d minClearance=%.1f", currentOverlaps, currentMinimumClearance)
+	)
 	local goalReached = DodgeGoal and (DodgeGoal - Root.Position).Magnitude <= 1.5
+	if goalReached and not currentFootprintSafe then
+		RuntimeUtil.telemetry("DODGE_CONTINUE", "reason=still-inside-hitbox")
+	end
 	local needsNewGoal = State ~= NavigationState.DODGE
 		or goalUnsafe
 		or goalReached
@@ -3924,6 +4014,11 @@ local function updateDodgeController(): boolean
 				end
 			end
 			setNavigationState(NavigationState.DODGE)
+			local _, goalOverlaps, goalMinimumClearance = dodgeDestinationSafety(DodgeGoal)
+			RuntimeUtil.telemetry(
+				"DODGE_GOAL_CLEARANCE",
+				string.format("goal overlapsAfter=%d minClearance=%.1f", goalOverlaps, goalMinimumClearance)
+			)
 			RuntimeUtil.telemetry(
 				"DODGE_GOAL",
 				string.format("choose=%s score=%.1f goal=%s", selectedLabel or "fallback", selectedScore or 0, tostring(DodgeGoal))
@@ -4425,7 +4520,12 @@ local function updateTargetAndObjective()
 			RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = orbitGoal, orbitDirection, "ORBIT"
 			NavigationGoal = orbitGoal
 			setNavigationState(NavigationState.DIRECT)
-			RuntimeUtil.telemetry("BOSS", "mode=orbit name=" .. Target.Name)
+			local radial = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z).Unit
+			local right = Vector3.new(-radial.Z, 0, radial.X)
+			RuntimeUtil.telemetry(
+				"BOSS",
+				string.format("mode=orbit side=%s radius=%.1f", orbitDirection:Dot(right) >= 0 and "right" or "left", (orbitGoal - Root.Position).Magnitude)
+			)
 			updateProgressTracking()
 			return
 		end
@@ -4686,35 +4786,60 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 	end
 	local forward = toEnemy.Unit
 	local right = Vector3.new(-forward.Z, 0, forward.X)
-	local base = retreat and -forward or forward
-	-- Both true sides are evaluated. A blocked left/right therefore naturally
-	-- selects its opposite rather than hard-coding an A or D preference.
-	local directions = if lateralOnly
-		then { right, -right }
-		else { (base + right).Unit, (base - right).Unit, right, -right }
-	local bestGoal: Vector3? = nil
-	local bestDirection: Vector3? = nil
-	local bestScore = -math.huge
-	for _, direction in ipairs(directions) do
-		local proposed = Root.Position + direction * 9
-		local grounded, foundGround = projectToWalkableGround(proposed, Target)
-		if foundGround
-			and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-			and hasGroundSupport(grounded, Target)
-			and directRouteClear(grounded, Target)
-			and pointIsSafeFromHazards(grounded)
-		then
-			local continuity = RuntimeState.KiteDirection.Magnitude > 0.1
-				and RuntimeState.KiteDirection:Dot(direction)
-				or 0
-			local progress = lateralOnly and 0 or forward:Dot(direction) * (retreat and -1 or 1)
-			local score = progress * 4 + continuity
-			if score > bestScore then
-				bestGoal, bestDirection, bestScore = grounded, direction, score
+	local candidates = if lateralOnly
+		then {
+			{ Direction = right, Label = "right" },
+			{ Direction = -right, Label = "left" },
+		}
+		elseif retreat
+		then {
+			{ Direction = (-forward + right).Unit, Label = "back-right" },
+			{ Direction = (-forward - right).Unit, Label = "back-left" },
+			{ Direction = right, Label = "right" },
+			{ Direction = -right, Label = "left" },
+			{ Direction = -forward, Label = "back" },
+		}
+		else {
+			{ Direction = (forward + right).Unit, Label = "forward-right" },
+			{ Direction = (forward - right).Unit, Label = "forward-left" },
+			{ Direction = right, Label = "right" },
+			{ Direction = -right, Label = "left" },
+		}
+	local distances = if retreat or lateralOnly then { 8, 12, 16 } else { 8 }
+	for _, distance in ipairs(distances) do
+		local bestGoal: Vector3? = nil
+		local bestDirection: Vector3? = nil
+		local bestScore = -math.huge
+		for _, candidate in ipairs(candidates) do
+			local direction = candidate.Direction
+			local proposed = Root.Position + direction * distance
+			local grounded, foundGround = projectToWalkableGround(proposed, Target)
+			if
+				foundGround
+				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+				and hasGroundSupport(grounded, Target)
+				and directRouteClear(grounded, Target)
+				and pointIsSafeFromHazards(grounded)
+				and kiteRouteIsSafeFromHazards(grounded)
+			then
+				local continuity = RuntimeState.KiteDirection.Magnitude > 0.1
+					and RuntimeState.KiteDirection:Dot(direction)
+					or 0
+				local progress = lateralOnly and 0 or forward:Dot(direction) * (retreat and -1 or 1)
+				local score = progress * 4 + continuity
+				if score > bestScore then
+					bestGoal, bestDirection, bestScore = grounded, direction, score
+				end
+			else
+				RuntimeUtil.telemetry("KITE_" .. candidate.Label, "mode=" .. (lateralOnly and "orbit" or retreat and "retreat" or "approach") .. " candidate=" .. candidate.Label .. " status=blocked")
 			end
 		end
+		if bestGoal and bestDirection then
+			RuntimeUtil.telemetry("KITE_CHOOSE", string.format("mode=%s choose=%s dist=%d", lateralOnly and "orbit" or retreat and "retreat" or "approach", "safe", distance))
+			return bestGoal, bestDirection
+		end
 	end
-	return bestGoal, bestDirection
+	return nil, nil
 end
 
 local function telemetryMovementOwner(owner: string)
