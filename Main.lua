@@ -419,6 +419,7 @@ local RuntimeState = {
 	BossDodgeSource = nil :: Instance?,
 	BossDodgeMode = "",
 	BossDodgeDirection = Vector3.zero,
+	MageHitboxSeen = {} :: { [Model]: boolean },
 	KiteGoal = nil :: Vector3?,
 	KiteDirection = Vector3.zero,
 	KiteMode = "",
@@ -807,6 +808,7 @@ local function canonicalHazardPart(part: BasePart): BasePart
 	-- three as unrelated hazards.
 	local hitbox = model:FindFirstChild("hitBox", true)
 	if hitbox and hitbox:IsA("BasePart") and hitbox:IsDescendantOf(workspace) then
+		RuntimeState.MageHitboxSeen[model] = true
 		return hitbox
 	end
 	local precast = model:FindFirstChild("precast", true)
@@ -935,6 +937,14 @@ local function isActiveHazardPart(part: BasePart): boolean
 end
 
 local function isCanonicalActiveHazard(part: BasePart): boolean
+	local model = skillModelForPart(part)
+	if model and model.Name:lower() == "northernmageshot" and RuntimeState.MageHitboxSeen[model] then
+		local hitbox = model:FindFirstChild("hitBox", true)
+		if not hitbox or not hitbox:IsA("BasePart") or not hitbox:IsDescendantOf(workspace) then
+			RuntimeUtil.telemetry("HAZARD_INACTIVE_" .. model:GetDebugId(), "inactive model=" .. model.Name .. " reason=hitbox-removed")
+			return false
+		end
+	end
 	return canonicalHazardPart(part) == part and isActiveHazardPart(part)
 end
 
@@ -954,6 +964,31 @@ local function registerHazard(instance: Instance)
 		}
 		logHazardRegistration(instance, "ACCEPT", reason)
 		local model = skillModelForPart(instance)
+		local owner: Model? = nil
+		local current: Instance? = instance.Parent
+		while current and current ~= workspace do
+			if current:IsA("Model") and current:FindFirstChildOfClass("Humanoid") then
+				owner = current
+				break
+			end
+			current = current.Parent
+		end
+		if Config.DebugTelemetry and owner and (owner.Name == "Northern Warrior" or owner.Name == "Northern Spearman") then
+			RuntimeUtil.telemetry(
+				"SKILL_UNKNOWN_" .. instance:GetDebugId(),
+				string.format(
+					"enemy=%s model=%s part=%s size=%s transparency=%.2f canCollide=%s canQuery=%s velocity=%.1f",
+					owner.Name,
+					model and model.Name or "none",
+					instance.Name,
+					tostring(instance.Size),
+					instance.Transparency,
+					tostring(instance.CanCollide),
+					tostring(instance.CanQuery),
+					instance.AssemblyLinearVelocity.Magnitude
+				)
+			)
+		end
 		if model and (model.Name:lower() == "northernmageshot" or specialSkillKind(instance)) then
 			local parts = 0
 			for _, descendant in ipairs(model:GetDescendants()) do
@@ -1090,8 +1125,9 @@ RuntimeState.hazardExitDirection = function(part: BasePart, position: Vector3): 
 	return flatDirection.Magnitude > 0.1 and flatDirection.Unit or Vector3.new(1, 0, 0)
 end
 
-RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3, padding: number?): number
-	local futureCFrame = RuntimeState.hazardFutureCFrame(part, Config.DodgeLookaheadSeconds * 0.5)
+RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, second: Vector3, padding: number?, lookaheadSeconds: number?): number
+	local lookahead = if lookaheadSeconds == nil then Config.DodgeLookaheadSeconds * 0.5 else lookaheadSeconds
+	local futureCFrame = RuntimeState.hazardFutureCFrame(part, lookahead)
 	local half = part.Size * 0.5 + Vector3.new(padding or 0, padding or 0, padding or 0)
 	if part:IsA("Part") and (part.Shape == Enum.PartType.Cylinder or part.Shape == Enum.PartType.Ball) then
 		local delta = second - first
@@ -1128,7 +1164,7 @@ RuntimeState.segmentHazardClearance = function(part: BasePart, first: Vector3, s
 	for index = 0, sampleCount do
 		local alpha = index / sampleCount
 		local point = first:Lerp(second, alpha)
-		minimum = math.min(minimum, RuntimeState.hazardEdgeDistance(part, point, Config.DodgeLookaheadSeconds * alpha, padding))
+		minimum = math.min(minimum, RuntimeState.hazardEdgeDistance(part, point, lookahead * alpha, padding))
 	end
 	return minimum
 end
@@ -1348,8 +1384,9 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 			local phase = RuntimeState.hazardIsPrecast(part) and "precast" or "active"
 			RuntimeUtil.telemetry("SKILL_PHASE_" .. skillModel:GetDebugId(), "phase=" .. phase .. " name=" .. skillModel.Name)
 		end
-		if part:IsDescendantOf(workspace) and isActiveHazardPart(part) then
+		if part:IsDescendantOf(workspace) and isCanonicalActiveHazard(part) then
 			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
+			local currentRouteClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint, 0)
 			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
 			local triggerPadding = if RuntimeState.hazardIsPrecast(part)
 				then Config.DodgePreTriggerPadding
@@ -1361,9 +1398,11 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 			local timeToImpact = if approachingSpeed > 0.5
 				then math.max(0, edgeDistance) / approachingSpeed
 				else math.huge
-			local routeThreat = routeClearance <= triggerPadding
+			local physicalRouteThreat = currentRouteClearance <= triggerPadding
+			local predictionAllowed = edgeDistance <= 40 and approachingSpeed > 0.5 and timeToImpact <= Config.DodgeLookaheadSeconds
+			local predictedRouteThreat = predictionAllowed and routeClearance <= triggerPadding
 			local nearbyThreat = edgeDistance <= Config.DodgePriorityRadius
-			local predicted = routeThreat or timeToImpact <= Config.DodgeLookaheadSeconds
+			local predicted = predictedRouteThreat or predictionAllowed
 			local retainingActiveDodge = State == NavigationState.DODGE
 				and edgeDistance <= Config.DodgeSafePadding
 			-- Nearby hazards win first. A farther one is allowed to interrupt only
@@ -1371,8 +1410,8 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 			local threatScore = math.min(edgeDistance, routeClearance, timeToImpact * 10)
 			if
 				edgeDistance <= Config.DodgeDetectionRadius
-				and (nearbyThreat or routeThreat or retainingActiveDodge)
-				and (edgeDistance <= triggerPadding or predicted or retainingActiveDodge)
+				and (nearbyThreat or physicalRouteThreat or predicted or retainingActiveDodge)
+				and (edgeDistance <= triggerPadding or physicalRouteThreat or predicted or retainingActiveDodge)
 				and threatScore < bestThreatScore
 			then
 				bestThreatScore = threatScore
@@ -1406,7 +1445,7 @@ local function horizontalBeamThreat(): (BasePart?, boolean, number, number)
 	local approachEnd = upcomingMovementGoal() or Root.Position
 	local footprint = playerFootprintRadius()
 	for part in pairs(NearbyActiveHazards) do
-		if specialSkillKind(part) == "HORIZONTAL_BEAM" and isActiveHazardPart(part) then
+		if specialSkillKind(part) == "HORIZONTAL_BEAM" and isCanonicalActiveHazard(part) then
 			local edge = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
 			local route = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
 			if edge <= Config.DodgePriorityRadius or route <= Config.DodgeTriggerPadding then
@@ -3694,6 +3733,7 @@ resetRuntimeForNewDungeon = function()
 	table.clear(PendingEnemyModels)
 	table.clear(HazardSet)
 	table.clear(RuntimeState.HazardMetadata)
+	table.clear(RuntimeState.MageHitboxSeen)
 	RuntimeState.DungeonFinishedInstance = nil
 	RuntimeState.PreviousDungeonFinishedInstance = nil
 	RuntimeState.DungeonFinishedLastState = false
@@ -3870,21 +3910,15 @@ local function updateDodgeController(): boolean
 		RuntimeState.DodgeHoldUntil = 0
 		RuntimeState.DodgeNoGoalSince = 0
 		if State == NavigationState.DODGE then
-			if not dodgeCanResumeNormalMovement() then
-				RuntimeUtil.telemetry("DODGE_ROUTE", "continue=resume-route-unsafe")
-				if DodgeGoal then
-					local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
-					Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
-					return true
-				end
-			end
-			if os.clock() - LastHazardThreatAt < Config.DodgeExitHysteresis and DodgeGoal then
+			if dodgeCanResumeNormalMovement() then
+				RuntimeUtil.telemetry("DODGE_STALE", "stale-cleared hazard=" .. (ActiveHazard and ActiveHazard.Name or "nil"))
+				RuntimeUtil.telemetry("DODGE_ROUTE", "exit=no-current-threat")
+				leaveDodge()
+			elseif DodgeGoal then
 				local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
 				Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
 				return true
 			end
-			RuntimeUtil.telemetry("DODGE_ROUTE", "exit=direct-route-safe")
-			leaveDodge()
 		end
 		return false
 	end
@@ -5020,6 +5054,7 @@ local function shutdown()
 	table.clear(NearbyActiveHazards)
 	table.clear(HazardSet)
 	table.clear(RuntimeState.HazardMetadata)
+	table.clear(RuntimeState.MageHitboxSeen)
 	resetNavigationForTarget(nil)
 	stopTranslation()
 	restoreMovementSpeed()
@@ -5100,6 +5135,7 @@ table.insert(
 	workspace.DescendantRemoving:Connect(function(instance)
 		if instance:IsA("Model") then
 			EnemySet[instance] = nil
+			RuntimeState.MageHitboxSeen[instance] = nil
 		end
 		local targetRoot = Target and getTargetRoot(Target)
 		if
@@ -5174,6 +5210,7 @@ table.insert(
 		table.clear(NearbyActiveHazards)
 		table.clear(HazardSet)
 		table.clear(RuntimeState.HazardMetadata)
+		table.clear(RuntimeState.MageHitboxSeen)
 		LastHazardRefreshAt = -math.huge
 		setNavigationState(NavigationState.IDLE)
 		print("[CHAR] respawn")
