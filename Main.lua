@@ -137,7 +137,9 @@ end
 local CONFIG_FILE = "AutoFarmV21Config.json"
 -- Version only the Dodge preference. Existing forced-OFF files migrate once;
 -- afterward the user's saved toggle remains authoritative.
-local DODGE_CONFIG_VERSION = 4
+-- Version 5 migrates the prior test-era OFF preference once. Subsequent user
+-- toggle changes persist normally and are never overwritten at runtime.
+local DODGE_CONFIG_VERSION = 5
 local SavedConfig: { [string]: any } = {}
 if type(isfile) == "function" and type(readfile) == "function" then
 	local ok, decoded = pcall(function()
