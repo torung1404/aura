@@ -524,9 +524,18 @@ local function isIgnoredTarget(model: Model): boolean
 	return false
 end
 
+local ExplicitBossNames = {
+	["crystal golem"] = true,
+	["ancient enchanted tree"] = true,
+	["enchanted forest dragon"] = true,
+}
+
 local function isEnemy(model: Model): boolean
 	if isIgnoredTarget(model) then
 		return false
+	end
+	if ExplicitBossNames[model.Name:lower()] then
+		return true
 	end
 	local current: Instance? = model
 	while current and current ~= workspace do
@@ -542,6 +551,9 @@ local function isEnemy(model: Model): boolean
 end
 
 local function isBossTarget(model: Model): boolean
+	if ExplicitBossNames[model.Name:lower()] then
+		return true
+	end
 	local fightingBoss = RuntimeState.FightingBossInstance
 	local enemyFolder = RuntimeState.EnemyFolderInstance
 	local activeRoot = RuntimeState.ActiveDungeonRoot
