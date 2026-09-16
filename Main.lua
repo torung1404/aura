@@ -304,6 +304,8 @@ local ProgressState = {
 	LastStuckPathRetryAt = -math.huge,
 	LowSpeedSince = nil :: number?,
 	LastLowSpeedPathRetryAt = -math.huge,
+	RecoveryEscalations = 0,
+	LastRecoveryEscalationAt = -math.huge,
 }
 local DodgeStartedAt = 0
 local LastStartClickAt = -math.huge
@@ -2347,7 +2349,17 @@ local function updateGlobalStuckJump()
 		RuntimeState.JumpBestVertical = math.min(RuntimeState.JumpBestVertical, vertical)
 		RuntimeState.JumpStillSince = now
 	elseif now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
-		recoverByRespawn(nil, nil, false, RuntimeState.JumpStillSince)
+		-- Targeted navigation has a more specific watchdog below that can retry its
+		-- local detour/PATH fallback before a respawn. Do not let this generic
+		-- watchdog preempt that recovery in the first frame it becomes eligible.
+		if Target and NavigationGoal then
+			RuntimeState.JumpStillSince = now
+			RuntimeState.JumpBestDistance = math.huge
+			RuntimeState.JumpBestVertical = math.huge
+			RuntimeUtil.telemetry("RECOVERY", "global=defer-to-target-path")
+		else
+			recoverByRespawn(nil, nil, false, RuntimeState.JumpStillSince)
+		end
 	end
 end
 
@@ -3272,6 +3284,8 @@ local function resetProgress(target: Model?, goal: Vector3?)
 	ProgressState.LastStuckPathRetryAt = -math.huge
 	ProgressState.LowSpeedSince = nil
 	ProgressState.LastLowSpeedPathRetryAt = -math.huge
+	ProgressState.RecoveryEscalations = 0
+	ProgressState.LastRecoveryEscalationAt = -math.huge
 	ProgressState.RecoveryGoal = nil
 	ProgressState.RecoveryUntil = 0
 	ProgressState.SteeringTried = false
@@ -3295,6 +3309,8 @@ end
 local function markMeaningfulProgress()
 	ProgressState.LastMeaningfulAt = os.clock()
 	ProgressState.BestGoalMetric = pathRemainingMetric()
+	ProgressState.RecoveryEscalations = 0
+	ProgressState.LastRecoveryEscalationAt = -math.huge
 end
 
 local function updateProgressTracking()
@@ -3334,6 +3350,8 @@ local function updateProgressTracking()
 	elseif metric <= ProgressState.BestGoalMetric - Config.MeaningfulProgressDistance or verticalProgress then
 		ProgressState.BestGoalMetric = metric
 		ProgressState.LastMeaningfulAt = now
+		ProgressState.RecoveryEscalations = 0
+		ProgressState.LastRecoveryEscalationAt = -math.huge
 	end
 end
 
@@ -3386,8 +3404,17 @@ end
 
 local function beginLocalRecovery(goal: Vector3)
 	ProgressState.RecoveryGoal = chooseRecoveryDetour(goal)
-	ProgressState.RecoveryUntil = os.clock() + Config.DetourDuration
-	setNavigationState(NavigationState.RECOVERY)
+	if ProgressState.RecoveryGoal then
+		ProgressState.RecoveryUntil = os.clock() + Config.DetourDuration
+		setNavigationState(NavigationState.RECOVERY)
+		return
+	end
+	-- A failed local detour is not an instruction to stand still. Hand ownership
+	-- back to PATH so its bounded, verified fallback can move while a new path is
+	-- requested; the next Heartbeat performs that request without duplicating it.
+	ProgressState.RecoveryUntil = 0
+	RuntimeUtil.telemetry("RECOVERY", "fallback=path reason=no-local-detour")
+	setNavigationState(NavigationState.PATH)
 end
 
 local function issueCurrentWaypoint()
@@ -3665,13 +3692,17 @@ local function updateRecoveryMovement()
 			return
 		end
 	end
-	Humanoid:Move(Vector3.zero, false)
-	-- A recovery detour must own movement long enough to get clear of the
-	-- blocking BasicPart. Rebuilding immediately here used to publish a new PATH
-	-- before the character had physically left the same blocked edge.
-	if State ~= NavigationState.RETREAT and not PathState.Computing and NavigationGoal then
-		requestPath(NavigationGoal)
+	if State ~= NavigationState.RETREAT and NavigationGoal then
+		-- The detour completed or was unavailable. Re-enter PATH in this same
+		-- dispatch cycle so there is no RECOVERY + zero-move gap before the path
+		-- fallback can validate and issue the next movement command.
+		ProgressState.RecoveryGoal = nil
+		ProgressState.RecoveryUntil = 0
+		setNavigationState(NavigationState.PATH)
+		updatePathNavigation()
+		return
 	end
+	stopTranslation()
 end
 
 local function decideNavigation()
@@ -4319,7 +4350,18 @@ local function runRecoveryPolicy()
 	end
 	local stuckFor = now - ProgressState.LastMeaningfulAt
 	if stuckFor >= Config.RespawnStuckTime then
-		if not RespawnInProgress then
+		-- Give the controller one fresh local/path recovery pass before spending a
+		-- respawn. This does not reset the progress timestamp, so a real stall is
+		-- still visible to the watchdog and can escalate on the following pass.
+		if ProgressState.RecoveryEscalations == 0 then
+			ProgressState.RecoveryEscalations = 1
+			ProgressState.LastRecoveryEscalationAt = now
+			cancelPathRequest()
+			beginLocalRecovery(NavigationGoal)
+			RuntimeUtil.telemetry("RECOVERY", "retry=path-before-respawn")
+			return
+		end
+		if now - ProgressState.LastRecoveryEscalationAt >= Config.SlowMovementRepathCooldown and not RespawnInProgress then
 			recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
 		end
 		return
