@@ -29,8 +29,8 @@ local DEFAULT_CONFIG = {
 	PreferredCombatDistance = 70,
 	RetreatEnterDistance = 40,
 	RetreatExitDistance = 45,
-	NormalKiteApproachDistance = 80,
-	NormalKiteRetreatDistance = 80,
+	NormalKiteApproachDistance = 75,
+	NormalKiteRetreatDistance = 75,
 	AttackRange = 15,
 	NormalSkillRange = 80,
 	BossSkillRange = 100,
@@ -41,9 +41,9 @@ local DEFAULT_CONFIG = {
 	KiteDistance = 75,
 	KiteHysteresis = 3,
 	AttackCooldown = 0.12,
-	QCooldownMin = 0.3,
-	QCooldownMax = 0.5,
-	ECooldown = 0.4,
+	QCooldownMin = 6,
+	QCooldownMax = 6,
+	ECooldown = 6,
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
@@ -83,6 +83,7 @@ local DEFAULT_CONFIG = {
 	DodgeSafePadding = 5,
 	DodgeDetectionRadius = 60,
 	DodgePriorityRadius = 50,
+	DodgePredictionRange = 30,
 	DodgeRefreshInterval = 0.12,
 	DodgeVerticalPadding = 6,
 	DodgeCandidateCount = 8,
@@ -196,8 +197,13 @@ Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 80
 Config.BossSkillRange = 100
-Config.NormalKiteApproachDistance = 80
-Config.NormalKiteRetreatDistance = 80
+Config.NormalKiteApproachDistance = 75
+Config.NormalKiteRetreatDistance = 75
+Config.KiteDistance = 75
+Config.QCooldownMin = 6
+Config.QCooldownMax = 6
+Config.ECooldown = 6
+Config.DodgePredictionRange = 30
 Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
 -- thirty percent. Old fixed-speed values must not survive a re-exec.
@@ -239,6 +245,9 @@ local function saveConfig()
 			end
 		end
 		persisted.FarmEnabled = Config.FarmEnabled == true
+		-- Movement-only test mode deliberately persists Dodge OFF so an old UI
+		-- setting cannot reactivate the controller on the next execution.
+		persisted.DodgeEnabled = false
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.NormalSkillRange = 80
 		persisted.BossSkillRange = 100
@@ -307,6 +316,9 @@ local CombatState = {
 	LastAttack = 0,
 	NextQAt = 0,
 	NextEAt = 0,
+	QCastTime = 0,
+	EAllowedUntil = 0,
+	BindSerial = 0,
 }
 local TargetDiedConnection: RBXScriptConnection? = nil
 local AimState = {
@@ -516,6 +528,12 @@ end
 
 local function isIgnoredTarget(model: Model): boolean
 	local name = model.Name:lower()
+	local normalized = name:gsub("[%p_]+", " "):gsub("%s+", " ")
+	normalized = normalized:match("^%s*(.-)%s*$") or normalized
+	if normalized == "dummy" then
+		RuntimeUtil.telemetry("TARGET_DUMMY_" .. model:GetDebugId(), "reject=dummy")
+		return true
+	end
 	for _, keyword in ipairs(Config.IgnoredTargetKeywords) do
 		if string.find(name, string.lower(keyword), 1, true) then
 			return true
@@ -1022,6 +1040,35 @@ local function registerHazard(instance: Instance)
 	end
 end
 
+RuntimeState.disableStaticWallCollision = function(instance: Instance)
+	if not instance:IsA("BasePart") or not instance:IsDescendantOf(workspace) or not instance.Anchored or not instance.CanCollide then
+		return
+	end
+	if
+		(Character and instance:IsDescendantOf(Character))
+		or isHazardCandidate(instance)
+		or hazardNameHint(instance)
+		or RuntimeState.hazardKind(instance) ~= nil
+	then
+		return
+	end
+	local owner = instance:FindFirstAncestorOfClass("Model")
+	if owner and (owner:FindFirstChildOfClass("Humanoid") or Services.Players:GetPlayerFromCharacter(owner)) then
+		return
+	end
+	local size = instance.Size
+	local horizontal = math.max(size.X, size.Z)
+	-- Only alter a clearly vertical, anchored obstruction. Flat parts remain
+	-- collision ground for navigation and arena support checks.
+	local verticalWall = size.Y >= 10 and size.Y >= horizontal * 0.75 and horizontal >= 1
+	local floorLike = size.Y <= horizontal * 0.35
+	if not verticalWall or floorLike then
+		return
+	end
+	instance.CanCollide = false
+	RuntimeUtil.telemetry("WALL_" .. instance:GetDebugId(), "collision-disabled part=" .. instance.Name)
+end
+
 local function buildInitialCaches(cacheRoot: Instance?)
 	-- A confirmed enemy folder is both cheaper and safer than re-walking an
 	-- entire replayed map. The workspace fallback remains for games that do
@@ -1033,8 +1080,11 @@ local function buildInitialCaches(cacheRoot: Instance?)
 	for _, object in ipairs(source:GetDescendants()) do
 		if object:IsA("Model") then
 			registerEnemy(object)
-		elseif Config.DodgeEnabled and object:IsA("BasePart") then
-			registerHazard(object)
+		elseif object:IsA("BasePart") then
+			RuntimeState.disableStaticWallCollision(object)
+			if Config.DodgeEnabled then
+				registerHazard(object)
+			end
 		end
 	end
 end
@@ -1420,7 +1470,9 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 				then math.max(0, edgeDistance) / approachingSpeed
 				else math.huge
 			local physicalRouteThreat = currentRouteClearance <= triggerPadding
-			local predictionAllowed = edgeDistance <= 40 and approachingSpeed > 0.5 and timeToImpact <= Config.DodgeLookaheadSeconds
+			local predictionAllowed = edgeDistance <= Config.DodgePredictionRange
+				and approachingSpeed > 0.5
+				and timeToImpact <= Config.DodgeLookaheadSeconds
 			local predictedRouteThreat = predictionAllowed and routeClearance <= triggerPadding
 			local nearbyThreat = edgeDistance <= Config.DodgePriorityRadius
 			local predicted = predictedRouteThreat or predictionAllowed
@@ -2905,6 +2957,17 @@ local function updateTargetFacing()
 	restoreRotation()
 end
 
+RuntimeState.combatCharacterCurrent = function(): boolean
+	return Character ~= nil
+		and Character == Player.Character
+		and Humanoid ~= nil
+		and Humanoid.Parent == Character
+		and Root ~= nil
+		and Root.Parent == Character
+		and Humanoid.Health > 0
+		and CombatState.BindSerial == CharacterBindSerial
+end
+
 local function sendKey(key: Enum.KeyCode)
 	pcall(function()
 		Services.VirtualInput:SendKeyEvent(true, key, false, game)
@@ -2966,27 +3029,34 @@ local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
 	-- Skill range is independent from the hold distance: cast as soon as a valid
 	-- target enters Q/E range, including while respawn-rushing or dodging.
-	if not Target or not validTarget(Target) or distance3D > activeSkillRange then
+	if not RuntimeState.combatCharacterCurrent() or not Target or not validTarget(Target) or distance3D > activeSkillRange then
 		return
 	end
 	local now = os.clock()
 	if now >= CombatState.NextQAt then
-		local minimum = math.max(0.1, Config.QCooldownMin)
-		local maximum = math.max(minimum, Config.QCooldownMax)
 		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
-			CombatState.NextQAt = now + minimum + math.random() * (maximum - minimum)
+			CombatState.NextQAt = now + Config.QCooldownMin
+			CombatState.QCastTime = now
+			CombatState.EAllowedUntil = now + 4.5
+			RuntimeUtil.telemetry("COMBAT_Q", "Q")
 		end
+	end
+	if now > CombatState.EAllowedUntil then
+		RuntimeUtil.telemetry("COMBAT_E_BLOCKED", "E-blocked reason=no-q-window")
+		return
 	end
 	if now >= CombatState.NextEAt then
 		if activateSkill(Config.SkillEToolName, Enum.KeyCode.E) then
-			CombatState.NextEAt = now + math.max(0.1, Config.ECooldown)
+			CombatState.NextEAt = now + Config.ECooldown
+			RuntimeUtil.telemetry("COMBAT_E", "E")
 		end
 	end
 end
 
 local function useNormalAttack(distance3D: number)
 	if
-		not validTarget(Target)
+		not RuntimeState.combatCharacterCurrent()
+		or not validTarget(Target)
 		or distance3D > Config.AttackRange
 		or os.clock() - CombatState.LastAttack < Config.AttackCooldown
 	then
@@ -3770,6 +3840,9 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.LastFallbackTargetScanAt = -math.huge
 	NoTargetSince = now
 	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
+	CombatState.QCastTime = 0
+	CombatState.EAllowedUntil = 0
+	CombatState.BindSerial = CharacterBindSerial
 	State = NavigationState.IDLE
 	stopTranslation()
 	table.clear(EnemySet)
@@ -4221,7 +4294,7 @@ local function replayBlocksRecovery(): boolean
 	return phase == "OPENING" or phase == "CONFIRMING" or phase == "WAIT_NEW_ROUND"
 end
 
-local function recoveryAbortReason(): string?
+local function recoveryAbortReason(allowRespawnGrace: boolean?): string?
 	if not RuntimeUtil.isCurrentExecution() then
 		return "shutdown"
 	end
@@ -4231,7 +4304,7 @@ local function recoveryAbortReason(): string?
 	if replayBlocksRecovery() then
 		return "replay=" .. RuntimeState.ReplayPhase
 	end
-	if os.clock() < RuntimeState.RespawnRushUntil then
+	if not allowRespawnGrace and os.clock() < RuntimeState.RespawnRushUntil then
 		return "respawn-grace"
 	end
 	if cachedStartScreen() then
@@ -4244,9 +4317,10 @@ recoverByRespawn = function(
 	expectedTarget: Model?,
 	expectedProgressAt: number?,
 	exploreRecovery: boolean?,
-	globalStuckAt: number?
+	globalStuckAt: number?,
+	verticalRecovery: boolean?
 )
-	if RespawnInProgress or recoveryAbortReason() then
+	if RespawnInProgress or recoveryAbortReason(verticalRecovery) then
 		return
 	end
 	RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
@@ -4272,17 +4346,23 @@ recoverByRespawn = function(
 			releaseRecoveryIfOwned()
 			return
 		end
-		local abortReason = recoveryAbortReason()
+		local abortReason = recoveryAbortReason(verticalRecovery)
 		if abortReason then
 			print("[RECOVERY] abort=" .. abortReason)
 			releaseRecoveryIfOwned()
 			return
 		end
 		if expectedTarget then
+			local expectedRoot = getTargetRoot(expectedTarget)
 			if State == NavigationState.DODGE
 				or Target ~= expectedTarget
-				or ProgressState.LastMeaningfulAt ~= expectedProgressAt
-				or os.clock() - ProgressState.LastMeaningfulAt < Config.RespawnStuckTime
+				or not Root
+				or not expectedRoot
+				or (verticalRecovery and expectedRoot.Position.Y - Root.Position.Y <= 75)
+				or (not verticalRecovery and (
+					ProgressState.LastMeaningfulAt ~= expectedProgressAt
+					or os.clock() - ProgressState.LastMeaningfulAt < Config.RespawnStuckTime
+				))
 			then
 				releaseRecoveryIfOwned()
 				return
@@ -4306,13 +4386,15 @@ recoverByRespawn = function(
 			return
 		end
 		ResetExecuting = true
-		print("[RECOVERY] reason=stuck")
+		local recoveryReason = if verticalRecovery then "vertical" else "stuck"
+		print("[RECOVERY] reason=" .. recoveryReason)
 		local recoveryTargetRoot = Target and getTargetRoot(Target)
 		local recoveryDistance = recoveryTargetRoot and Root and (recoveryTargetRoot.Position - Root.Position).Magnitude
 		RuntimeUtil.telemetry(
 			"RECOVERY",
 			string.format(
-				"reason=stuck state=%s owner=%s target=%s distance=%s stuckFor=%.1f",
+				"reason=%s state=%s owner=%s target=%s distance=%s stuckFor=%.1f",
+				recoveryReason,
 				State,
 				State,
 				Target and Target.Name or "nil",
@@ -4338,7 +4420,7 @@ recoverByRespawn = function(
 				or not Running
 				or Character ~= resetCharacter
 				or State == NavigationState.DODGE
-				or recoveryAbortReason()
+				or recoveryAbortReason(verticalRecovery)
 			then
 				releaseRecoveryIfOwned()
 				return
@@ -4552,6 +4634,18 @@ local function updateTargetAndObjective()
 		end
 	end
 	local distance3D = (enemyRoot.Position - Root.Position).Magnitude
+	local verticalDelta = enemyRoot.Position.Y - Root.Position.Y
+	if
+		verticalDelta > 75
+		and not RespawnInProgress
+		and not RuntimeState.RoundTransitionActive
+		and not cachedStartScreen()
+		and not replayBlocksRecovery()
+	then
+		RuntimeUtil.telemetry("RECOVERY_VERTICAL", string.format("reason=vertical deltaY=%.1f", verticalDelta))
+		recoverByRespawn(Target, ProgressState.LastMeaningfulAt, nil, nil, true)
+		return
+	end
 	if targetRootIsStabilizing(Target, enemyRoot, now) then
 		-- A newly spawned enemy can rise several studs while its horizontal position
 		-- is already visible. Do not path to the underground snapshot or retreat from
@@ -4575,7 +4669,7 @@ local function updateTargetAndObjective()
 	-- the same approach/kite bands below must start as soon as the new root binds.
 	local bossPolicy = bossPolicyForTarget(Target)
 	if not bossPolicy then
-		if distance3D < Config.NormalKiteRetreatDistance then
+		if distance3D <= Config.NormalKiteRetreatDistance then
 			if
 				RuntimeState.KiteMode == "RETREAT_DIAGONAL"
 				and RuntimeState.KiteGoal
@@ -4599,30 +4693,13 @@ local function updateTargetAndObjective()
 				updateProgressTracking()
 				return
 			end
-		elseif distance3D <= Config.NormalKiteApproachDistance then
-			if
-				RuntimeState.KiteMode == "FORWARD_DIAGONAL"
-				and RuntimeState.KiteGoal
-				and now - LastGoalRefreshAt < Config.GoalRefreshInterval
-				and directRouteClear(RuntimeState.KiteGoal, Target)
-				and pointIsSafeFromHazards(RuntimeState.KiteGoal)
-				and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
-			then
-				NavigationGoal = RuntimeState.KiteGoal
-				setNavigationState(NavigationState.DIRECT)
-				updateProgressTracking()
-				return
-			end
-			LastGoalRefreshAt = now
-			local kiteGoal, kiteDirection = chooseKiteGoal(enemyRoot, false)
-			if kiteGoal and kiteDirection then
-				cancelPathRequest()
-				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = kiteGoal, kiteDirection, "FORWARD_DIAGONAL"
-				NavigationGoal = kiteGoal
-				setNavigationState(NavigationState.DIRECT)
-				updateProgressTracking()
-				return
-			end
+			-- Keep RETREAT as the single retry owner when the first diagonal probe
+			-- cannot choose a direction. updateRecoveryMovement uses the same
+			-- multi-candidate helper on this heartbeat instead of falling into COMBAT.
+			cancelPathRequest()
+			NavigationGoal = nil
+			setNavigationState(NavigationState.RETREAT)
+			return
 		end
 	elseif bossPolicy.Mode == "MIDGARDIAN" and distance3D <= 80 then
 		if
@@ -4822,6 +4899,9 @@ local function bindCharacter(character: Model)
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 	end
 	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
+	CombatState.QCastTime = 0
+	CombatState.EAllowedUntil = 0
+	CombatState.BindSerial = CharacterBindSerial
 	RespawnInProgress = false
 	ResetExecuting = false
 	NoTargetSince = os.clock()
@@ -4873,6 +4953,8 @@ local function bindCharacter(character: Model)
 				-- Keep recovery blocked throughout that hand-off: otherwise the delayed
 				-- death fallback can press reset again while bindCharacter is waiting.
 				RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
+				CombatState.EAllowedUntil = 0
+				CombatState.QCastTime = 0
 				RuntimeState.sendStatusWebhook("CHARACTER_DIED")
 				-- Do not discard a living enemy just because this character died.
 				-- CharacterAdded will immediately resume the same target when possible.
@@ -5202,6 +5284,14 @@ table.insert(
 				end
 			end)
 		end
+		if instance:IsA("BasePart") then
+			local executionGeneration = RuntimeState.Generation
+			task.defer(function()
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+					RuntimeState.disableStaticWallCollision(instance)
+				end
+			end)
+		end
 	end)
 )
 table.insert(
@@ -5276,6 +5366,9 @@ table.insert(
 		RuntimeState.LastRespawnRushPathProbeAt = -math.huge
 		RuntimeState.RespawnRushPathDirection = Vector3.zero
 		RuntimeState.RespawnRushPathClear = false
+		CombatState.EAllowedUntil = 0
+		CombatState.QCastTime = 0
+		CombatState.BindSerial = 0
 		-- A recovery operation belongs to the old character. Invalidate it before
 		-- the new bind so it cannot reset or hold this respawn in place.
 		RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
