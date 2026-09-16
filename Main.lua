@@ -3072,9 +3072,11 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 end
 
 local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
-	-- Q is a self-buff. It belongs to the existing combat scheduler, but has no
-	-- target or range dependency. E remains target/range dependent below.
 	if not Running or not RuntimeUtil.isCurrentExecution() or not RuntimeState.combatCharacterCurrent() then
+		return
+	end
+	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
+	if not Target or not validTarget(Target) or not enemyRoot or not distance3D or distance3D > activeSkillRange then
 		return
 	end
 	local now = os.clock()
@@ -3086,12 +3088,11 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 			RuntimeUtil.telemetry("COMBAT_Q", "Q")
 		end
 	end
-	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
-	if not Target or not validTarget(Target) or not enemyRoot or not distance3D or distance3D > activeSkillRange then
-		return
-	end
 	if now > CombatState.EAllowedUntil then
 		RuntimeUtil.telemetry("COMBAT_E_BLOCKED", "E-blocked reason=no-q-window")
+		return
+	end
+	if now - CombatState.QCastTime < 0.5 then
 		return
 	end
 	if now >= CombatState.NextEAt then
