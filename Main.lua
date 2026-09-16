@@ -41,9 +41,9 @@ local DEFAULT_CONFIG = {
 	KiteDistance = 75,
 	KiteHysteresis = 3,
 	AttackCooldown = 0.12,
-	QCooldownMin = 6,
-	QCooldownMax = 6,
-	ECooldown = 6,
+	QCooldownMin = 0.3,
+	QCooldownMax = 0.5,
+	ECooldown = 0.4,
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
@@ -200,9 +200,9 @@ Config.BossSkillRange = 100
 Config.NormalKiteApproachDistance = 75
 Config.NormalKiteRetreatDistance = 75
 Config.KiteDistance = 75
-Config.QCooldownMin = 6
-Config.QCooldownMax = 6
-Config.ECooldown = 6
+Config.QCooldownMin = 0.3
+Config.QCooldownMax = 0.5
+Config.ECooldown = 0.4
 Config.DodgePredictionRange = 30
 Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
@@ -316,8 +316,6 @@ local CombatState = {
 	LastAttack = 0,
 	NextQAt = 0,
 	NextEAt = 0,
-	QCastTime = 0,
-	EAllowedUntil = 0,
 	BindSerial = 0,
 }
 local TargetDiedConnection: RBXScriptConnection? = nil
@@ -3081,23 +3079,16 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 	end
 	local now = os.clock()
 	if now >= CombatState.NextQAt then
+		local minimum = math.max(0.1, Config.QCooldownMin)
+		local maximum = math.max(minimum, Config.QCooldownMax)
 		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
-			CombatState.NextQAt = now + Config.QCooldownMin
-			CombatState.QCastTime = now
-			CombatState.EAllowedUntil = now + 4.5
+			CombatState.NextQAt = now + minimum + math.random() * (maximum - minimum)
 			RuntimeUtil.telemetry("COMBAT_Q", "Q")
 		end
 	end
-	if now > CombatState.EAllowedUntil then
-		RuntimeUtil.telemetry("COMBAT_E_BLOCKED", "E-blocked reason=no-q-window")
-		return
-	end
-	if now - CombatState.QCastTime < 0.5 then
-		return
-	end
 	if now >= CombatState.NextEAt then
 		if activateSkill(Config.SkillEToolName, Enum.KeyCode.E) then
-			CombatState.NextEAt = now + Config.ECooldown
+			CombatState.NextEAt = now + math.max(0.1, Config.ECooldown)
 			RuntimeUtil.telemetry("COMBAT_E", "E")
 		end
 	end
@@ -3890,8 +3881,6 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.LastFallbackTargetScanAt = -math.huge
 	NoTargetSince = now
 	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
-	CombatState.QCastTime = 0
-	CombatState.EAllowedUntil = 0
 	CombatState.BindSerial = CharacterBindSerial
 	State = NavigationState.IDLE
 	stopTranslation()
@@ -4955,8 +4944,6 @@ local function bindCharacter(character: Model)
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 	end
 	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
-	CombatState.QCastTime = 0
-	CombatState.EAllowedUntil = 0
 	CombatState.BindSerial = CharacterBindSerial
 	RespawnInProgress = false
 	ResetExecuting = false
@@ -5009,8 +4996,6 @@ local function bindCharacter(character: Model)
 				-- Keep recovery blocked throughout that hand-off: otherwise the delayed
 				-- death fallback can press reset again while bindCharacter is waiting.
 				RuntimeState.RespawnRushUntil = os.clock() + Config.RespawnRushDuration
-				CombatState.EAllowedUntil = 0
-				CombatState.QCastTime = 0
 				RuntimeState.sendStatusWebhook("CHARACTER_DIED")
 				-- Do not discard a living enemy just because this character died.
 				-- CharacterAdded will immediately resume the same target when possible.
@@ -5423,8 +5408,6 @@ table.insert(
 		RuntimeState.LastRespawnRushPathProbeAt = -math.huge
 		RuntimeState.RespawnRushPathDirection = Vector3.zero
 		RuntimeState.RespawnRushPathClear = false
-		CombatState.EAllowedUntil = 0
-		CombatState.QCastTime = 0
 		CombatState.BindSerial = 0
 		-- A recovery operation belongs to the old character. Invalidate it before
 		-- the new bind so it cannot reset or hold this respawn in place.
