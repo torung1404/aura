@@ -605,6 +605,9 @@ local function normalizedInstanceName(instance: Instance): string
 end
 
 local BossPolicies = {
+	["crystal golem"] = { Mode = "STANDARD", SkillRange = 100 },
+	["ancient enchanted tree"] = { Mode = "STANDARD", SkillRange = 100 },
+	["enchanted forest dragon"] = { Mode = "STANDARD", SkillRange = 100 },
 	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 80 },
 	["bob"] = { Mode = "BOB", SkillRange = 90 },
 	["bob the frost giant"] = { Mode = "BOB", SkillRange = 90 },
