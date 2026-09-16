@@ -462,6 +462,10 @@ local RuntimeState = {
 	DirectRouteCacheOrigin = nil :: Vector3?,
 	DirectRouteCacheDirection = Vector3.zero,
 	DirectRouteCacheResult = false,
+	WallProcessedRoot = nil :: Instance?,
+	WallProcessedRound = -1,
+	WallDiagnosticRoot = nil :: Instance?,
+	WallDiagnosticSamples = 0,
 }
 
 local UIState = {
@@ -1040,33 +1044,78 @@ local function registerHazard(instance: Instance)
 	end
 end
 
-RuntimeState.disableStaticWallCollision = function(instance: Instance)
-	if not instance:IsA("BasePart") or not instance:IsDescendantOf(workspace) or not instance.Anchored or not instance.CanCollide then
+RuntimeState.wallDiagnostic = function(instance: BasePart, action: string, reason: string)
+	if not Config.DebugTelemetry or RuntimeState.WallDiagnosticSamples >= 12 then
 		return
 	end
+	RuntimeState.WallDiagnosticSamples += 1
+	RuntimeUtil.telemetry(
+		"WALL_" .. instance:GetDebugId(),
+		string.format("%s part=%s path=%s reason=%s", action, instance.Name, instance:GetFullName(), reason)
+	)
+end
+
+RuntimeState.disableStaticWallCollision = function(instance: Instance): boolean
+	if not instance:IsA("BasePart") or not instance:IsDescendantOf(workspace) or not instance.Anchored or not instance.CanCollide then
+		return false
+	end
+	if Character and instance:IsDescendantOf(Character) then
+		RuntimeState.wallDiagnostic(instance, "keep", "character")
+		return false
+	end
+	if isHazardCandidate(instance) or hazardNameHint(instance) or RuntimeState.hazardKind(instance) ~= nil then
+		RuntimeState.wallDiagnostic(instance, "keep", "hazard")
+		return false
+	end
 	if
-		(Character and instance:IsDescendantOf(Character))
-		or isHazardCandidate(instance)
-		or hazardNameHint(instance)
-		or RuntimeState.hazardKind(instance) ~= nil
+		instance:FindFirstChildWhichIsA("ClickDetector")
+		or instance:FindFirstChildWhichIsA("ProximityPrompt")
+		or instance:FindFirstChildWhichIsA("TouchTransmitter")
 	then
-		return
+		RuntimeState.wallDiagnostic(instance, "keep", "gameplay-interactable")
+		return false
 	end
 	local owner = instance:FindFirstAncestorOfClass("Model")
 	if owner and (owner:FindFirstChildOfClass("Humanoid") or Services.Players:GetPlayerFromCharacter(owner)) then
-		return
+		RuntimeState.wallDiagnostic(instance, "keep", "humanoid-model")
+		return false
 	end
 	local size = instance.Size
 	local horizontal = math.max(size.X, size.Z)
-	-- Only alter a clearly vertical, anchored obstruction. Flat parts remain
-	-- collision ground for navigation and arena support checks.
-	local verticalWall = size.Y >= 10 and size.Y >= horizontal * 0.75 and horizontal >= 1
-	local floorLike = size.Y <= horizontal * 0.35
-	if not verticalWall or floorLike then
-		return
+	local upFacing = math.abs(instance.CFrame.UpVector:Dot(Vector3.yAxis)) >= 0.55
+	-- Preserve broad up-facing surfaces, including slopes and arena platforms.
+	-- Collision is only removed from anchored map geometry that blocks traversal
+	-- without presenting a reasonable support surface.
+	local floorLike = upFacing and horizontal >= 4 and horizontal >= size.Y * 1.25
+	if floorLike then
+		RuntimeState.wallDiagnostic(instance, "keep", "floor-support")
+		return false
+	end
+	if math.max(size.X, size.Y, size.Z) < 2 then
+		RuntimeState.wallDiagnostic(instance, "keep", "small-uncertain")
+		return false
 	end
 	instance.CanCollide = false
-	RuntimeUtil.telemetry("WALL_" .. instance:GetDebugId(), "collision-disabled part=" .. instance.Name)
+	RuntimeState.wallDiagnostic(instance, "disable", "static-non-ground-obstruction")
+	return true
+end
+
+RuntimeState.processStaticWallRoot = function(root: Instance?)
+	if not root or not root:IsDescendantOf(workspace) then
+		return
+	end
+	if RuntimeState.WallProcessedRoot == root and RuntimeState.WallProcessedRound == RuntimeState.RoundResetSerial then
+		return
+	end
+	RuntimeState.WallProcessedRoot = root
+	RuntimeState.WallProcessedRound = RuntimeState.RoundResetSerial
+	RuntimeState.WallDiagnosticRoot = root
+	RuntimeState.WallDiagnosticSamples = 0
+	for _, object in ipairs(root:GetDescendants()) do
+		if object:IsA("BasePart") then
+			RuntimeState.disableStaticWallCollision(object)
+		end
+	end
 end
 
 local function buildInitialCaches(cacheRoot: Instance?)
@@ -1080,11 +1129,8 @@ local function buildInitialCaches(cacheRoot: Instance?)
 	for _, object in ipairs(source:GetDescendants()) do
 		if object:IsA("Model") then
 			registerEnemy(object)
-		elseif object:IsA("BasePart") then
-			RuntimeState.disableStaticWallCollision(object)
-			if Config.DodgeEnabled then
-				registerHazard(object)
-			end
+		elseif Config.DodgeEnabled and object:IsA("BasePart") then
+			registerHazard(object)
 		end
 	end
 end
@@ -3025,11 +3071,10 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 	return ok
 end
 
-local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
-	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
-	-- Skill range is independent from the hold distance: cast as soon as a valid
-	-- target enters Q/E range, including while respawn-rushing or dodging.
-	if not RuntimeState.combatCharacterCurrent() or not Target or not validTarget(Target) or distance3D > activeSkillRange then
+local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
+	-- Q is a self-buff. It belongs to the existing combat scheduler, but has no
+	-- target or range dependency. E remains target/range dependent below.
+	if not Running or not RuntimeUtil.isCurrentExecution() or not RuntimeState.combatCharacterCurrent() then
 		return
 	end
 	local now = os.clock()
@@ -3040,6 +3085,10 @@ local function useCombatSkills(enemyRoot: BasePart, distance3D: number)
 			CombatState.EAllowedUntil = now + 4.5
 			RuntimeUtil.telemetry("COMBAT_Q", "Q")
 		end
+	end
+	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
+	if not Target or not validTarget(Target) or not enemyRoot or not distance3D or distance3D > activeSkillRange then
+		return
 	end
 	if now > CombatState.EAllowedUntil then
 		RuntimeUtil.telemetry("COMBAT_E_BLOCKED", "E-blocked reason=no-q-window")
@@ -3854,6 +3903,10 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.PreviousDungeonFinishedInstance = nil
 	RuntimeState.DungeonFinishedLastState = false
 	RuntimeState.ActiveDungeonRoot = nil
+	RuntimeState.WallProcessedRoot = nil
+	RuntimeState.WallProcessedRound = -1
+	RuntimeState.WallDiagnosticRoot = nil
+	RuntimeState.WallDiagnosticSamples = 0
 	RuntimeState.FightingBossInstance = nil
 	RuntimeState.EnemyFolderInstance = nil
 	RuntimeState.DungeonTimeInstance = nil
@@ -3916,6 +3969,7 @@ resetRuntimeForNewDungeon = function()
 		print("[ROUND] bootstrap attempt=" .. tostring(RuntimeState.RoundBootstrapAttempts))
 		RuntimeState.refreshDungeonReferences()
 		local enemyFolder = RuntimeState.EnemyFolderInstance
+		local activeDungeonRoot = RuntimeState.ActiveDungeonRoot
 		local startMarker = cachedStartScreen()
 		if enemyFolder and enemyFolder:IsDescendantOf(workspace) and attemptNow - RuntimeState.RoundBootstrapLastCacheAt >= 1 then
 			-- The bounded cache refresh covers late enemy replication; events keep
@@ -3923,6 +3977,7 @@ resetRuntimeForNewDungeon = function()
 			RuntimeState.RoundBootstrapLastCacheAt = attemptNow
 			buildInitialCaches(enemyFolder)
 		end
+		RuntimeState.processStaticWallRoot(activeDungeonRoot)
 		LastTargetAcquireAt = -math.huge
 		if alive() and not Target then
 			local acquired = acquireBestTarget()
@@ -5284,7 +5339,8 @@ table.insert(
 				end
 			end)
 		end
-		if instance:IsA("BasePart") then
+		local wallRoot = RuntimeState.ActiveDungeonRoot
+		if instance:IsA("BasePart") and wallRoot and instance:IsDescendantOf(wallRoot) then
 			local executionGeneration = RuntimeState.Generation
 			task.defer(function()
 				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
@@ -5426,7 +5482,10 @@ table.insert(
 local startupGeneration = RuntimeState.Generation
 task.defer(function()
 	if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == startupGeneration then
-		buildInitialCaches()
+		RuntimeState.refreshDungeonReferences()
+		local enemyFolder = RuntimeState.EnemyFolderInstance
+		buildInitialCaches(enemyFolder)
+		RuntimeState.processStaticWallRoot(RuntimeState.ActiveDungeonRoot or workspace)
 	end
 end)
 print("[AF] startup complete")
@@ -5516,13 +5575,11 @@ table.insert(
 		local dodgeOwnsTranslation = updateDodgeController()
 		telemetryMovementOwner(dodgeOwnsTranslation and "DODGE" or State)
 		updateTargetFacing()
-		if Target and validTarget(Target) then
-			local enemyRoot = getTargetRoot(Target)
-			if enemyRoot and Root then
-				local distance = (enemyRoot.Position - Root.Position).Magnitude
-				useCombatSkills(enemyRoot, distance)
-				useNormalAttack(distance)
-			end
+		local enemyRoot = Target and validTarget(Target) and getTargetRoot(Target) or nil
+		local distance = enemyRoot and Root and (enemyRoot.Position - Root.Position).Magnitude or nil
+		useCombatSkills(enemyRoot, distance)
+		if enemyRoot and distance then
+			useNormalAttack(distance)
 		end
 		if dodgeOwnsTranslation then
 			return
