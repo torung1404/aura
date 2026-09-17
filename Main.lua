@@ -5369,6 +5369,7 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 	end
 	local forward = toEnemy.Unit
 	local right = Vector3.new(-forward.Z, 0, forward.X)
+	local now = os.clock()
 	local orbitCorrection = Vector3.zero
 	if lateralOnly and Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN" then
 		if Root.Position.X <= -633 then orbitCorrection += Vector3.xAxis end
@@ -5404,26 +5405,45 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 		local bestScore = -math.huge
 		for _, candidate in ipairs(candidates) do
 			local direction = candidate.Direction
-			local proposed = Root.Position + direction * distance
-			local grounded, foundGround = projectToWalkableGround(proposed, Target)
-			if
-				foundGround
-				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-				and hasGroundSupport(grounded, Target)
-				and directRouteClear(grounded, Target)
-				and pointIsSafeFromHazards(grounded)
-				and kiteRouteIsSafeFromHazards(grounded)
-			then
-				local continuity = RuntimeState.KiteDirection.Magnitude > 0.1
-					and RuntimeState.KiteDirection:Dot(direction)
-					or 0
-				local progress = lateralOnly and 0 or forward:Dot(direction) * (retreat and -1 or 1)
-				local score = progress * 4 + continuity
-				if score > bestScore then
-					bestGoal, bestDirection, bestScore = grounded, direction, score
+			local recentlyBlocked = retreat
+				and now < RuntimeState.LocalBlockedUntil
+				and RuntimeState.LocalBlockedDirection.Magnitude > 0.1
+				and RuntimeState.LocalBlockedDirection:Dot(direction) >= 0.92
+			if not recentlyBlocked then
+				local proposed = Root.Position + direction * distance
+				local grounded, foundGround = projectToWalkableGround(proposed, Target)
+				if
+					foundGround
+					and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+					and hasGroundSupport(grounded, Target)
+					and directRouteClear(grounded, Target)
+					and pointIsSafeFromHazards(grounded)
+					and kiteRouteIsSafeFromHazards(grounded)
+				then
+					local continuity = RuntimeState.KiteDirection.Magnitude > 0.1
+						and RuntimeState.KiteDirection:Dot(direction)
+						or 0
+					local progress = lateralOnly and 0 or forward:Dot(direction) * (retreat and -1 or 1)
+					local score = progress * 4 + continuity
+					if retreat then
+						-- Back-left/back-right are the real S+A/S+D policy. The short
+						-- clearance probe breaks their tie toward the side farther from a
+						-- wall; pure S stays a final fallback only.
+						local sidePreference = if candidate.Label == "back-left" or candidate.Label == "back-right"
+							then 8
+							elseif candidate.Label == "left" or candidate.Label == "right"
+							then 2
+							else -8
+						score = sidePreference + rayClearance(Root.Position, direction, Target) * 0.35 + continuity * 2
+					end
+					if score > bestScore then
+						bestGoal, bestDirection, bestScore = grounded, direction, score
+					end
+				else
+					RuntimeUtil.telemetry("KITE_" .. candidate.Label, "mode=" .. (lateralOnly and "orbit" or retreat and "retreat" or "approach") .. " candidate=" .. candidate.Label .. " status=blocked")
 				end
 			else
-				RuntimeUtil.telemetry("KITE_" .. candidate.Label, "mode=" .. (lateralOnly and "orbit" or retreat and "retreat" or "approach") .. " candidate=" .. candidate.Label .. " status=blocked")
+				RuntimeUtil.telemetry("KITE_" .. candidate.Label, "mode=retreat candidate=" .. candidate.Label .. " status=recently-blocked")
 			end
 		end
 		if bestGoal and bestDirection then
@@ -5435,20 +5455,39 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 		-- Keep local combat spacing alive even when no full 8/12/16-stud goal can
 		-- be built. A short validated vector is enough to start S+A/S+D movement;
 		-- the next evaluation can promote it to a normal goal or switch sides.
+		local fallbackDirection: Vector3? = nil
+		local fallbackScore = -math.huge
 		for _, candidate in ipairs(candidates) do
-			local probe = Root.Position + candidate.Direction * 3
-			local grounded, foundGround = projectToWalkableGround(probe, Target)
-			if
-				foundGround
-				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-				and hasGroundSupport(grounded, Target)
-				and directRouteClear(grounded, Target)
-				and pointIsSafeFromHazards(grounded)
-				and kiteRouteIsSafeFromHazards(grounded)
-			then
-				RuntimeUtil.telemetry("KITE_CHOOSE", "mode=retreat choose=short-vector")
-				return nil, candidate.Direction
+			local direction = candidate.Direction
+			local recentlyBlocked = now < RuntimeState.LocalBlockedUntil
+				and RuntimeState.LocalBlockedDirection.Magnitude > 0.1
+				and RuntimeState.LocalBlockedDirection:Dot(direction) >= 0.92
+			if not recentlyBlocked then
+				local probe = Root.Position + direction * 3
+				local grounded, foundGround = projectToWalkableGround(probe, Target)
+				if
+					foundGround
+					and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+					and hasGroundSupport(grounded, Target)
+					and directRouteClear(grounded, Target)
+					and pointIsSafeFromHazards(grounded)
+					and kiteRouteIsSafeFromHazards(grounded)
+				then
+					local sidePreference = if candidate.Label == "back-left" or candidate.Label == "back-right"
+						then 8
+						elseif candidate.Label == "left" or candidate.Label == "right"
+						then 2
+						else -8
+					local score = sidePreference + rayClearance(Root.Position, direction, Target) * 0.35
+					if score > fallbackScore then
+						fallbackDirection, fallbackScore = direction, score
+					end
+				end
 			end
+		end
+		if fallbackDirection then
+			RuntimeUtil.telemetry("KITE_CHOOSE", "mode=retreat choose=short-vector")
+			return nil, fallbackDirection
 		end
 	end
 	return nil, nil
