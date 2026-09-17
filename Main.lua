@@ -4946,7 +4946,7 @@ local function updateTargetAndObjective()
 		return
 	end
 	local now = os.clock()
-	if tryStartDungeon() then
+	if tryStartDungeon() and not validTarget(Target) then
 		setNavigationState(NavigationState.IDLE)
 		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
@@ -5118,7 +5118,10 @@ local function updateTargetAndObjective()
 		recoverByRespawn(Target, ProgressState.LastMeaningfulAt, nil, nil, true)
 		return
 	end
-	if targetRootIsStabilizing(Target, enemyRoot, now) then
+	if
+		targetRootIsStabilizing(Target, enemyRoot, now)
+		and math.abs(enemyRoot.Position.Y - Root.Position.Y) > Config.DirectVerticalTolerance
+	then
 		-- A newly spawned enemy can rise several studs while its horizontal position
 		-- is already visible. Do not path to the underground snapshot or retreat from
 		-- a far target; retain the target and release as soon as its root settles.
