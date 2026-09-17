@@ -5056,6 +5056,61 @@ local function updateTargetAndObjective()
 			updateProgressTracking()
 			return
 		end
+	elseif bossPolicy.Mode == "BOB" then
+		-- Bob should keep a right-hand diagonal line rather than approach straight
+		-- and then become stationary at the combat ring. Far from Bob this is W+D;
+		-- at the hold distance it naturally becomes a safe D-style strafe.
+		if
+			RuntimeState.KiteMode == "BOB_DIAGONAL"
+			and RuntimeState.KiteGoal
+			and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+			and directRouteClear(RuntimeState.KiteGoal, Target)
+			and pointIsSafeFromHazards(RuntimeState.KiteGoal)
+			and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
+		then
+			NavigationGoal = RuntimeState.KiteGoal
+			setNavigationState(NavigationState.DIRECT)
+			updateProgressTracking()
+			return
+		end
+		LastGoalRefreshAt = now
+		local bobGoal = navigationGoalForTarget(enemyRoot, Target)
+		local toBob = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z)
+		if toBob.Magnitude > 0.1 then
+			local right = Vector3.new(-toBob.Z, 0, toBob.X).Unit
+			local candidate, foundCandidate = projectToWalkableGround(bobGoal + right * 8, Target)
+			if not (
+				foundCandidate
+				and math.abs(candidate.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+				and hasGroundSupport(candidate, Target)
+				and directRouteClear(candidate, Target)
+				and pointIsSafeFromHazards(candidate)
+				and kiteRouteIsSafeFromHazards(candidate)
+			) then
+				candidate, foundCandidate = projectToWalkableGround(bobGoal - right * 8, Target)
+			end
+			if
+				foundCandidate
+				and math.abs(candidate.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+				and hasGroundSupport(candidate, Target)
+				and directRouteClear(candidate, Target)
+				and pointIsSafeFromHazards(candidate)
+				and kiteRouteIsSafeFromHazards(candidate)
+			then
+				bobGoal = candidate
+			end
+		end
+		local bobDirection = Vector3.new(bobGoal.X - Root.Position.X, 0, bobGoal.Z - Root.Position.Z)
+		if bobDirection.Magnitude > Config.DirectReachedDistance then
+			cancelPathRequest()
+			RuntimeState.KiteGoal = bobGoal
+			RuntimeState.KiteDirection = bobDirection.Unit
+			RuntimeState.KiteMode = "BOB_DIAGONAL"
+			NavigationGoal = bobGoal
+			setNavigationState(NavigationState.DIRECT)
+			updateProgressTracking()
+			return
+		end
 	end
 	RuntimeState.KiteGoal = nil
 	RuntimeState.KiteDirection = Vector3.zero
