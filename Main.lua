@@ -818,6 +818,7 @@ local function specialSkillKind(part: BasePart): string?
 	while current and current ~= workspace do
 		local name = current.Name:lower()
 		if name:find("secondbosshorizontalbeam", 1, true) then return "HORIZONTAL_BEAM" end
+		if name:find("secondbosscirclehitbox", 1, true) then return "CIRCLE_HITBOX" end
 		if name:find("secondbossspreadbeam", 1, true) then return "SPREAD_BEAM" end
 		if name:find("secondbossmovingbeam", 1, true) then return "MOVING_BEAM" end
 		if name:find("groundaura", 1, true) then return "GROUND_AURA" end
@@ -912,8 +913,9 @@ local function hazardCandidateReason(part: BasePart): string?
 	-- HorizontalBeam is a confirmed runtime container. It must reach the
 	-- special lateral-response path even when its child Part is not red, thin,
 	-- or non-colliding enough for the generic visual classifier.
-	if specialSkillKind(part) == "HORIZONTAL_BEAM" then
-		return "known-horizontal-beam"
+	local specialKind = specialSkillKind(part)
+	if specialKind == "HORIZONTAL_BEAM" or specialKind == "CIRCLE_HITBOX" then
+		return "known-special-hitbox"
 	end
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
@@ -956,7 +958,8 @@ local function isActiveHazardPart(part: BasePart): boolean
 	if part.Size.X <= 0.05 or part.Size.Y <= 0.05 or part.Size.Z <= 0.05 then
 		return false
 	end
-	if specialSkillKind(part) == "HORIZONTAL_BEAM" then
+	local specialKind = specialSkillKind(part)
+	if specialKind == "HORIZONTAL_BEAM" or specialKind == "CIRCLE_HITBOX" then
 		return true
 	end
 	local color = part.Color
@@ -1207,10 +1210,10 @@ RuntimeState.hazardIsPrecast = function(part: BasePart): boolean
 end
 
 RuntimeState.hazardFutureCFrame = function(part: BasePart, lookaheadSeconds: number?): CFrame
-	local velocity = hazardVelocity(part)
-	local metadata = RuntimeState.HazardMetadata[part]
-	local baseCFrame = metadata and metadata.CFrame or part.CFrame
-	return baseCFrame + velocity * (lookaheadSeconds or 0)
+	-- Dodge currently evaluates only what exists at this instant. Keep the
+	-- function as a compatibility seam for cache/telemetry callers, but never
+	-- extrapolate a moving object into a future coordinate for movement decisions.
+	return part.CFrame
 end
 
 RuntimeState.hazardEdgeDistance = function(part: BasePart, position: Vector3, lookaheadSeconds: number?, padding: number?): number
@@ -1518,33 +1521,22 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 		if part:IsDescendantOf(workspace) and isCanonicalActiveHazard(part) then
 			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
 			local currentRouteClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint, 0)
-			local routeClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
+			local routeClearance = currentRouteClearance
 			local triggerPadding = if RuntimeState.hazardIsPrecast(part)
 				then Config.DodgePreTriggerPadding
 				else Config.DodgeTriggerPadding
-			local velocity = hazardVelocity(part)
-			local toPlayer = Vector3.new(Root.Position.X - part.Position.X, 0, Root.Position.Z - part.Position.Z)
-			local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
-			local approachingSpeed = if toPlayer.Magnitude > 0.1 then horizontalVelocity:Dot(toPlayer.Unit) else 0
-			local timeToImpact = if approachingSpeed > 0.5
-				then math.max(0, edgeDistance) / approachingSpeed
-				else math.huge
 			local physicalRouteThreat = currentRouteClearance <= triggerPadding
-			local predictionAllowed = edgeDistance <= Config.DodgePredictionRange
-				and approachingSpeed > 0.5
-				and timeToImpact <= Config.DodgeLookaheadSeconds
-			local predictedRouteThreat = predictionAllowed and routeClearance <= triggerPadding
 			local nearbyThreat = edgeDistance <= Config.DodgePriorityRadius
-			local predicted = predictedRouteThreat or predictionAllowed
+			local predicted = false
 			local retainingActiveDodge = State == NavigationState.DODGE
 				and edgeDistance <= Config.DodgeSafePadding
-			-- Nearby hazards win first. A farther one is allowed to interrupt only
-			-- when its predicted path actually intersects the current route.
-			local threatScore = math.min(edgeDistance, routeClearance, timeToImpact * 10)
+			-- Current geometry is authoritative: a hitbox must overlap the current
+			-- footprint or current route, never a velocity-extrapolated future route.
+			local threatScore = math.min(edgeDistance, routeClearance)
 			if
 				edgeDistance <= Config.DodgeDetectionRadius
-				and (nearbyThreat or physicalRouteThreat or predicted or retainingActiveDodge)
-				and (edgeDistance <= triggerPadding or physicalRouteThreat or predicted or retainingActiveDodge)
+				and (nearbyThreat or physicalRouteThreat or retainingActiveDodge)
+				and (edgeDistance <= triggerPadding or physicalRouteThreat or retainingActiveDodge)
 				and threatScore < bestThreatScore
 			then
 				bestThreatScore = threatScore
@@ -1586,7 +1578,8 @@ local function horizontalBeamThreat(): (BasePart?, boolean, number, number)
 			-- active nearby instance exists; it does not wait for the generic 50-stud
 			-- priority gate.
 			if bobIsCurrentTarget or edge <= Config.DodgePriorityRadius or route <= Config.DodgeTriggerPadding then
-				return part, route <= Config.DodgeTriggerPadding, edge, route
+				-- Route overlap is current geometry, not a predicted future impact.
+				return part, false, edge, route
 			end
 		end
 	end
@@ -1731,13 +1724,24 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 		end
 		table.insert(candidateDirections, { Direction = normalized, Label = label })
 	end
-	local beamSideOnly = specialSkillKind(hazard) == "HORIZONTAL_BEAM" or specialSkillKind(hazard) == "SPREAD_BEAM"
+	local specialMode = specialSkillKind(hazard)
+	local beamSideOnly = specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM"
 	if forwardDirection.Magnitude > 0.1 and beamSideOnly then
 		-- Bob's horizontal/spread sequences require a persistent A/D-style exit;
 		-- do not let target-progress scoring turn their first choice into a diagonal.
 		local rightDirection = Vector3.new(-forwardDirection.Z, 0, forwardDirection.X)
 		addCandidateDirection(-rightDirection, "left")
 		addCandidateDirection(rightDirection, "right")
+	elseif forwardDirection.Magnitude > 0.1 and specialMode == "CIRCLE_HITBOX" then
+		-- CircleHitbox exits are based on the current footprint only. Try the two
+		-- lateral/diagonal routes around the current boss line before generic exits.
+		local rightDirection = Vector3.new(-forwardDirection.Z, 0, forwardDirection.X)
+		local leftDirection = -rightDirection
+		addCandidateDirection(leftDirection, "left")
+		addCandidateDirection(rightDirection, "right")
+		addCandidateDirection(forwardDirection + leftDirection, "diagonal-left")
+		addCandidateDirection(forwardDirection + rightDirection, "diagonal-right")
+		addCandidateDirection(exitDirection, "exit")
 	elseif forwardDirection.Magnitude > 0.1 then
 		-- The approach basis is independent from the escape normal. A hazard's
 		-- outward direction is not guaranteed to be perpendicular to the target.
@@ -3757,10 +3761,10 @@ local function updateRecoveryMovement()
 		local enemyRoot = getTargetRoot(Target)
 		if enemyRoot then
 			local retreatGoal, retreatDirection = chooseKiteGoal(enemyRoot, true)
-			if retreatGoal and retreatDirection then
+			if retreatDirection then
 				RuntimeState.KiteGoal = retreatGoal
 				RuntimeState.KiteDirection = retreatDirection
-				RuntimeState.KiteMode = "RETREAT_DIAGONAL"
+				RuntimeState.KiteMode = if retreatGoal then "RETREAT_DIAGONAL" else "RETREAT_VECTOR"
 				Humanoid:Move(retreatDirection, false)
 			else
 				stopTranslation()
@@ -4265,8 +4269,28 @@ local function updateDodgeController(): boolean
 			and (targetRoot.Position - Root.Position).Magnitude > 120
 			and hazardAssociatedWithTarget(hazard, Target)
 		then
-			RuntimeUtil.telemetry("BOSS", "mode=midgardian prediction=ignored-far")
+			RuntimeUtil.telemetry("BOSS", "mode=midgardian hazard=ignored-far")
 			hazard = nil
+		end
+		if policy and policy.Mode == "MIDGARDIAN" and targetRoot and (targetRoot.Position - Root.Position).Magnitude <= 80 then
+			-- A current hitbox modifies Midgardian's orbit instead of replacing it
+			-- with an unrelated Dodge owner. The orbit helper already rejects current
+			-- hitbox overlap/route intersections and evaluates both tangents.
+			local orbitGoal, orbitDirection = chooseKiteGoal(targetRoot, false, true)
+			if orbitGoal and orbitDirection then
+				cancelPathRequest()
+				DodgeGoal = nil
+				RuntimeState.DodgeHoldUntil = 0
+				RuntimeState.DodgeCommitUntil = 0
+				RuntimeState.KiteGoal = orbitGoal
+				RuntimeState.KiteDirection = orbitDirection
+				RuntimeState.KiteMode = "ORBIT"
+				NavigationGoal = orbitGoal
+				ActiveHazard = hazard
+				setNavigationState(NavigationState.DIRECT)
+				RuntimeUtil.telemetry("BOSS", "mode=orbit hazard=current-integrated")
+				return false
+			end
 		end
 	end
 	if not hazard then
@@ -4850,7 +4874,7 @@ local function updateTargetAndObjective()
 		end)
 	end
 	NoTargetSince = nil
-	if State == NavigationState.DODGE then
+	if State == NavigationState.DODGE and not (bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN") then
 		return
 	end
 	if
@@ -5237,11 +5261,13 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 		then {
 			{ Direction = right, Label = "right" },
 			{ Direction = -right, Label = "left" },
+			{ Direction = (right - forward * 0.35).Unit, Label = "right-outward" },
+			{ Direction = (-right - forward * 0.35).Unit, Label = "left-outward" },
 		}
 		elseif retreat
 		then {
-			{ Direction = (-forward + right).Unit, Label = "back-right" },
 			{ Direction = (-forward - right).Unit, Label = "back-left" },
+			{ Direction = (-forward + right).Unit, Label = "back-right" },
 			{ Direction = right, Label = "right" },
 			{ Direction = -right, Label = "left" },
 			{ Direction = -forward, Label = "back" },
@@ -5284,6 +5310,26 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 		if bestGoal and bestDirection then
 			RuntimeUtil.telemetry("KITE_CHOOSE", string.format("mode=%s choose=%s dist=%d", lateralOnly and "orbit" or retreat and "retreat" or "approach", "safe", distance))
 			return bestGoal, bestDirection
+		end
+	end
+	if retreat then
+		-- Keep local combat spacing alive even when no full 8/12/16-stud goal can
+		-- be built. A short validated vector is enough to start S+A/S+D movement;
+		-- the next evaluation can promote it to a normal goal or switch sides.
+		for _, candidate in ipairs(candidates) do
+			local probe = Root.Position + candidate.Direction * 3
+			local grounded, foundGround = projectToWalkableGround(probe, Target)
+			if
+				foundGround
+				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
+				and hasGroundSupport(grounded, Target)
+				and directRouteClear(grounded, Target)
+				and pointIsSafeFromHazards(grounded)
+				and kiteRouteIsSafeFromHazards(grounded)
+			then
+				RuntimeUtil.telemetry("KITE_CHOOSE", "mode=retreat choose=short-vector")
+				return nil, candidate.Direction
+			end
 		end
 	end
 	return nil, nil
