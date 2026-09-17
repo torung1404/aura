@@ -4633,7 +4633,27 @@ local function runRecoveryPolicy()
 			RuntimeUtil.telemetry("RECOVERY", "retry=path-before-respawn")
 			return
 		end
-		if now - ProgressState.LastRecoveryEscalationAt >= Config.SlowMovementRepathCooldown and not RespawnInProgress then
+		if ProgressState.RecoveryEscalations == 1 and now - ProgressState.LastRecoveryEscalationAt >= Config.SlowMovementRepathCooldown then
+			-- The first escalation can still resolve to the same short detour. Before
+			-- resetting a living character, force one uncooldowned path request from
+			-- the current position and give its result time to publish and move.
+			ProgressState.RecoveryEscalations = 2
+			ProgressState.LastRecoveryEscalationAt = now
+			ProgressState.RecoveryGoal = nil
+			ProgressState.RecoveryUntil = 0
+			cancelPathRequest()
+			PathState.LastBuildAt = -math.huge
+			setNavigationState(NavigationState.PATH)
+			requestPath(NavigationGoal)
+			RuntimeUtil.telemetry("RECOVERY", "retry=forced-path-before-respawn")
+			return
+		end
+		if
+			ProgressState.RecoveryEscalations >= 2
+			and not PathState.Computing
+			and now - ProgressState.LastRecoveryEscalationAt >= Config.DetourDuration + Config.SlowMovementRepathCooldown
+			and not RespawnInProgress
+		then
 			recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
 		end
 		return
@@ -5131,7 +5151,16 @@ local function updateTargetAndObjective()
 		local toBob = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z)
 		if toBob.Magnitude > 0.1 then
 			local right = Vector3.new(-toBob.Z, 0, toBob.X).Unit
-			local candidate, foundCandidate = projectToWalkableGround(bobGoal + right * 8, Target)
+			local bobSkillRange = skillRangeForTarget(Target)
+			-- Keep the side that was used while approaching (W+A or W+D). Once Bob
+			-- is in range, drop the forward component and continue with pure A/D;
+			-- this avoids reversing through the boss just to maintain the hold ring.
+			local side = 1
+			if RuntimeState.KiteMode == "BOB_DIAGONAL" and RuntimeState.KiteDirection.Magnitude > 0.1 then
+				side = if RuntimeState.KiteDirection:Dot(right) >= 0 then 1 else -1
+			end
+			local sideOrigin = if distance3D <= bobSkillRange then Root.Position else bobGoal
+			local candidate, foundCandidate = projectToWalkableGround(sideOrigin + right * side * 8, Target)
 			if not (
 				foundCandidate
 				and math.abs(candidate.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
@@ -5140,7 +5169,8 @@ local function updateTargetAndObjective()
 				and pointIsSafeFromHazards(candidate)
 				and kiteRouteIsSafeFromHazards(candidate)
 			) then
-				candidate, foundCandidate = projectToWalkableGround(bobGoal - right * 8, Target)
+				side = -side
+				candidate, foundCandidate = projectToWalkableGround(sideOrigin + right * side * 8, Target)
 			end
 			if
 				foundCandidate
@@ -5151,6 +5181,7 @@ local function updateTargetAndObjective()
 				and kiteRouteIsSafeFromHazards(candidate)
 			then
 				bobGoal = candidate
+				RuntimeUtil.telemetry("BOSS", if distance3D <= bobSkillRange then "mode=bob-strafe" else "mode=bob-diagonal")
 			end
 		end
 		local bobDirection = Vector3.new(bobGoal.X - Root.Position.X, 0, bobGoal.Z - Root.Position.Z)
