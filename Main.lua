@@ -113,7 +113,7 @@ local DEFAULT_CONFIG = {
 	DescentRiseReleaseCount = 2,
 	DebugTelemetry = false,
 	AutoReplay = true,
-	AutoStart = false,
+	AutoStart = true,
 }
 
 local NavigationState = {
@@ -182,12 +182,16 @@ for key, defaultValue in pairs(DEFAULT_CONFIG) do
 		savedValue ~= nil
 		and type(savedValue) == type(defaultValue)
 		and (key ~= "DodgeEnabled" or savedDodgeSettingIsCurrent)
+		and (key ~= "AutoStart" or SavedConfig.AutoStartConfigVersion == 1)
 	then
 		Config[key] = savedValue
 	end
 end
 if not savedDodgeSettingIsCurrent then
 	Config.DodgeEnabled = DEFAULT_CONFIG.DodgeEnabled
+end
+if SavedConfig.AutoStartConfigVersion ~= 1 then
+	Config.AutoStart = DEFAULT_CONFIG.AutoStart
 end
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
@@ -249,6 +253,7 @@ local function saveConfig()
 		persisted.FarmEnabled = Config.FarmEnabled == true
 		persisted.DodgeEnabled = Config.DodgeEnabled == true
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
+		persisted.AutoStartConfigVersion = 1
 		persisted.NormalSkillRange = 75
 		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
