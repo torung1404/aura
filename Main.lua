@@ -429,6 +429,9 @@ local RuntimeState = {
 	CharacterBindRetryUntil = 0,
 	CharacterBindRetryPending = false,
 	CharacterBindRetryCharacter = nil :: Model?,
+	CharacterBindActiveCharacter = nil :: Model?,
+	CharacterBindTimeoutReported = false,
+	CharacterBindStartedAt = 0,
 	LastCharacterBindWait = "",
 	SmoothedFPS = 0,
 	HUDInfo = nil :: TextLabel?,
@@ -2497,14 +2500,11 @@ local function updateGlobalStuckJump()
 		RuntimeState.JumpBestVertical = math.min(RuntimeState.JumpBestVertical, vertical)
 		RuntimeState.JumpStillSince = now
 	elseif now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
-		-- Targeted navigation has a more specific watchdog below that can retry its
-		-- local detour/PATH fallback before a respawn. Do not let this generic
-		-- watchdog preempt that recovery in the first frame it becomes eligible.
-		if Target and NavigationGoal then
-			RuntimeState.JumpStillSince = now
-			RuntimeState.JumpBestDistance = math.huge
-			RuntimeState.JumpBestVertical = math.huge
-			RuntimeUtil.telemetry("RECOVERY", "global=defer-to-target-path")
+		-- A target/goal proves intent, not physical movement. Preserve the continuous
+		-- stalled episode and hand the targeted watchdog its original timestamp.
+		if Target and validTarget(Target) and NavigationGoal then
+			RuntimeUtil.telemetry("STUCK_HARD", "hard-respawn target=" .. Target.Name)
+			recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
 		else
 			recoverByRespawn(nil, nil, false, RuntimeState.JumpStillSince)
 		end
@@ -3029,6 +3029,11 @@ end
 local function tryStartDungeon(): boolean
 	local marker, cachedButton = cachedStartScreen()
 	if not marker then
+		return false
+	end
+	-- A late-replicating start GUI is not authority once this round has a live
+	-- target. Otherwise AutoExec can reacquire a target and immediately freeze it.
+	if not RuntimeState.AutoStartAwaitingReady and validTarget(Target) then
 		return false
 	end
 	if not Running or not Config.AutoStart or os.clock() - LastStartClickAt < 1 then
@@ -4670,40 +4675,10 @@ local function runRecoveryPolicy()
 	end
 	local stuckFor = now - ProgressState.LastMeaningfulAt
 	if stuckFor >= Config.RespawnStuckTime then
-		-- Give the controller one fresh local/path recovery pass before spending a
-		-- respawn. This does not reset the progress timestamp, so a real stall is
-		-- still visible to the watchdog and can escalate on the following pass.
-		if ProgressState.RecoveryEscalations == 0 then
-			ProgressState.RecoveryEscalations = 1
-			ProgressState.LastRecoveryEscalationAt = now
-			cancelPathRequest()
-			beginLocalRecovery(NavigationGoal)
-			RuntimeUtil.telemetry("RECOVERY", "retry=path-before-respawn")
-			return
-		end
-		if ProgressState.RecoveryEscalations == 1 and now - ProgressState.LastRecoveryEscalationAt >= Config.SlowMovementRepathCooldown then
-			-- The first escalation can still resolve to the same short detour. Before
-			-- resetting a living character, force one uncooldowned path request from
-			-- the current position and give its result time to publish and move.
-			ProgressState.RecoveryEscalations = 2
-			ProgressState.LastRecoveryEscalationAt = now
-			ProgressState.RecoveryGoal = nil
-			ProgressState.RecoveryUntil = 0
-			cancelPathRequest()
-			PathState.LastBuildAt = -math.huge
-			setNavigationState(NavigationState.PATH)
-			requestPath(NavigationGoal)
-			RuntimeUtil.telemetry("RECOVERY", "retry=forced-path-before-respawn")
-			return
-		end
-		if
-			ProgressState.RecoveryEscalations >= 2
-			and not PathState.Computing
-			and now - ProgressState.LastRecoveryEscalationAt >= Config.DetourDuration + Config.SlowMovementRepathCooldown
-			and not RespawnInProgress
-		then
-			recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
-		end
+		-- Local detours and path retries have already been allowed below the hard
+		-- deadline. Do not turn a configured twelve-second stall into 17+ seconds.
+		RuntimeUtil.telemetry("STUCK_HARD", string.format("hard-respawn target=%s age=%.1f", Target.Name, stuckFor))
+		recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
 		return
 	end
 	if stuckFor >= Config.RecoveryRefreshAt and now - ProgressState.LastStuckPathRetryAt >= Config.StuckPathRetryInterval then
@@ -4728,13 +4703,13 @@ local function recoveryAbortReason(allowRespawnGrace: boolean?): string?
 	if RuntimeState.RoundTransitionActive then
 		return "ROUND_TRANSITION"
 	end
-	if replayBlocksRecovery() then
+	if replayBlocksRecovery() and not validTarget(Target) then
 		return "replay=" .. RuntimeState.ReplayPhase
 	end
 	if not allowRespawnGrace and os.clock() < RuntimeState.RespawnRushUntil then
 		return "respawn-grace"
 	end
-	if cachedStartScreen() and alive() then
+	if cachedStartScreen() and alive() and not validTarget(Target) then
 		return "start-screen"
 	end
 	return nil
@@ -5024,11 +4999,24 @@ local function updateTargetAndObjective()
 		end
 	end
 	if RuntimeState.RoundTransitionActive then
+		-- A stale replay/GUI event may arrive after the new map is already usable.
+		-- Target/enemy evidence releases this owner immediately; the bounded reset
+		-- retry remains responsible only while references are genuinely unavailable.
+		RuntimeState.refreshDungeonReferences()
+		local transitionFolder = RuntimeState.EnemyFolderInstance
+		if validTarget(Target) or (transitionFolder and transitionFolder:IsDescendantOf(workspace)) then
+			RuntimeState.RoundTransitionActive = false
+			RuntimeState.RoundTransitionTimedOut = false
+			RuntimeState.ReplayPhase = "IDLE"
+			LastTargetAcquireAt = -math.huge
+			RuntimeUtil.telemetry("ROUND_READY", validTarget(Target) and "ready reason=target" or "ready reason=enemy-folder")
+		else
 		ProgressState.LastMeaningfulAt = now
 		ProgressState.LowSpeedSince = nil
 		setNavigationState(NavigationState.IDLE)
 		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
+		end
 	end
 	if not validTarget(Target) then
 		local invalidTarget = Target
@@ -5164,7 +5152,7 @@ local function updateTargetAndObjective()
 		end
 	end
 	if not bossPolicy then
-		if distance3D <= Config.NormalKiteRetreatDistance then
+		if distance3D < Config.NormalKiteRetreatDistance then
 			if
 				RuntimeState.KiteMode == "RETREAT_DIAGONAL"
 				and RuntimeState.KiteGoal
@@ -5197,7 +5185,7 @@ local function updateTargetAndObjective()
 			return
 		end
 		-- The normal-mob band has one authoritative boundary: at any distance
-		-- above 55, stale RETREAT/RECOVERY ownership must be released before the
+		-- at or above 55, stale RETREAT/RECOVERY ownership must be released before the
 		-- direct approach goal below is calculated.  The legacy 40/45 recovery
 		-- thresholds are not allowed to keep a mob at 75 in an avoidance state.
 		if
@@ -5421,12 +5409,17 @@ local function updateTargetAndObjective()
 end
 
 local function bindCharacter(character: Model)
-	CharacterBindSerial += 1
-	local serial = CharacterBindSerial
 	local now = os.clock()
-	if RuntimeState.CharacterBindRetryUntil < now then
+	if RuntimeState.CharacterBindActiveCharacter ~= character then
+		-- Retries for one replicated Character are one bind generation. Incrementing
+		-- this serial for every poll made delayed retries invalidate each other.
+		CharacterBindSerial += 1
+		RuntimeState.CharacterBindActiveCharacter = character
 		RuntimeState.CharacterBindRetryUntil = now + 8
+		RuntimeState.CharacterBindTimeoutReported = false
+		RuntimeState.CharacterBindStartedAt = now
 	end
+	local serial = CharacterBindSerial
 	local newHumanoid = character:FindFirstChildOfClass("Humanoid")
 	local newRoot = character:FindFirstChild("HumanoidRootPart")
 	if not RuntimeUtil.isCurrentExecution() or serial ~= CharacterBindSerial or Player.Character ~= character then
@@ -5436,33 +5429,44 @@ local function bindCharacter(character: Model)
 		local missing = (not newHumanoid and "Humanoid" or "") .. (not newRoot and " HumanoidRootPart" or "")
 		if RuntimeState.LastCharacterBindWait ~= missing then
 			RuntimeState.LastCharacterBindWait = missing
+			RuntimeUtil.telemetry("CHAR_BIND", string.format("bind-wait missing=%s age=%.1f", missing, now - RuntimeState.CharacterBindStartedAt))
 			print("[CHAR] bind waiting=" .. missing)
 		end
-		if now < RuntimeState.CharacterBindRetryUntil and not RuntimeState.CharacterBindRetryPending then
+		if now >= RuntimeState.CharacterBindRetryUntil and not RuntimeState.CharacterBindTimeoutReported then
+			RuntimeState.CharacterBindTimeoutReported = true
+			print("[CHAR] bind-timeout continuing-retry")
+		end
+		if not RuntimeState.CharacterBindRetryPending then
 			RuntimeState.CharacterBindRetryPending = true
 			RuntimeState.CharacterBindRetryCharacter = character
 			local executionGeneration = RuntimeState.Generation
-			task.delay(0.5, function()
-				if RuntimeState.CharacterBindRetryCharacter == character then
+			local retryDelay = if now < RuntimeState.CharacterBindRetryUntil then 0.5 else 1
+			task.delay(retryDelay, function()
+				local shouldRetry = RuntimeState.CharacterBindRetryCharacter == character
+				if shouldRetry then
 					RuntimeState.CharacterBindRetryPending = false
 					RuntimeState.CharacterBindRetryCharacter = nil
 				end
 				if
-					RuntimeUtil.isCurrentExecution()
+					shouldRetry
+					and RuntimeUtil.isCurrentExecution()
 					and RuntimeState.Generation == executionGeneration
+					and Running
 					and Player.Character == character
 				then
 					bindCharacter(character)
 				end
 			end)
-		else
-			print("[CHAR] bind timeout")
 		end
 		return
+	end
+	if RuntimeState.CharacterBindTimeoutReported then
+		RuntimeUtil.telemetry("CHAR_BIND", string.format("rebound-after-timeout age=%.1f", now - RuntimeState.CharacterBindStartedAt))
 	end
 	RuntimeState.CharacterBindRetryUntil = 0
 	RuntimeState.CharacterBindRetryPending = false
 	RuntimeState.CharacterBindRetryCharacter = nil
+	RuntimeState.CharacterBindTimeoutReported = false
 	RuntimeState.LastCharacterBindWait = ""
 	ConnectionUtil.disconnectAll(UIState.CharacterConnections)
 	clearAimObjects()
@@ -5498,6 +5502,9 @@ local function bindCharacter(character: Model)
 	CombatState.BindSerial = CharacterBindSerial
 	RespawnInProgress = false
 	ResetExecuting = false
+	RuntimeState.JumpStillSince = now
+	RuntimeState.JumpBestDistance = math.huge
+	RuntimeState.JumpBestVertical = math.huge
 	NoTargetSince = os.clock()
 	clearDodgeObjective()
 	-- Keep a living target through the player's own death. Its listener remains
@@ -6052,9 +6059,12 @@ table.insert(
 		RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
 		RespawnInProgress = false
 		ResetExecuting = false
+		RuntimeState.CharacterBindActiveCharacter = nil
 		RuntimeState.CharacterBindRetryUntil = os.clock() + 8
 		RuntimeState.CharacterBindRetryPending = false
 		RuntimeState.CharacterBindRetryCharacter = nil
+		RuntimeState.CharacterBindTimeoutReported = false
+		RuntimeState.CharacterBindStartedAt = os.clock()
 		RuntimeState.LastCharacterBindWait = ""
 		ConnectionUtil.disconnectAll(UIState.CharacterConnections)
 		clearAimObjects()
