@@ -3873,6 +3873,10 @@ local function updateRecoveryMovement()
 				RuntimeState.KiteDirection = retreatDirection
 				RuntimeState.KiteMode = if retreatGoal then "RETREAT_DIAGONAL" else "RETREAT_VECTOR"
 				Humanoid:Move(retreatDirection, false)
+			elseif RuntimeState.KiteMode == "RETREAT_VECTOR" and RuntimeState.KiteDirection.Magnitude > 0.1 then
+				-- Preserve the already validated fallback from this retreat episode
+				-- instead of converting a transient probe miss into zero movement.
+				Humanoid:Move(RuntimeState.KiteDirection, false)
 			else
 				stopTranslation()
 			end
@@ -5160,7 +5164,7 @@ local function updateTargetAndObjective()
 		end
 	end
 	if not bossPolicy then
-		if distance3D < Config.NormalKiteRetreatDistance then
+		if distance3D <= Config.NormalKiteRetreatDistance then
 			if
 				RuntimeState.KiteMode == "RETREAT_DIAGONAL"
 				and RuntimeState.KiteGoal
@@ -5182,6 +5186,15 @@ local function updateTargetAndObjective()
 				NavigationGoal = kiteGoal
 				setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
+				return
+			end
+			if kiteDirection then
+				-- The bounded probe found a usable local S+A/S+D vector but no full
+				-- NavigationGoal. Keep that vector as the retreat owner immediately.
+				cancelPathRequest()
+				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = nil, kiteDirection, "RETREAT_VECTOR"
+				NavigationGoal = nil
+				setNavigationState(NavigationState.RETREAT)
 				return
 			end
 			-- Keep RETREAT as the single retry owner when the first diagonal probe
@@ -5327,7 +5340,7 @@ local function updateTargetAndObjective()
 	RuntimeState.KiteGoal = nil
 	RuntimeState.KiteDirection = Vector3.zero
 	RuntimeState.KiteMode = ""
-	if State == NavigationState.RETREAT and distance3D >= Config.RetreatExitDistance then
+	if bossPolicy and State == NavigationState.RETREAT and distance3D >= Config.RetreatExitDistance then
 		-- RETREAT is valid only close to the current target. Never allow a stale
 		-- retreat owner to walk backward from a newly acquired or risen far target.
 		ProgressState.RecoveryGoal = nil
@@ -5335,17 +5348,17 @@ local function updateTargetAndObjective()
 		LastDirectDecisionAt = 0
 		setNavigationState(NavigationState.IDLE)
 	end
-	if State == NavigationState.RETREAT and distance3D < Config.RetreatExitDistance then
+	if bossPolicy and State == NavigationState.RETREAT and distance3D < Config.RetreatExitDistance then
 		cancelPathRequest()
 		NavigationGoal = nil
 		return
-	elseif distance3D < Config.RetreatEnterDistance then
+	elseif bossPolicy and distance3D < Config.RetreatEnterDistance then
 		cancelPathRequest()
 		NavigationGoal = nil
 		setNavigationState(NavigationState.RETREAT)
 		return
 	end
-	if distance3D <= Config.PreferredCombatDistance then
+	if bossPolicy and distance3D <= Config.PreferredCombatDistance then
 		-- Invalidate an in-flight ComputeAsync as well as any published path. Merely
 		-- disposing ActivePath would still allow the old callback to publish PATH.
 		if State ~= NavigationState.COMBAT or PathState.Computing or PathState.Active then
@@ -5638,8 +5651,8 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 		then {
 			{ Direction = (-forward - right).Unit, Label = "back-left" },
 			{ Direction = (-forward + right).Unit, Label = "back-right" },
-			{ Direction = right, Label = "right" },
 			{ Direction = -right, Label = "left" },
+			{ Direction = right, Label = "right" },
 			{ Direction = -forward, Label = "back" },
 		}
 		else {
