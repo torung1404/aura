@@ -26,20 +26,19 @@ local DEFAULT_CONFIG = {
 	TargetAcquireInterval = 1,
 	GoalRefreshInterval = 0.15,
 	TargetLockRangeMultiplier = 1.25,
-	PreferredCombatDistance = 75,
+	PreferredCombatDistance = 55,
 	RetreatEnterDistance = 40,
 	RetreatExitDistance = 45,
-	NormalKiteApproachDistance = 75,
-	NormalKiteRetreatDistance = 75,
+	NormalKiteApproachDistance = 55,
+	NormalKiteRetreatDistance = 55,
 	AttackRange = 15,
-	NormalSkillRange = 75,
+	NormalSkillRange = 56,
 	QSkillRange = 100,
-	BossSkillRange = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
 	RespawnRushDuration = 6,
 	HorizontalBeamGraceDuration = 3,
-	KiteDistance = 75,
+	KiteDistance = 55,
 	KiteHysteresis = 3,
 	AttackCooldown = 0.12,
 	QCooldownMin = 0.3,
@@ -85,13 +84,13 @@ local DEFAULT_CONFIG = {
 	DodgeDetectionRadius = 60,
 	DodgePriorityRadius = 50,
 	DodgePredictionRange = 30,
-	DodgeRefreshInterval = 0.12,
-	HazardSpatialFallbackInterval = 0.6,
+	DodgeRefreshInterval = 0.18,
+	HazardSpatialFallbackInterval = 1.0,
 	DodgeVerticalPadding = 6,
-	DodgeCandidateCount = 8,
+	DodgeCandidateCount = 4,
 	DodgeCommitDuration = 0.35,
-	DodgeEvaluationInterval = 0.08,
-	DodgeRaycastBudget = 32,
+	DodgeEvaluationInterval = 0.12,
+	DodgeRaycastBudget = 12,
 	DodgeNoGoalMaxHold = 0.4,
 	RespawnRushPathProbeInterval = 0.12,
 	DirectRouteCacheInterval = 0.12,
@@ -200,20 +199,24 @@ Config.ApproachDistance = nil
 -- A legacy saved combat distance could be larger than the current kite band,
 -- leaving a normal mob at 75 studs in COMBAT even though Kite displays 75.
 -- Keep the owner boundary canonical: >75 approaches, <=75 retreats.
-Config.PreferredCombatDistance = 75
+Config.PreferredCombatDistance = 55
 -- Keep the current Q/E contract regardless of stale old config files.
-Config.NormalSkillRange = 75
+Config.NormalSkillRange = 56
 -- Q is a separate close-combat opener.  Do not inherit the normal/boss E
 -- range, which is selected through skillRangeForTarget().
 Config.QSkillRange = 100
-Config.BossSkillRange = 100
-Config.NormalKiteApproachDistance = 75
-Config.NormalKiteRetreatDistance = 75
-Config.KiteDistance = 75
+Config.NormalKiteApproachDistance = 55
+Config.NormalKiteRetreatDistance = 55
+Config.KiteDistance = 55
 Config.QCooldownMin = 0.3
 Config.QCooldownMax = 0.5
 Config.ECooldown = 0.4
 Config.DodgePredictionRange = 30
+Config.DodgeEvaluationInterval = 0.12
+Config.DodgeRefreshInterval = 0.18
+Config.HazardSpatialFallbackInterval = 1.0
+Config.DodgeRaycastBudget = 12
+Config.DodgeCandidateCount = 4
 -- The game owns replay itself. Keep this controller from opening/clicking any
 -- replay UI, while retaining round detection so a game-started new map resets
 -- its target and navigation caches normally.
@@ -262,9 +265,12 @@ local function saveConfig()
 		persisted.DodgeEnabled = Config.DodgeEnabled == true
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.AutoStartConfigVersion = 1
-		persisted.NormalSkillRange = 75
+		persisted.PreferredCombatDistance = 55
+		persisted.NormalSkillRange = 56
+		persisted.NormalKiteApproachDistance = 55
+		persisted.NormalKiteRetreatDistance = 55
+		persisted.KiteDistance = 55
 		persisted.QSkillRange = 100
-		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
 end
@@ -661,14 +667,21 @@ local BossPolicies = {
 	["crystal golem"] = { Mode = "STANDARD", SkillRange = 100 },
 	["ancient enchanted tree"] = { Mode = "STANDARD", SkillRange = 100 },
 	["enchanted forest dragon"] = { Mode = "STANDARD", SkillRange = 100 },
-	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 80 },
-	["bob"] = { Mode = "BOB", SkillRange = 90 },
-	["bob the frost giant"] = { Mode = "BOB", SkillRange = 90 },
-	["odin"] = { Mode = "ODIN", SkillRange = 100 },
+	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 80, KiteDistance = 80 },
+	["bob"] = { Mode = "BOB", SkillRange = 90, KiteDistance = 90 },
+	["bob the frost giant"] = { Mode = "BOB", SkillRange = 90, KiteDistance = 90 },
+	["odin"] = { Mode = "ODIN", SkillRange = 90, KiteDistance = 90 },
 }
 
-local function bossPolicyForTarget(target: Model?): { Mode: string, SkillRange: number }?
+local function bossPolicyForTarget(target: Model?): { Mode: string, SkillRange: number, KiteDistance: number? }?
 	return target and BossPolicies[normalizedInstanceName(target)] or nil
+end
+
+RuntimeState.midgardianGoalAllowed = function(goal: Vector3, target: Model?): boolean
+	local policy = target and bossPolicyForTarget(target)
+	return not policy
+		or policy.Mode ~= "MIDGARDIAN"
+		or (goal.X > -633 and goal.Z > 376)
 end
 
 local function skillRangeForTarget(target: Model): number
@@ -1656,6 +1669,9 @@ local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 	if not Root then
 		return false, "UNSAFE"
 	end
+	if not RuntimeState.midgardianGoalAllowed(goal, Target) then
+		return false, "UNSAFE"
+	end
 	local flatDelta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
 	if flatDelta.Magnitude <= 0.1 then
 		return true, "SAFE"
@@ -2084,7 +2100,11 @@ local function invalidateDirectRouteCache()
 end
 
 local function computeDirectRouteClear(goal: Vector3, target: Model?): boolean
-	if not Root or math.abs(goal.Y - Root.Position.Y) > Config.DirectVerticalTolerance then
+	if
+		not Root
+		or not RuntimeState.midgardianGoalAllowed(goal, target)
+		or math.abs(goal.Y - Root.Position.Y) > Config.DirectVerticalTolerance
+	then
 		return false
 	end
 	local flatDelta = Vector3.new(goal.X - Root.Position.X, 0, goal.Z - Root.Position.Z)
@@ -3015,12 +3035,12 @@ local function tryStartDungeon(): boolean
 		return true
 	end
 	LastStartClickAt = os.clock()
-	-- Auto-exec can run while the next dungeon is still replicating.  Keep
-	-- translation gated until the clicked round has both a grounded character and
-	-- a confirmed enemy container; manual late loads naturally skip this gate.
+	-- Auto-exec can run while the next dungeon is still replicating. Keep the
+	-- short readiness gate only long enough to avoid issuing a route into an
+	-- incomplete floor; replay/bootstrap owns all longer reference retries.
 	RuntimeState.AutoStartAwaitingReady = true
-	RuntimeState.AutoStartReadyAt = LastStartClickAt + 1
-	RuntimeState.AutoStartDeadline = LastStartClickAt + 7
+	RuntimeState.AutoStartReadyAt = LastStartClickAt + 0.25
+	RuntimeState.AutoStartDeadline = LastStartClickAt + 2
 	RuntimeState.AutoStartReadySamples = 0
 	RuntimeState.AutoStartLastReadySampleAt = -math.huge
 	RuntimeState.AutoStartReadyFolder = nil
@@ -3542,6 +3562,7 @@ local function chooseRecoveryDetour(goal: Vector3, retreat: boolean?): Vector3?
 			local grounded, foundGround = projectToWalkableGround(candidate, Target)
 			if
 				foundGround
+				and RuntimeState.midgardianGoalAllowed(grounded, Target)
 				and directRouteClear(grounded, Target)
 				and kiteRouteIsSafeFromHazards(grounded)
 				and pointIsSafeFromHazards(grounded)
@@ -3608,6 +3629,11 @@ local function requestPath(goal: Vector3): boolean
 	if not alive() or not Target then
 		PathState.RequestStatus = "REJECTED"
 		RuntimeUtil.telemetry("PATH", "result=rejected")
+		return false
+	end
+	if not RuntimeState.midgardianGoalAllowed(goal, Target) then
+		PathState.RequestStatus = "REJECTED"
+		RuntimeUtil.telemetry("PATH", "result=rejected boundary=midgardian")
 		return false
 	end
 	if PathState.Computing then
@@ -4087,13 +4113,18 @@ resetRuntimeForNewDungeon = function()
 	RuntimeState.PlayerSafetySampleAt = -math.huge
 	print("[ROUND] transition=BEGIN")
 	RuntimeState.RoundTransitionActive = true
-	RuntimeState.RoundBootstrapUntil = now + 7
+	RuntimeState.RoundBootstrapUntil = now + 2
 	RuntimeState.RoundBootstrapAttempts = 0
 	RuntimeState.RoundTransitionSerial += 1
 	RuntimeState.RoundTransitionStartedAt = now
-	RuntimeState.RoundTransitionDeadline = now + 7
+	RuntimeState.RoundTransitionDeadline = now + 2
 	RuntimeState.RoundTransitionTimedOut = false
 	RuntimeState.RoundBootstrapLastCacheAt = -math.huge
+	RuntimeState.AutoStartAwaitingReady = false
+	RuntimeState.AutoStartReadyAt = 0
+	RuntimeState.AutoStartDeadline = 0
+	RuntimeState.AutoStartReadySamples = 0
+	RuntimeState.AutoStartReadyFolder = nil
 	cancelPathRequest()
 	-- Clear the old target through its normal lifecycle so its death listener,
 	-- path and facing state cannot survive into the replayed dungeon.
@@ -4217,12 +4248,13 @@ resetRuntimeForNewDungeon = function()
 		RuntimeState.refreshDungeonReferences()
 		local enemyFolder = RuntimeState.EnemyFolderInstance
 		local activeDungeonRoot = RuntimeState.ActiveDungeonRoot
-		local startMarker = cachedStartScreen()
-		if enemyFolder and enemyFolder:IsDescendantOf(workspace) and attemptNow - RuntimeState.RoundBootstrapLastCacheAt >= 1 then
+		local cacheBuilt = false
+		if enemyFolder and enemyFolder:IsDescendantOf(workspace) and RuntimeState.RoundBootstrapLastCacheAt == -math.huge then
 			-- The bounded cache refresh covers late enemy replication; events keep
 			-- additions warm between attempts without a workspace-wide frame scan.
 			RuntimeState.RoundBootstrapLastCacheAt = attemptNow
 			buildInitialCaches(enemyFolder)
+			cacheBuilt = true
 		end
 		RuntimeState.processStaticWallRoot(activeDungeonRoot)
 		LastTargetAcquireAt = -math.huge
@@ -4233,7 +4265,7 @@ resetRuntimeForNewDungeon = function()
 				NoTargetSince = nil
 			end
 		end
-		if startMarker or (alive() and enemyFolder and enemyFolder:IsDescendantOf(workspace) and RuntimeState.RoundBootstrapLastCacheAt > -math.huge) then
+		if Target or (alive() and enemyFolder and enemyFolder:IsDescendantOf(workspace) and cacheBuilt) then
 			RuntimeState.RoundTransitionActive = false
 			ProgressState.LastMeaningfulAt = attemptNow
 			ProgressState.LowSpeedSince = nil
@@ -4241,10 +4273,11 @@ resetRuntimeForNewDungeon = function()
 			print("[ROUND] transition=END")
 			return
 		end
-		task.delay(0.5, refreshRoundTargets)
+		task.delay(0.15, refreshRoundTargets)
 	end
-	-- Bounded retry handles late replication without relying on fixed long waits.
-	task.delay(0.4, refreshRoundTargets)
+	-- First pass runs now: a replay/re-exec can already have a valid character
+	-- and enemy folder, so a timed idle transition would only create a false stall.
+	refreshRoundTargets()
 end
 
 local function leaveDodge()
@@ -4898,8 +4931,8 @@ local function updateDungeonReplayState()
 		if not RuntimeState.RoundTransitionActive and not RuntimeState.RoundTransitionTimedOut then
 			RuntimeState.RoundTransitionActive = true
 			RuntimeState.RoundTransitionStartedAt = now
-			RuntimeState.RoundTransitionDeadline = now + 7
-			RuntimeState.RoundBootstrapUntil = now + 7
+			RuntimeState.RoundTransitionDeadline = now + 2
+			RuntimeState.RoundBootstrapUntil = now + 2
 			print("[ROUND] transition=BEGIN awaiting-new-state")
 		elseif RuntimeState.RoundTransitionActive and now >= RuntimeState.RoundTransitionDeadline then
 			RuntimeState.RoundTransitionActive = false
@@ -5114,6 +5147,22 @@ local function updateTargetAndObjective()
 	-- Spawn protection suppresses generic Dodge, not the combat movement policy:
 	-- the same approach/kite bands below must start as soon as the new root binds.
 	local bossPolicy = bossPolicyForTarget(Target)
+	if bossPolicy and bossPolicy.Mode == "MIDGARDIAN" and (Root.Position.X <= -633 or Root.Position.Z <= 376) then
+		-- Physics may push the player across the arena boundary.  The only
+		-- controller-created recovery goal is back into the valid X/Z half-plane;
+		-- neither orbit nor generic Dodge is allowed to deepen that excursion.
+		local boundaryPoint = Vector3.new(math.max(Root.Position.X, -632.5), Root.Position.Y, math.max(Root.Position.Z, 376.5))
+		local boundaryGoal, foundBoundaryGround = projectToWalkableGround(boundaryPoint, Target)
+		if foundBoundaryGround and RuntimeState.midgardianGoalAllowed(boundaryGoal, Target) then
+			cancelPathRequest()
+			NavigationGoal = boundaryGoal
+			setNavigationState(NavigationState.DIRECT)
+			decideNavigation()
+			updateProgressTracking()
+			runRecoveryPolicy()
+			return
+		end
+	end
 	if not bossPolicy then
 		if distance3D <= Config.NormalKiteRetreatDistance then
 			if
@@ -5182,10 +5231,9 @@ local function updateTargetAndObjective()
 			updateProgressTracking()
 			return
 		end
-	elseif bossPolicy.Mode == "BOB" then
-		-- Bob should keep a right-hand diagonal line rather than approach straight
-		-- and then become stationary at the combat ring. Far from Bob this is W+D;
-		-- at the hold distance it naturally becomes a safe D-style strafe.
+	elseif bossPolicy.Mode == "BOB" or bossPolicy.Mode == "ODIN" then
+		-- Boss 2/3 approach diagonally, then preserve that A/D side at their own
+		-- combat band instead of continuing to press forward into the boss.
 		if
 			RuntimeState.KiteMode == "BOB_DIAGONAL"
 			and NavigationGoal
@@ -5214,11 +5262,11 @@ local function updateTargetAndObjective()
 			return
 		end
 		LastGoalRefreshAt = now
-		local bobGoal = navigationGoalForTarget(enemyRoot, Target)
+		local bossKiteDistance = bossPolicy.KiteDistance or skillRangeForTarget(Target)
+		local bobGoal = navigationGoalForTarget(enemyRoot, Target, bossKiteDistance)
 		local toBob = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z)
 		if toBob.Magnitude > 0.1 then
 			local right = Vector3.new(-toBob.Z, 0, toBob.X).Unit
-			local bobSkillRange = skillRangeForTarget(Target)
 			-- Keep the side that was used while approaching (W+A or W+D). Once Bob
 			-- is in range, drop the forward component and continue with pure A/D;
 			-- this avoids reversing through the boss just to maintain the hold ring.
@@ -5226,7 +5274,7 @@ local function updateTargetAndObjective()
 			if RuntimeState.KiteMode == "BOB_DIAGONAL" and RuntimeState.KiteDirection.Magnitude > 0.1 then
 				side = if RuntimeState.KiteDirection:Dot(right) >= 0 then 1 else -1
 			end
-			local sideOrigin = if distance3D <= bobSkillRange then Root.Position else bobGoal
+			local sideOrigin = if distance3D <= bossKiteDistance then Root.Position else bobGoal
 			local candidate, foundCandidate = projectToWalkableGround(sideOrigin + right * side * 8, Target)
 			if not (
 				foundCandidate
@@ -5248,7 +5296,7 @@ local function updateTargetAndObjective()
 				and kiteRouteIsSafeFromHazards(candidate)
 			then
 				bobGoal = candidate
-				RuntimeUtil.telemetry("BOSS", if distance3D <= bobSkillRange then "mode=bob-strafe" else "mode=bob-diagonal")
+				RuntimeUtil.telemetry("BOSS", if distance3D <= bossKiteDistance then "mode=boss-strafe" else "mode=boss-diagonal")
 			end
 		end
 		local bobDirection = Vector3.new(bobGoal.X - Root.Position.X, 0, bobGoal.Z - Root.Position.Z)
@@ -5305,7 +5353,7 @@ local function updateTargetAndObjective()
 	local verticalDifference = math.abs(enemyRoot.Position.Y - Root.Position.Y)
 	local targetBelow = enemyRoot.Position.Y < Root.Position.Y - Config.DirectVerticalTolerance
 	if targetBelow and (flatDistance <= 15 or verticalDifference > flatDistance) then
-		local newVerticalGoal = navigationGoalForTarget(enemyRoot, Target)
+		local newVerticalGoal = navigationGoalForTarget(enemyRoot, Target, bossPolicy and bossPolicy.KiteDistance or nil)
 		if
 			RuntimeState.VerticalPathTarget ~= Target
 			or not RuntimeState.VerticalPathGoal
@@ -5342,7 +5390,7 @@ local function updateTargetAndObjective()
 	if GoalTarget ~= Target or now - LastGoalRefreshAt >= Config.GoalRefreshInterval then
 		LastGoalRefreshAt = now
 		GoalTarget = Target
-		local newGoal = navigationGoalForTarget(enemyRoot, Target)
+		local newGoal = navigationGoalForTarget(enemyRoot, Target, bossPolicy and bossPolicy.KiteDistance or nil)
 		if not NavigationGoal or (newGoal - NavigationGoal).Magnitude >= Config.DirectGoalChangeDistance then
 			NavigationGoal = newGoal
 		elseif State == NavigationState.DIRECT then
