@@ -413,6 +413,12 @@ local RuntimeState = {
 	RoundBootstrapUntil = 0,
 	RoundBootstrapAttempts = 0,
 	RoundBootstrapLastCacheAt = -math.huge,
+	AutoStartAwaitingReady = false,
+	AutoStartReadyAt = 0,
+	AutoStartDeadline = 0,
+	AutoStartReadySamples = 0,
+	AutoStartLastReadySampleAt = -math.huge,
+	AutoStartReadyFolder = nil :: Instance?,
 	LastStaleTarget = nil :: Model?,
 	CharacterBindRetryUntil = 0,
 	CharacterBindRetryPending = false,
@@ -3009,6 +3015,15 @@ local function tryStartDungeon(): boolean
 		return true
 	end
 	LastStartClickAt = os.clock()
+	-- Auto-exec can run while the next dungeon is still replicating.  Keep
+	-- translation gated until the clicked round has both a grounded character and
+	-- a confirmed enemy container; manual late loads naturally skip this gate.
+	RuntimeState.AutoStartAwaitingReady = true
+	RuntimeState.AutoStartReadyAt = LastStartClickAt + 1
+	RuntimeState.AutoStartDeadline = LastStartClickAt + 7
+	RuntimeState.AutoStartReadySamples = 0
+	RuntimeState.AutoStartLastReadySampleAt = -math.huge
+	RuntimeState.AutoStartReadyFolder = nil
 	local button = cachedButton
 	local clickTarget = button or marker
 	local clickX, clickY, inset = getVimClickPoint(clickTarget, 0.5, 0.55)
@@ -4922,6 +4937,58 @@ local function updateTargetAndObjective()
 		setNavigationState(NavigationState.IDLE)
 		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
+	end
+	if RuntimeState.AutoStartAwaitingReady then
+		-- A fresh Delta auto-exec can see enemy models before the floor/map collision
+		-- they belong to has finished replicating.  Starting DIRECT/PATH in that
+		-- interval produces a false blocked route that manual late loading avoids.
+		RuntimeState.refreshDungeonReferences()
+		local enemyFolder = RuntimeState.EnemyFolderInstance
+		local grounded = select(2, projectToWalkableGround(Root.Position, nil))
+		local readyNow = enemyFolder and enemyFolder:IsDescendantOf(workspace) and grounded
+		if readyNow then
+			if RuntimeState.AutoStartReadyFolder ~= enemyFolder then
+				RuntimeState.AutoStartReadyFolder = enemyFolder
+				RuntimeState.AutoStartReadySamples = 1
+				RuntimeState.AutoStartLastReadySampleAt = now
+			elseif now - RuntimeState.AutoStartLastReadySampleAt >= 0.25 then
+				RuntimeState.AutoStartReadySamples += 1
+				RuntimeState.AutoStartLastReadySampleAt = now
+			end
+		else
+			RuntimeState.AutoStartReadySamples = 0
+			RuntimeState.AutoStartReadyFolder = nil
+		end
+		if
+			now >= RuntimeState.AutoStartReadyAt
+			and RuntimeState.AutoStartReadySamples >= 2
+		then
+			RuntimeState.AutoStartAwaitingReady = false
+			RuntimeState.AutoStartReadyAt = 0
+			RuntimeState.AutoStartDeadline = 0
+			RuntimeState.AutoStartReadySamples = 0
+			RuntimeState.AutoStartReadyFolder = nil
+			buildInitialCaches(enemyFolder)
+			RuntimeState.processStaticWallRoot(RuntimeState.ActiveDungeonRoot)
+			LastTargetAcquireAt = -math.huge
+			resetProgress(nil, nil)
+			print("[START] map-ready")
+		elseif now < RuntimeState.AutoStartDeadline then
+			ProgressState.LastMeaningfulAt = now
+			ProgressState.LowSpeedSince = nil
+			setNavigationState(NavigationState.IDLE)
+			if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
+			return
+		else
+			-- Do not hold forever if this game round exposes no recognizable folder;
+			-- release to the existing bounded target fallback and retain diagnostics.
+			RuntimeState.AutoStartAwaitingReady = false
+			RuntimeState.AutoStartReadyAt = 0
+			RuntimeState.AutoStartDeadline = 0
+			RuntimeState.AutoStartReadySamples = 0
+			RuntimeState.AutoStartReadyFolder = nil
+			RuntimeUtil.telemetry("START", "map-ready=timeout")
+		end
 	end
 	if RuntimeState.RoundTransitionActive then
 		ProgressState.LastMeaningfulAt = now
