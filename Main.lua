@@ -26,19 +26,19 @@ local DEFAULT_CONFIG = {
 	TargetAcquireInterval = 1,
 	GoalRefreshInterval = 0.15,
 	TargetLockRangeMultiplier = 1.25,
-	PreferredCombatDistance = 55,
+	PreferredCombatDistance = 60,
 	RetreatEnterDistance = 40,
 	RetreatExitDistance = 45,
-	NormalKiteApproachDistance = 55,
-	NormalKiteRetreatDistance = 55,
+	NormalKiteApproachDistance = 60,
+	NormalKiteRetreatDistance = 60,
 	AttackRange = 15,
-	NormalSkillRange = 56,
+	NormalSkillRange = 61,
 	QSkillRange = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
 	RespawnRushDuration = 6,
 	HorizontalBeamGraceDuration = 3,
-	KiteDistance = 55,
+	KiteDistance = 60,
 	KiteHysteresis = 3,
 	AttackCooldown = 0.12,
 	QCooldownMin = 0.3,
@@ -199,15 +199,15 @@ Config.ApproachDistance = nil
 -- A legacy saved combat distance could be larger than the current kite band,
 -- leaving a normal mob at 75 studs in COMBAT even though Kite displays 75.
 -- Keep the owner boundary canonical: >75 approaches, <=75 retreats.
-Config.PreferredCombatDistance = 55
+Config.PreferredCombatDistance = 60
 -- Keep the current Q/E contract regardless of stale old config files.
-Config.NormalSkillRange = 56
+Config.NormalSkillRange = 61
 -- Q is a separate close-combat opener.  Do not inherit the normal/boss E
 -- range, which is selected through skillRangeForTarget().
 Config.QSkillRange = 100
-Config.NormalKiteApproachDistance = 55
-Config.NormalKiteRetreatDistance = 55
-Config.KiteDistance = 55
+Config.NormalKiteApproachDistance = 60
+Config.NormalKiteRetreatDistance = 60
+Config.KiteDistance = 60
 Config.QCooldownMin = 0.3
 Config.QCooldownMax = 0.5
 Config.ECooldown = 0.4
@@ -265,11 +265,11 @@ local function saveConfig()
 		persisted.DodgeEnabled = Config.DodgeEnabled == true
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.AutoStartConfigVersion = 1
-		persisted.PreferredCombatDistance = 55
-		persisted.NormalSkillRange = 56
-		persisted.NormalKiteApproachDistance = 55
-		persisted.NormalKiteRetreatDistance = 55
-		persisted.KiteDistance = 55
+		persisted.PreferredCombatDistance = 60
+		persisted.NormalSkillRange = 61
+		persisted.NormalKiteApproachDistance = 60
+		persisted.NormalKiteRetreatDistance = 60
+		persisted.KiteDistance = 60
 		persisted.QSkillRange = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
@@ -5164,7 +5164,10 @@ local function updateTargetAndObjective()
 		end
 	end
 	if not bossPolicy then
-		if distance3D <= Config.NormalKiteRetreatDistance then
+		-- Keep a small stable lateral band around the desired 60-stud spacing.
+		-- Only retreat after we are genuinely inside that band; otherwise a mob at
+		-- 60 would repeatedly alternate between approach and retreat every refresh.
+		if distance3D < Config.NormalKiteRetreatDistance - Config.KiteHysteresis then
 			if
 				RuntimeState.KiteMode == "RETREAT_DIAGONAL"
 				and RuntimeState.KiteGoal
@@ -5205,14 +5208,46 @@ local function updateTargetAndObjective()
 			setNavigationState(NavigationState.RETREAT)
 			return
 		end
-		-- The normal-mob band has one authoritative boundary: at any distance
-		-- at or above 55, stale RETREAT/RECOVERY ownership must be released before the
-		-- direct approach goal below is calculated.  The legacy 40/45 recovery
-		-- thresholds are not allowed to keep a mob at 75 in an avoidance state.
+		-- 60..70: close the gap using W+A/W+D.  At the desired spacing, keep
+		-- the same A/D side instead of walking straight into the target.  The
+		-- candidate helper validates both sides, so an obstructed side changes
+		-- immediately to the other side rather than waiting for recovery.
+		if distance3D <= Config.NormalKiteRetreatDistance + 10 then
+			local lateralOnly = distance3D <= Config.NormalKiteRetreatDistance
+			local normalKiteMode = if lateralOnly then "NORMAL_STRAFE" else "NORMAL_APPROACH_DIAGONAL"
+			if
+				RuntimeState.KiteMode == normalKiteMode
+				and RuntimeState.KiteGoal
+				and (RuntimeState.KiteGoal - Root.Position).Magnitude > Config.DirectReachedDistance
+				and now - LastGoalRefreshAt < 0.65
+				and directRouteClear(RuntimeState.KiteGoal, Target)
+				and pointIsSafeFromHazards(RuntimeState.KiteGoal)
+				and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
+			then
+				NavigationGoal = RuntimeState.KiteGoal
+				setNavigationState(NavigationState.DIRECT)
+				updateProgressTracking()
+				return
+			end
+			LastGoalRefreshAt = now
+			local kiteGoal, kiteDirection = chooseKiteGoal(enemyRoot, false, lateralOnly)
+			if kiteGoal and kiteDirection then
+				cancelPathRequest()
+				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = kiteGoal, kiteDirection, normalKiteMode
+				NavigationGoal = kiteGoal
+				setNavigationState(NavigationState.DIRECT)
+				updateProgressTracking()
+				return
+			end
+		end
+		-- Above the local 60..70 movement band, stale normal kite ownership must
+		-- be released before the direct approach goal below is calculated.
 		if
 			State == NavigationState.RETREAT
 			or RuntimeState.KiteMode == "RETREAT_DIAGONAL"
 			or RuntimeState.KiteMode == "RETREAT_VECTOR"
+			or RuntimeState.KiteMode == "NORMAL_STRAFE"
+			or RuntimeState.KiteMode == "NORMAL_APPROACH_DIAGONAL"
 		then
 			cancelPathRequest()
 			ProgressState.RecoveryGoal = nil
