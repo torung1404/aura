@@ -112,7 +112,7 @@ local DEFAULT_CONFIG = {
 	DescentFlatTolerance = 1.5,
 	DescentRiseReleaseCount = 2,
 	DebugTelemetry = false,
-	AutoReplay = true,
+	AutoReplay = false,
 	AutoStart = true,
 }
 
@@ -210,6 +210,10 @@ Config.QCooldownMin = 0.3
 Config.QCooldownMax = 0.5
 Config.ECooldown = 0.4
 Config.DodgePredictionRange = 30
+-- The game owns replay itself. Keep this controller from opening/clicking any
+-- replay UI, while retaining round detection so a game-started new map resets
+-- its target and navigation caches normally.
+Config.AutoReplay = false
 Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
 -- thirty percent. Old fixed-speed values must not survive a re-exec.
@@ -3913,6 +3917,17 @@ local function decideNavigation()
 		ProgressState.RecoveryGoal = nil
 		setNavigationState(NavigationState.DIRECT)
 	else
+		if now - LastStartClickAt <= 6 then
+			-- Immediately after the start click, collision/ground replication can
+			-- make a valid long route look locally blocked. PATH's existing verified
+			-- fallback can move now; do not spend the initial map load in RECOVERY.
+			ProgressState.RecoveryGoal = nil
+			ProgressState.RecoveryUntil = 0
+			cancelPathRequest()
+			setNavigationState(NavigationState.PATH)
+			requestPath(NavigationGoal)
+			return
+		end
 		-- A blocked DIRECT route gets a short local sidestep first. Waiting for the
 		-- long recovery window used to resume DIRECT into the same BasicPart.
 		ProgressState.SteeringTried = true
