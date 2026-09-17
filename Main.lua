@@ -3031,9 +3031,14 @@ local function tryStartDungeon(): boolean
 	if not marker then
 		return false
 	end
-	-- A late-replicating start GUI is not authority once this round has a live
-	-- target. Otherwise AutoExec can reacquire a target and immediately freeze it.
-	if not RuntimeState.AutoStartAwaitingReady and validTarget(Target) then
+	-- A live target is authoritative over every old Start GUI/readiness flag.
+	-- Otherwise AutoExec can acquire a nearby enemy and still keep returning IDLE.
+	if validTarget(Target) then
+		RuntimeState.AutoStartAwaitingReady = false
+		RuntimeState.AutoStartReadyAt = 0
+		RuntimeState.AutoStartDeadline = 0
+		RuntimeState.AutoStartReadySamples = 0
+		RuntimeState.AutoStartReadyFolder = nil
 		return false
 	end
 	if not Running or not Config.AutoStart or os.clock() - LastStartClickAt < 1 then
