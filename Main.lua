@@ -64,16 +64,16 @@ local DEFAULT_CONFIG = {
 	WaypointSpacing = 5,
 	MeaningfulProgressDistance = 1.5,
 	ProgressCheckInterval = 0.25,
-	-- At eight seconds without progress, rebuild a route before considering reset.
-	RecoveryRefreshAt = 8,
+	-- Rebuild locally before the six-second hard-stuck deadline.
+	RecoveryRefreshAt = 3,
 	StuckPathRetryInterval = 3,
 	-- Rebuild a route quickly when collision leaves horizontal velocity near zero.
 	SlowMovementSpeedThreshold = 10,
-	SlowMovementRepathDelay = 0.75,
-	SlowMovementRepathCooldown = 2,
-	RespawnStuckTime = 12,
+	SlowMovementRepathDelay = 0.35,
+	SlowMovementRepathCooldown = 0.35,
+	RespawnStuckTime = 6,
 	DetourProbeDistance = 13,
-	DetourDuration = 1.5,
+	DetourDuration = 0.45,
 	DodgeEnabled = false,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
@@ -194,7 +194,11 @@ if SavedConfig.AutoStartConfigVersion ~= 1 then
 	Config.AutoStart = DEFAULT_CONFIG.AutoStart
 end
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
-Config.RespawnStuckTime = 12
+Config.RespawnStuckTime = 6
+Config.RecoveryRefreshAt = 3
+Config.SlowMovementRepathDelay = 0.35
+Config.SlowMovementRepathCooldown = 0.35
+Config.DetourDuration = 0.45
 Config.ApproachDistance = nil
 -- A legacy saved combat distance could be larger than the current kite band,
 -- leaving a normal mob at 75 studs in COMBAT even though Kite displays 75.
@@ -326,6 +330,7 @@ local ProgressState = {
 	LastLowSpeedPathRetryAt = -math.huge,
 	RecoveryEscalations = 0,
 	LastRecoveryEscalationAt = -math.huge,
+	LastPhysicalPosition = nil :: Vector3?,
 }
 local DodgeStartedAt = 0
 local LastStartClickAt = -math.huge
@@ -378,6 +383,7 @@ local RuntimeState = {
 	JumpStillSince = os.clock(),
 	JumpBestDistance = math.huge,
 	JumpBestVertical = math.huge,
+	JumpLastPhysicalPosition = nil :: Vector3?,
 	JumpBurstUntil = 0,
 	JumpBurstTaskRunning = false,
 	JumpBurstGeneration = 0,
@@ -2465,39 +2471,28 @@ local function updateGlobalStuckJump()
 		or State == NavigationState.RECOVERY
 		or State == NavigationState.EXPLORE
 	if not translating then
-		RuntimeState.JumpStillSince = now
-		RuntimeState.JumpBestDistance = math.huge
-		RuntimeState.JumpBestVertical = math.huge
-		return
+		-- State/goal churn is not proof of movement. Keep a live target+goal in
+		-- the same stuck episode so IDLE/RECOVERY hand-offs cannot postpone reset.
+		if not Target or not NavigationGoal or State == NavigationState.COMBAT then
+			RuntimeState.JumpStillSince = now
+			RuntimeState.JumpBestDistance = math.huge
+			RuntimeState.JumpBestVertical = math.huge
+			RuntimeState.JumpLastPhysicalPosition = Root.Position
+			return
+		end
 	end
-	local targetRoot = if validTarget(Target) then getTargetRoot(Target) else nil
-	-- PATH progress must be measured against the active waypoint, not directly
-	-- against the enemy. A valid route can temporarily move away from the enemy
-	-- to get around a BasicPart, which used to make the global watchdog reset a
-	-- character that was following its path correctly.
-	local objectivePosition = if State == NavigationState.PATH
-		then upcomingMovementGoal()
-		else if targetRoot then targetRoot.Position else upcomingMovementGoal()
-	if not objectivePosition then
-		RuntimeState.JumpStillSince = now
-		RuntimeState.JumpBestDistance = math.huge
-		RuntimeState.JumpBestVertical = math.huge
-		return
-	end
-	local delta = objectivePosition - Root.Position
-	local distance, vertical = delta.Magnitude, math.abs(delta.Y)
-	if RuntimeState.JumpBestDistance == math.huge then
-		RuntimeState.JumpBestDistance = distance
-		RuntimeState.JumpBestVertical = vertical
+	local previousPosition = RuntimeState.JumpLastPhysicalPosition
+	RuntimeState.JumpLastPhysicalPosition = Root.Position
+	if not previousPosition then
 		RuntimeState.JumpStillSince = now
 		return
 	end
-	local progressThreshold = Config.MeaningfulProgressDistance
-	local progressed = distance <= RuntimeState.JumpBestDistance - progressThreshold
-		or vertical <= RuntimeState.JumpBestVertical - progressThreshold
-	if progressed then
-		RuntimeState.JumpBestDistance = math.min(RuntimeState.JumpBestDistance, distance)
-		RuntimeState.JumpBestVertical = math.min(RuntimeState.JumpBestVertical, vertical)
+	local physicalProgress = Vector3.new(
+		Root.Position.X - previousPosition.X,
+		0,
+		Root.Position.Z - previousPosition.Z
+	).Magnitude >= Config.MeaningfulProgressDistance
+	if physicalProgress then
 		RuntimeState.JumpStillSince = now
 	elseif now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
 		-- A target/goal proves intent, not physical movement. Preserve the continuous
@@ -3448,6 +3443,7 @@ local function resetProgress(target: Model?, goal: Vector3?)
 	ProgressState.BestVerticalDifference = math.huge
 	ProgressState.LastMeaningfulAt = os.clock()
 	ProgressState.LastCheckAt = 0
+	ProgressState.LastPhysicalPosition = Root and Root.Position or nil
 	ProgressState.LastStuckPathRetryAt = -math.huge
 	ProgressState.LowSpeedSince = nil
 	ProgressState.LastLowSpeedPathRetryAt = -math.huge
@@ -3478,7 +3474,15 @@ local function pathRemainingMetric(): number
 end
 
 local function markMeaningfulProgress()
-	ProgressState.LastMeaningfulAt = os.clock()
+	local previousPosition = ProgressState.LastPhysicalPosition
+	local physicallyMoved = Root
+		and previousPosition
+		and Vector3.new(Root.Position.X - previousPosition.X, 0, Root.Position.Z - previousPosition.Z).Magnitude
+			>= Config.MeaningfulProgressDistance
+	if physicallyMoved then
+		ProgressState.LastMeaningfulAt = os.clock()
+		ProgressState.LastPhysicalPosition = Root.Position
+	end
 	ProgressState.BestGoalMetric = pathRemainingMetric()
 	ProgressState.RecoveryEscalations = 0
 	ProgressState.LastRecoveryEscalationAt = -math.huge
@@ -3489,15 +3493,6 @@ local function updateProgressTracking()
 		return
 	end
 	local now = os.clock()
-	if RuntimeState.KiteMode ~= "" and State == NavigationState.DIRECT then
-		local velocity = Root.AssemblyLinearVelocity
-		if Vector3.new(velocity.X, 0, velocity.Z).Magnitude >= Config.SlowMovementSpeedThreshold then
-			-- A short moving kite goal is intentionally regenerated as the enemy and
-			-- player move. Treat real horizontal motion as progress; do not reset this
-			-- timer merely because a new local goal was selected.
-			ProgressState.LastMeaningfulAt = now
-		end
-	end
 	if ProgressState.Target ~= Target or not ProgressState.GoalAnchor then
 		resetProgress(Target, NavigationGoal)
 		return
@@ -3516,10 +3511,22 @@ local function updateProgressTracking()
 	elseif verticalProgress then
 		ProgressState.BestVerticalDifference = vertical
 	end
+	local previousPhysicalPosition = ProgressState.LastPhysicalPosition
+	local physicalProgress = previousPhysicalPosition
+		and Vector3.new(
+			Root.Position.X - previousPhysicalPosition.X,
+			0,
+			Root.Position.Z - previousPhysicalPosition.Z
+		).Magnitude >= Config.MeaningfulProgressDistance
+	ProgressState.LastPhysicalPosition = Root.Position
 	if ProgressState.BestGoalMetric == math.huge then
 		ProgressState.BestGoalMetric = metric
 	elseif metric <= ProgressState.BestGoalMetric - Config.MeaningfulProgressDistance or verticalProgress then
 		ProgressState.BestGoalMetric = metric
+	end
+	-- Goal/path changes are intent, not motion. The hard stuck episode is reset
+	-- only when the root actually changes horizontal position by a useful amount.
+	if physicalProgress then
 		ProgressState.LastMeaningfulAt = now
 		ProgressState.RecoveryEscalations = 0
 		ProgressState.LastRecoveryEscalationAt = -math.huge
@@ -3567,13 +3574,14 @@ local function chooseRecoveryDetour(goal: Vector3, retreat: boolean?): Vector3?
 			and RuntimeState.LocalBlockedDirection:Dot(direction) >= 0.92
 		) then
 			local clearance = rayClearance(Root.Position, direction, Target)
-			local travel = math.min(8, math.max(3, clearance - 1.5))
+			local travel = math.min(8, clearance - 1.25)
 			local candidate = Root.Position + direction * travel
 			local grounded, foundGround = projectToWalkableGround(candidate, Target)
 			if
-				foundGround
+				travel >= 2.5
+				and foundGround
 				and RuntimeState.midgardianGoalAllowed(grounded, Target)
-				and directRouteClear(grounded, Target)
+				and hasGroundSupport(grounded, Target)
 				and kiteRouteIsSafeFromHazards(grounded)
 				and pointIsSafeFromHazards(grounded)
 			then
@@ -3818,11 +3826,6 @@ local function updatePathNavigation()
 		PathState.IssuedIndex = 0
 		PathState.IssuedAt = 0
 		PathState.ActiveWaypointIssueSerial = 0
-		-- The next waypoint is a new navigation objective; do not carry the old
-		-- waypoint's distance into the global no-progress watchdog.
-		RuntimeState.JumpStillSince = os.clock()
-		RuntimeState.JumpBestDistance = math.huge
-		RuntimeState.JumpBestVertical = math.huge
 		if advanced then
 			markMeaningfulProgress()
 		end
@@ -3904,7 +3907,8 @@ local function updateRecoveryMovement()
 		if direction.Magnitude > Config.WaypointReachedDistance then
 			local now = os.clock()
 			local horizontalSpeed = Vector3.new(Root.AssemblyLinearVelocity.X, 0, Root.AssemblyLinearVelocity.Z).Magnitude
-			local routeStillValid = directRouteClear(ProgressState.RecoveryGoal, Target)
+			local routeStillValid = rayClearance(Root.Position, direction.Unit, Target)
+				>= math.min(direction.Magnitude, Config.DetourProbeDistance) - 0.5
 				and kiteRouteIsSafeFromHazards(ProgressState.RecoveryGoal)
 				and pointIsSafeFromHazards(ProgressState.RecoveryGoal)
 			local progressed = direction.Magnitude <= RuntimeState.RecoveryGoalDistance - 0.5
@@ -3915,7 +3919,7 @@ local function updateRecoveryMovement()
 			elseif
 				not routeStillValid
 				or (
-					now - RuntimeState.RecoveryGoalStartedAt >= 0.4
+					now - RuntimeState.RecoveryGoalStartedAt >= 0.35
 					and horizontalSpeed <= 1.5
 				)
 			then
@@ -4665,8 +4669,10 @@ local function runRecoveryPolicy()
 	if translating and Root and noMeaningfulProgressFor >= Config.SlowMovementRepathDelay then
 		local velocity = Root.AssemblyLinearVelocity
 		local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-		if horizontalSpeed < Config.SlowMovementSpeedThreshold then
-			ProgressState.LowSpeedSince = ProgressState.LowSpeedSince or now
+		if horizontalSpeed <= 1.5 then
+			-- The outer no-progress check already waited 0.35s. Start the bounded
+			-- side selection now rather than idling through a second timer window.
+			ProgressState.LowSpeedSince = ProgressState.LowSpeedSince or (now - Config.SlowMovementRepathDelay)
 			if
 				now - ProgressState.LowSpeedSince >= Config.SlowMovementRepathDelay
 				and now - ProgressState.LastLowSpeedPathRetryAt >= Config.SlowMovementRepathCooldown
@@ -4684,8 +4690,8 @@ local function runRecoveryPolicy()
 	end
 	local stuckFor = now - ProgressState.LastMeaningfulAt
 	if stuckFor >= Config.RespawnStuckTime then
-		-- Local detours and path retries have already been allowed below the hard
-		-- deadline. Do not turn a configured twelve-second stall into 17+ seconds.
+		-- Local detours and path retries have already been allowed below this hard
+		-- deadline. Do not turn a configured six-second stall into a longer wait.
 		RuntimeUtil.telemetry("STUCK_HARD", string.format("hard-respawn target=%s age=%.1f", Target.Name, stuckFor))
 		recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
 		return
@@ -4738,6 +4744,8 @@ recoverByRespawn = function(
 	local recoverySerial = RuntimeState.RecoverySerial
 	local executionGeneration = RuntimeState.Generation
 	local roundSerial = RuntimeState.RoundResetSerial
+	local recoveryCharacter = Character
+	local recoveryOrigin = Root and Root.Position
 	RespawnInProgress = true
 	local function recoveryStillCurrent(): boolean
 		return RuntimeUtil.isCurrentExecution()
@@ -4765,15 +4773,17 @@ recoverByRespawn = function(
 		end
 		if expectedTarget then
 			local expectedRoot = getTargetRoot(expectedTarget)
+			local movedSinceRecovery = recoveryOrigin
+				and Root
+				and Vector3.new(Root.Position.X - recoveryOrigin.X, 0, Root.Position.Z - recoveryOrigin.Z).Magnitude
+					>= Config.MeaningfulProgressDistance
 			if State == NavigationState.DODGE
 				or Target ~= expectedTarget
+				or Character ~= recoveryCharacter
 				or not Root
 				or not expectedRoot
 				or (verticalRecovery and expectedRoot.Position.Y - Root.Position.Y <= 75)
-				or (not verticalRecovery and (
-					ProgressState.LastMeaningfulAt ~= expectedProgressAt
-					or os.clock() - ProgressState.LastMeaningfulAt < Config.RespawnStuckTime
-				))
+				or (not verticalRecovery and movedSinceRecovery)
 			then
 				releaseRecoveryIfOwned()
 				return
@@ -5300,7 +5310,7 @@ local function updateTargetAndObjective()
 		then
 			-- A Bob goal that met a wall must leave translation to the shared local
 			-- detour/PATH owner. Reissuing DIRECT here every frame was what kept the
-			-- character pressing into a simple wall until the 12-second watchdog.
+			-- character pressing into a simple wall until the hard stuck watchdog.
 			updateProgressTracking()
 			runRecoveryPolicy()
 			return
