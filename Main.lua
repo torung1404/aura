@@ -33,6 +33,7 @@ local DEFAULT_CONFIG = {
 	NormalKiteRetreatDistance = 75,
 	AttackRange = 15,
 	NormalSkillRange = 75,
+	QSkillRange = 100,
 	BossSkillRange = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
@@ -202,6 +203,9 @@ Config.ApproachDistance = nil
 Config.PreferredCombatDistance = 75
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 75
+-- Q is a separate close-combat opener.  Do not inherit the normal/boss E
+-- range, which is selected through skillRangeForTarget().
+Config.QSkillRange = 100
 Config.BossSkillRange = 100
 Config.NormalKiteApproachDistance = 75
 Config.NormalKiteRetreatDistance = 75
@@ -259,6 +263,7 @@ local function saveConfig()
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.AutoStartConfigVersion = 1
 		persisted.NormalSkillRange = 75
+		persisted.QSkillRange = 100
 		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
@@ -3202,12 +3207,11 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 	if not Running or not RuntimeUtil.isCurrentExecution() or not RuntimeState.combatCharacterCurrent() then
 		return
 	end
-	local activeSkillRange = Target and skillRangeForTarget(Target) or Config.NormalSkillRange
-	if not Target or not validTarget(Target) or not enemyRoot or not distance3D or distance3D > activeSkillRange then
+	if not Target or not validTarget(Target) or not enemyRoot or not distance3D then
 		return
 	end
 	local now = os.clock()
-	if now >= CombatState.NextQAt then
+	if distance3D <= Config.QSkillRange and now >= CombatState.NextQAt then
 		local minimum = math.max(0.1, Config.QCooldownMin)
 		local maximum = math.max(minimum, Config.QCooldownMax)
 		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
@@ -3215,7 +3219,8 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 			RuntimeUtil.telemetry("COMBAT_Q", "Q")
 		end
 	end
-	if now >= CombatState.NextEAt then
+	local activeSkillRange = skillRangeForTarget(Target)
+	if distance3D <= activeSkillRange and now >= CombatState.NextEAt then
 		if activateSkill(Config.SkillEToolName, Enum.KeyCode.E) then
 			CombatState.NextEAt = now + math.max(0.1, Config.ECooldown)
 			RuntimeUtil.telemetry("COMBAT_E", "E")
@@ -3699,7 +3704,21 @@ local function updatePathFallback(goal: Vector3)
 		RuntimeUtil.telemetry("PATH_FALLBACK", "result=safe status=" .. PathState.RequestStatus)
 		Humanoid:Move(RuntimeState.PathFallbackDirection, false)
 	else
-		RuntimeUtil.telemetry("PATH_FALLBACK", "result=stop status=" .. PathState.RequestStatus)
+		-- A single forward probe is expected to fail at a simple corner.  Promote a
+		-- verified local sidestep immediately instead of holding zero movement until
+		-- the long stuck watchdog runs.  beginLocalRecovery keeps the existing
+		-- wall, ground, drop, and hazard checks and records the chosen goal.
+		beginLocalRecovery(goal)
+		local detour = ProgressState.RecoveryGoal
+		if State == NavigationState.RECOVERY and detour then
+			local direction = Vector3.new(detour.X - Root.Position.X, 0, detour.Z - Root.Position.Z)
+			if direction.Magnitude > 0.1 then
+				RuntimeUtil.telemetry("PATH_FALLBACK", "result=local-detour status=" .. PathState.RequestStatus)
+				Humanoid:Move(direction.Unit, false)
+				return
+			end
+		end
+		RuntimeUtil.telemetry("PATH_FALLBACK", "result=stop-no-safe-detour status=" .. PathState.RequestStatus)
 		stopTranslation()
 	end
 end
