@@ -439,7 +439,10 @@ local RuntimeState = {
 	BossDodgeSource = nil :: Instance?,
 	BossDodgeMode = "",
 	BossDodgeDirection = Vector3.zero,
-	MidgardianSafeZone = { XMin = -649, XMax = -633, ZMin = 350, ZMax = 376 },
+	MidgardianOrbitUntil = 0,
+	MidgardianOrbitSide = 0,
+	CircleHitboxSource = nil :: Instance?,
+	CircleHitboxSide = Vector3.zero,
 	MageHitboxSeen = {} :: { [Model]: boolean },
 	KiteGoal = nil :: Vector3?,
 	KiteDirection = Vector3.zero,
@@ -1752,10 +1755,6 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 		table.insert(candidateDirections, { Direction = normalized, Label = label })
 	end
 	local specialMode = specialSkillKind(hazard)
-	local midgardianZone = Target
-		and bossPolicyForTarget(Target)
-		and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
-		and RuntimeState.MidgardianSafeZone
 	local beamSideOnly = specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM"
 	if forwardDirection.Magnitude > 0.1 and beamSideOnly then
 		-- Bob's horizontal/spread sequences require a persistent A/D-style exit;
@@ -1764,15 +1763,11 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 		addCandidateDirection(-rightDirection, "left")
 		addCandidateDirection(rightDirection, "right")
 	elseif forwardDirection.Magnitude > 0.1 and specialMode == "CIRCLE_HITBOX" then
-		-- CircleHitbox exits are based on the current footprint only. Try the two
-		-- lateral/diagonal routes around the current boss line before generic exits.
+		-- CircleHitbox owns one A/D-style lateral side for its whole active instance.
 		local rightDirection = Vector3.new(-forwardDirection.Z, 0, forwardDirection.X)
 		local leftDirection = -rightDirection
 		addCandidateDirection(leftDirection, "left")
 		addCandidateDirection(rightDirection, "right")
-		addCandidateDirection(forwardDirection + leftDirection, "diagonal-left")
-		addCandidateDirection(forwardDirection + rightDirection, "diagonal-right")
-		addCandidateDirection(exitDirection, "exit")
 	elseif forwardDirection.Magnitude > 0.1 then
 		-- The approach basis is independent from the escape normal. A hazard's
 		-- outward direction is not guaranteed to be perpendicular to the target.
@@ -1795,12 +1790,14 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 	end
 	-- Keep a bounded fallback set for circular hazards or an objective that is
 	-- temporarily unavailable. These are only reached after lateral choices.
-	for angleIndex = 1, Config.DodgeCandidateCount do
-		if #candidateDirections >= Config.DodgeCandidateCount then
-			break
+	if specialMode ~= "CIRCLE_HITBOX" then
+		for angleIndex = 1, Config.DodgeCandidateCount do
+			if #candidateDirections >= Config.DodgeCandidateCount then
+				break
+			end
+			local angle = (angleIndex - 1) * math.pi * 2 / Config.DodgeCandidateCount
+			addCandidateDirection(Vector3.new(math.cos(angle), 0, math.sin(angle)), "fallback-" .. tostring(angleIndex))
 		end
-		local angle = (angleIndex - 1) * math.pi * 2 / Config.DodgeCandidateCount
-		addCandidateDirection(Vector3.new(math.cos(angle), 0, math.sin(angle)), "fallback-" .. tostring(angleIndex))
 	end
 	for ringIndex, ringDistance in ipairs(ringDistances) do
 		for directionIndex, candidateInfo in ipairs(candidateDirections) do
@@ -1819,16 +1816,6 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 				rejection = if evaluation == "UNKNOWN" then "ground-unknown" else "no-ground"
 			elseif math.abs(grounded.Y - Root.Position.Y) > Config.DirectVerticalTolerance then
 				evaluation, rejection = "UNSAFE", "wrong-floor"
-			elseif
-				midgardianZone
-				and (
-					grounded.X < midgardianZone.XMin + 1
-					or grounded.X > midgardianZone.XMax - 1
-					or grounded.Z < midgardianZone.ZMin + 1
-					or grounded.Z > midgardianZone.ZMax - 1
-				)
-			then
-				evaluation, rejection = "UNSAFE", "midgardian-safe-zone"
 			elseif not pointIsSafeFromHazards(grounded) then
 				local _, routeStatus = dodgeRouteClear(grounded)
 				if routeStatus == "SAFE" then
@@ -3938,6 +3925,10 @@ local function resetNavigationForTarget(newTarget: Model?)
 	RuntimeState.KiteGoal = nil
 	RuntimeState.KiteDirection = Vector3.zero
 	RuntimeState.KiteMode = ""
+	RuntimeState.MidgardianOrbitUntil = 0
+	RuntimeState.MidgardianOrbitSide = 0
+	RuntimeState.CircleHitboxSource = nil
+	RuntimeState.CircleHitboxSide = Vector3.zero
 	RuntimeState.VerticalPathTarget = nil
 	RuntimeState.VerticalPathGoal = nil
 	RuntimeState.TargetRootSampleTarget = nil
@@ -4022,6 +4013,8 @@ local function clearDodgeObjective()
 	RuntimeState.BossDodgeSource = nil
 	RuntimeState.BossDodgeMode = ""
 	RuntimeState.BossDodgeDirection = Vector3.zero
+	RuntimeState.CircleHitboxSource = nil
+	RuntimeState.CircleHitboxSide = Vector3.zero
 	RuntimeState.DodgeRaycastsUsed = 0
 	RuntimeState.DodgeBudgetExhausted = false
 	LastHazardThreatAt = -math.huge
@@ -4289,6 +4282,10 @@ local function updateDodgeController(): boolean
 		circleHazard, circlePredicted, circleEdge, circleRoute = bossSpecialThreat("CIRCLE_HITBOX")
 		horizontalHazard, horizontalPredicted, horizontalEdge, horizontalRoute = bossSpecialThreat("HORIZONTAL_BEAM")
 	end
+	if not circleHazard and RuntimeState.CircleHitboxSource then
+		RuntimeState.CircleHitboxSource = nil
+		RuntimeState.CircleHitboxSide = Vector3.zero
+	end
 	if graceCircleHazard or circleHazard then
 		-- CircleHitbox immediately claims a committed A/D-style strafe for its
 		-- active Bob instance; this is not a future-coordinate prediction.
@@ -4312,10 +4309,15 @@ local function updateDodgeController(): boolean
 				RuntimeUtil.telemetry("BOSS", "mode=midgardian hazard=ignored-far")
 				hazard = nil
 			elseif targetRoot and (targetRoot.Position - Root.Position).Magnitude <= 80 then
-				-- updateTargetAndObjective is Midgardian's sole orbit selector. It has
-				-- already evaluated safe tangents this frame; Dodge only takes over for
-				-- a genuine footprint overlap with no usable orbit route.
-				if State == NavigationState.DIRECT and RuntimeState.KiteMode == "ORBIT" and NavigationGoal then
+				-- updateTargetAndObjective is the sole Midgardian orbit selector. A
+				-- confirmed skill is ignored only after the selected current orbit route
+				-- itself has passed the real-geometry test, never merely because a goal exists.
+				if
+					State == NavigationState.DIRECT
+					and RuntimeState.KiteMode == "ORBIT"
+					and NavigationGoal
+					and kiteRouteIsSafeFromHazards(NavigationGoal)
+				then
 					ActiveHazard = nil
 					return false
 				end
@@ -4412,13 +4414,19 @@ local function updateDodgeController(): boolean
 		local candidateStatus = "UNSAFE"
 		local selectedLabel: string? = nil
 		local selectedScore: number? = nil
-		local lockedSpecialDirection =
-			(specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM" or specialMode == "CIRCLE_HITBOX")
-			and RuntimeState.BossDodgeSource == specialSource
-			and RuntimeState.BossDodgeMode == specialMode
-			and RuntimeState.BossDodgeDirection.Magnitude > 0.1
+		local circleCommitted = specialMode == "CIRCLE_HITBOX"
+			and RuntimeState.CircleHitboxSource == specialSource
+			and RuntimeState.CircleHitboxSide.Magnitude > 0.1
+		local lockedSpecialDirection = circleCommitted
+			or (
+				(specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM")
+				and RuntimeState.BossDodgeSource == specialSource
+				and RuntimeState.BossDodgeMode == specialMode
+				and RuntimeState.BossDodgeDirection.Magnitude > 0.1
+			)
 		if lockedSpecialDirection then
-			local continued = Root.Position + RuntimeState.BossDodgeDirection.Unit * 8
+			local committedDirection = if circleCommitted then RuntimeState.CircleHitboxSide else RuntimeState.BossDodgeDirection
+			local continued = Root.Position + committedDirection.Unit * 8
 			local grounded, foundGround = RuntimeState.projectDodgeGround(continued, Target)
 			if
 				foundGround
@@ -4459,22 +4467,9 @@ local function updateDodgeController(): boolean
 			local fallback = Root.Position + outward.Unit * fallbackDistance
 			fallback = Vector3.new(fallback.X, Root.Position.Y, fallback.Z)
 			local grounded, foundGround = RuntimeState.projectDodgeGround(fallback, nil)
-			local emergencyZone = Target
-				and bossPolicyForTarget(Target)
-				and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
-				and RuntimeState.MidgardianSafeZone
 			if
 				foundGround
 				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-				and (
-					not emergencyZone
-					or (
-						grounded.X >= emergencyZone.XMin + 1
-						and grounded.X <= emergencyZone.XMax - 1
-						and grounded.Z >= emergencyZone.ZMin + 1
-						and grounded.Z <= emergencyZone.ZMax - 1
-					)
-				)
 				and pointIsSafeFromHazards(grounded)
 				and select(2, dodgeRouteClear(grounded)) == "SAFE"
 			then
@@ -4488,7 +4483,14 @@ local function updateDodgeController(): boolean
 			RuntimeState.DodgeHoldUntil = 0
 			RuntimeState.DodgeNoGoalSince = 0
 			RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
-			if specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM" or specialMode == "CIRCLE_HITBOX" then
+			if specialMode == "CIRCLE_HITBOX" then
+				local movement = Vector3.new(selectedGoal.X - Root.Position.X, 0, selectedGoal.Z - Root.Position.Z)
+				if movement.Magnitude > 0.1 then
+					RuntimeState.CircleHitboxSource = specialSource
+					RuntimeState.CircleHitboxSide = movement.Unit
+					RuntimeUtil.telemetry("BOSS", "mode=circle_hitbox side-committed")
+				end
+			elseif specialMode == "HORIZONTAL_BEAM" or specialMode == "SPREAD_BEAM" then
 				local movement = Vector3.new(selectedGoal.X - Root.Position.X, 0, selectedGoal.Z - Root.Position.Z)
 				if movement.Magnitude > 0.1 then
 					RuntimeState.BossDodgeSource = specialSource
@@ -5020,10 +5022,13 @@ local function updateTargetAndObjective()
 			return
 		end
 	elseif bossPolicy.Mode == "MIDGARDIAN" and distance3D <= 80 then
+		local boundaryRecoveryNeeded = Root.Position.X <= -633 or Root.Position.Z <= 376
 		if
 			RuntimeState.KiteMode == "ORBIT"
 			and RuntimeState.KiteGoal
-			and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+			and now < RuntimeState.MidgardianOrbitUntil
+			and not boundaryRecoveryNeeded
+			and now - ProgressState.LastMeaningfulAt < Config.SlowMovementRepathDelay
 			and directRouteClear(RuntimeState.KiteGoal, Target)
 			and pointIsSafeFromHazards(RuntimeState.KiteGoal)
 			and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
@@ -5042,6 +5047,8 @@ local function updateTargetAndObjective()
 			setNavigationState(NavigationState.DIRECT)
 			local radial = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z).Unit
 			local right = Vector3.new(-radial.Z, 0, radial.X)
+			RuntimeState.MidgardianOrbitSide = if orbitDirection:Dot(right) >= 0 then 1 else -1
+			RuntimeState.MidgardianOrbitUntil = now + 0.65
 			RuntimeUtil.telemetry(
 				"BOSS",
 				string.format("mode=orbit side=%s radius=%.1f", orbitDirection:Dot(right) >= 0 and "right" or "left", (orbitGoal - Root.Position).Magnitude)
@@ -5307,17 +5314,19 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 	end
 	local forward = toEnemy.Unit
 	local right = Vector3.new(-forward.Z, 0, forward.X)
-	local midgardianZone = lateralOnly
-		and Target
-		and bossPolicyForTarget(Target)
-		and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
-		and RuntimeState.MidgardianSafeZone
+	local orbitCorrection = Vector3.zero
+	if lateralOnly and Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN" then
+		if Root.Position.X <= -633 then orbitCorrection += Vector3.xAxis end
+		if Root.Position.Z <= 376 then orbitCorrection += Vector3.zAxis end
+		if orbitCorrection.Magnitude > 0.1 then
+			orbitCorrection = orbitCorrection.Unit * 0.25
+		end
+	end
+	local orbitPrimary = if RuntimeState.MidgardianOrbitSide < 0 then -right else right
 	local candidates = if lateralOnly
 		then {
-			{ Direction = right, Label = "right" },
-			{ Direction = -right, Label = "left" },
-			{ Direction = (right - forward * 0.35).Unit, Label = "right-outward" },
-			{ Direction = (-right - forward * 0.35).Unit, Label = "left-outward" },
+			{ Direction = (orbitPrimary + orbitCorrection).Unit, Label = "orbit-primary" },
+			{ Direction = (-orbitPrimary + orbitCorrection).Unit, Label = "orbit-opposite" },
 		}
 		elseif retreat
 		then {
@@ -5345,15 +5354,6 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 			if
 				foundGround
 				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-				and (
-					not midgardianZone
-					or (
-						grounded.X >= midgardianZone.XMin + 1
-						and grounded.X <= midgardianZone.XMax - 1
-						and grounded.Z >= midgardianZone.ZMin + 1
-						and grounded.Z <= midgardianZone.ZMax - 1
-					)
-				)
 				and hasGroundSupport(grounded, Target)
 				and directRouteClear(grounded, Target)
 				and pointIsSafeFromHazards(grounded)
@@ -5386,15 +5386,6 @@ chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: bo
 			if
 				foundGround
 				and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance
-				and (
-					not midgardianZone
-					or (
-						grounded.X >= midgardianZone.XMin + 1
-						and grounded.X <= midgardianZone.XMax - 1
-						and grounded.Z >= midgardianZone.ZMin + 1
-						and grounded.Z <= midgardianZone.ZMax - 1
-					)
-				)
 				and hasGroundSupport(grounded, Target)
 				and directRouteClear(grounded, Target)
 				and pointIsSafeFromHazards(grounded)
