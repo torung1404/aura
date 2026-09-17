@@ -32,7 +32,7 @@ local DEFAULT_CONFIG = {
 	NormalKiteApproachDistance = 75,
 	NormalKiteRetreatDistance = 75,
 	AttackRange = 15,
-	NormalSkillRange = 71,
+	NormalSkillRange = 75,
 	BossSkillRange = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
@@ -197,7 +197,7 @@ Config.ApproachDistance = nil
 -- Keep the owner boundary canonical: >75 approaches, <=75 retreats.
 Config.PreferredCombatDistance = 75
 -- Keep the current Q/E contract regardless of stale old config files.
-Config.NormalSkillRange = 71
+Config.NormalSkillRange = 75
 Config.BossSkillRange = 100
 Config.NormalKiteApproachDistance = 75
 Config.NormalKiteRetreatDistance = 75
@@ -249,7 +249,7 @@ local function saveConfig()
 		persisted.FarmEnabled = Config.FarmEnabled == true
 		persisted.DodgeEnabled = Config.DodgeEnabled == true
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
-		persisted.NormalSkillRange = 71
+		persisted.NormalSkillRange = 75
 		persisted.BossSkillRange = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
