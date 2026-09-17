@@ -5196,6 +5196,21 @@ local function updateTargetAndObjective()
 			setNavigationState(NavigationState.RETREAT)
 			return
 		end
+		-- The normal-mob band has one authoritative boundary: at any distance
+		-- above 55, stale RETREAT/RECOVERY ownership must be released before the
+		-- direct approach goal below is calculated.  The legacy 40/45 recovery
+		-- thresholds are not allowed to keep a mob at 75 in an avoidance state.
+		if
+			State == NavigationState.RETREAT
+			or RuntimeState.KiteMode == "RETREAT_DIAGONAL"
+			or RuntimeState.KiteMode == "RETREAT_VECTOR"
+		then
+			cancelPathRequest()
+			ProgressState.RecoveryGoal = nil
+			ProgressState.RecoveryUntil = 0
+			LastDirectDecisionAt = 0
+			setNavigationState(NavigationState.IDLE)
+		end
 	elseif bossPolicy.Mode == "MIDGARDIAN" and distance3D <= 80 then
 		local boundaryRecoveryNeeded = Root.Position.X <= -633 or Root.Position.Z <= 376
 		if
