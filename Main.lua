@@ -670,7 +670,7 @@ local BossPolicies = {
 	["crystal golem"] = { Mode = "STANDARD", SkillRange = 100 },
 	["ancient enchanted tree"] = { Mode = "STANDARD", SkillRange = 100 },
 	["enchanted forest dragon"] = { Mode = "STANDARD", SkillRange = 100 },
-	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 80, KiteDistance = 80 },
+	["midgardian champion"] = { Mode = "MIDGARDIAN", SkillRange = 81, KiteDistance = 80 },
 	["bob"] = { Mode = "BOB", SkillRange = 90, KiteDistance = 90 },
 	["bob the frost giant"] = { Mode = "BOB", SkillRange = 90, KiteDistance = 90 },
 	["odin"] = { Mode = "ODIN", SkillRange = 90, KiteDistance = 90 },
