@@ -74,7 +74,7 @@ local DEFAULT_CONFIG = {
 	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 1.5,
-	DodgeEnabled = false,
+	DodgeEnabled = true,
 	DodgeTriggerPadding = 2.5,
 	DodgePreTriggerPadding = 3.5,
 	DodgePlayerSafetyMargin = 1.5,
@@ -139,9 +139,9 @@ end
 local CONFIG_FILE = "AutoFarmV21Config.json"
 -- Version only the Dodge preference. Existing forced-OFF files migrate once;
 -- afterward the user's saved toggle remains authoritative.
--- Version 5 migrates the prior test-era OFF preference once. Subsequent user
+-- Version 6 migrates the prior forced-OFF test setting once. Subsequent user
 -- toggle changes persist normally and are never overwritten at runtime.
-local DODGE_CONFIG_VERSION = 5
+local DODGE_CONFIG_VERSION = 6
 local SavedConfig: { [string]: any } = {}
 if type(isfile) == "function" and type(readfile) == "function" then
 	local ok, decoded = pcall(function()
@@ -189,9 +189,6 @@ if not savedDodgeSettingIsCurrent then
 	Config.DodgeEnabled = DEFAULT_CONFIG.DodgeEnabled
 end
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
--- Dodge is intentionally disabled for the current runtime while movement is
--- being tested. Do not let an older persisted ON toggle re-enable it on load.
-Config.DodgeEnabled = false
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
 -- Keep the current Q/E contract regardless of stale old config files.
@@ -245,9 +242,7 @@ local function saveConfig()
 			end
 		end
 		persisted.FarmEnabled = Config.FarmEnabled == true
-		-- Movement-only test mode deliberately persists Dodge OFF so an old UI
-		-- setting cannot reactivate the controller on the next execution.
-		persisted.DodgeEnabled = false
+		persisted.DodgeEnabled = Config.DodgeEnabled == true
 		persisted.DodgeConfigVersion = DODGE_CONFIG_VERSION
 		persisted.NormalSkillRange = 80
 		persisted.BossSkillRange = 100
@@ -434,6 +429,7 @@ local RuntimeState = {
 	DodgeBudgetExhausted = false,
 	DodgeEvaluationSerial = 0,
 	DodgeDirection = Vector3.zero,
+	LastDodgeEnabled = Config.DodgeEnabled,
 	BossDodgeSource = nil :: Instance?,
 	BossDodgeMode = "",
 	BossDodgeDirection = Vector3.zero,
@@ -462,6 +458,10 @@ local RuntimeState = {
 	DirectRouteCacheOrigin = nil :: Vector3?,
 	DirectRouteCacheDirection = Vector3.zero,
 	DirectRouteCacheResult = false,
+	LocalBlockedDirection = Vector3.zero,
+	LocalBlockedUntil = 0,
+	RecoveryGoalDistance = math.huge,
+	RecoveryGoalStartedAt = 0,
 	WallProcessedRoot = nil :: Instance?,
 	WallProcessedRound = -1,
 	WallDiagnosticRoot = nil :: Instance?,
@@ -909,6 +909,12 @@ local function hazardCandidateReason(part: BasePart): string?
 	if ignoredSkillPart(part) then
 		return nil
 	end
+	-- HorizontalBeam is a confirmed runtime container. It must reach the
+	-- special lateral-response path even when its child Part is not red, thin,
+	-- or non-colliding enough for the generic visual classifier.
+	if specialSkillKind(part) == "HORIZONTAL_BEAM" then
+		return "known-horizontal-beam"
+	end
 	local dimensions = { part.Size.X, part.Size.Y, part.Size.Z }
 	table.sort(dimensions)
 	local broadAndThin = dimensions[1] <= 5 and dimensions[2] >= 5 and dimensions[3] >= 5
@@ -949,6 +955,9 @@ local function isActiveHazardPart(part: BasePart): boolean
 	end
 	if part.Size.X <= 0.05 or part.Size.Y <= 0.05 or part.Size.Z <= 0.05 then
 		return false
+	end
+	if specialSkillKind(part) == "HORIZONTAL_BEAM" then
+		return true
 	end
 	local color = part.Color
 	local visiblyRed = color.R >= 0.65 and color.R >= color.G * 1.35 and color.R >= color.B * 1.2
@@ -1096,6 +1105,11 @@ RuntimeState.disableStaticWallCollision = function(instance: Instance): boolean
 		return false
 	end
 	instance.CanCollide = false
+	-- A route result may have been sampled while this map obstruction still
+	-- collided. Force the next direct probe to observe the changed geometry.
+	RuntimeState.DirectRouteCacheAt = -math.huge
+	RuntimeState.DirectRouteCacheGoal = nil
+	RuntimeState.DirectRouteCacheResult = false
 	RuntimeState.wallDiagnostic(instance, "disable", "static-non-ground-obstruction")
 	return true
 end
@@ -2078,6 +2092,68 @@ local function directRouteClear(goal: Vector3, target: Model?): boolean
 	RuntimeState.DirectRouteCacheDirection = direction
 	RuntimeState.DirectRouteCacheResult = result
 	return result
+end
+
+RuntimeState.chooseHorizontalBeamGoal = function(beam: BasePart): (Vector3?, string?, number?)
+	if not Root then
+		return nil, nil, nil
+	end
+	local targetRoot = if Target and validTarget(Target) then getTargetRoot(Target) else nil
+	local forward = targetRoot and Vector3.new(targetRoot.Position.X - Root.Position.X, 0, targetRoot.Position.Z - Root.Position.Z)
+		or Vector3.new(Root.CFrame.LookVector.X, 0, Root.CFrame.LookVector.Z)
+	if forward.Magnitude <= 0.1 then
+		forward = Vector3.new(0, 0, -1)
+	else
+		forward = forward.Unit
+	end
+	local right = Vector3.new(-forward.Z, 0, forward.X)
+	local sides = {
+		{ Direction = -right, Label = "left" },
+		{ Direction = right, Label = "right" },
+	}
+	local bestGoal: Vector3? = nil
+	local bestLabel: string? = nil
+	local bestScore = -math.huge
+	local partialGoal: Vector3? = nil
+	local partialLabel: string? = nil
+	local partialScore = -math.huge
+	for _, distance in ipairs({ 8, 12, 16 }) do
+		for _, side in ipairs(sides) do
+			local rawGoal = Root.Position + side.Direction * distance
+			local grounded, foundGround = RuntimeState.projectDodgeGround(rawGoal, Target)
+			if foundGround and math.abs(grounded.Y - Root.Position.Y) <= Config.DirectVerticalTolerance then
+				local routeSafe, routeStatus = dodgeRouteClear(grounded)
+				if routeSafe and routeStatus == "SAFE" then
+					local obstacle = workspace:Raycast(
+						Root.Position + Vector3.new(0, 2.5, 0),
+						side.Direction * distance,
+						makeRaycastParams(Target)
+					)
+					local clearance = obstacle and obstacle.Distance or distance
+					local continuity = if RuntimeState.BossDodgeSource == (skillModelForPart(beam) or beam)
+						then RuntimeState.BossDodgeDirection:Dot(side.Direction) * 2
+						else 0
+					local score = clearance * 3 - distance * 0.2 + continuity
+					if pointIsSafeFromHazards(grounded) and score > bestScore then
+						bestGoal, bestLabel, bestScore = grounded, side.Label, score
+					elseif not pointIsSafeFromHazards(grounded) then
+						local _, overlaps, minimumClearance = dodgeDestinationSafety(grounded)
+						local candidatePartialScore = score + minimumClearance - overlaps * 20
+						if candidatePartialScore > partialScore then
+							partialGoal, partialLabel, partialScore = grounded, side.Label .. "-partial", candidatePartialScore
+						end
+					end
+				end
+			end
+		end
+		if bestGoal then
+			break
+		end
+	end
+	if bestGoal then
+		return bestGoal, bestLabel, bestScore
+	end
+	return partialGoal, partialLabel, partialScore
 end
 
 local function navigationGoalForTarget(enemyRoot: BasePart, target: Model, holdDistance: number?): Vector3
@@ -3289,6 +3365,10 @@ local function resetProgress(target: Model?, goal: Vector3?)
 	ProgressState.RecoveryGoal = nil
 	ProgressState.RecoveryUntil = 0
 	ProgressState.SteeringTried = false
+	RuntimeState.RecoveryGoalDistance = math.huge
+	RuntimeState.RecoveryGoalStartedAt = 0
+	RuntimeState.LocalBlockedDirection = Vector3.zero
+	RuntimeState.LocalBlockedUntil = 0
 end
 
 local function pathRemainingMetric(): number
@@ -3372,30 +3452,45 @@ local function chooseRecoveryDetour(goal: Vector3, retreat: boolean?): Vector3?
 	if flatGoal.Magnitude <= 0.01 then
 		return nil
 	end
+	local now = os.clock()
 	local forward = flatGoal.Unit
-	local candidates = {}
-	local angle = math.atan2(forward.Z, forward.X)
-	for index = 0, 11 do
-		local heading = angle + index * math.pi / 6
-		table.insert(candidates, Vector3.new(math.cos(heading), 0, math.sin(heading)))
-	end
+	local right = Vector3.new(-forward.Z, 0, forward.X)
+	local left = -right
+	-- These are short, distinct escape choices around the blocked command. They
+	-- run before PATH, so a normal wall/corner does not consume the long recovery
+	-- window just to discover that the original forward direction is blocked.
+	local candidates = {
+		(forward + left).Unit,
+		(forward + right).Unit,
+		left,
+		right,
+		(-forward + left).Unit,
+		(-forward + right).Unit,
+	}
 	local bestGoal: Vector3? = nil
 	local bestScore = -math.huge
 	for _, direction in ipairs(candidates) do
-		local clearance = rayClearance(Root.Position, direction, Target)
-		local candidate = Root.Position + direction * math.max(3, clearance - 1.5)
-		local grounded, foundGround = projectToWalkableGround(candidate, Target)
-		if
-			foundGround
-			and directRouteClear(grounded, Target)
-			and dodgeRouteClear(grounded)
-			and pointIsSafeFromHazards(grounded)
-		then
-			local goalGain = (goal - Root.Position).Magnitude - (goal - grounded).Magnitude
-			local heightGain = math.abs(goal.Y - Root.Position.Y) - math.abs(goal.Y - grounded.Y)
-			local score = clearance + goalGain * 2 + heightGain + forward:Dot(direction) * 3
-			if score > bestScore and (not retreat or goalGain > 1) then
-				bestScore, bestGoal = score, grounded
+		if not (
+			now < RuntimeState.LocalBlockedUntil
+			and RuntimeState.LocalBlockedDirection.Magnitude > 0.1
+			and RuntimeState.LocalBlockedDirection:Dot(direction) >= 0.92
+		) then
+			local clearance = rayClearance(Root.Position, direction, Target)
+			local travel = math.min(8, math.max(3, clearance - 1.5))
+			local candidate = Root.Position + direction * travel
+			local grounded, foundGround = projectToWalkableGround(candidate, Target)
+			if
+				foundGround
+				and directRouteClear(grounded, Target)
+				and kiteRouteIsSafeFromHazards(grounded)
+				and pointIsSafeFromHazards(grounded)
+			then
+				local goalGain = (goal - Root.Position).Magnitude - (goal - grounded).Magnitude
+				local heightGain = math.abs(goal.Y - Root.Position.Y) - math.abs(goal.Y - grounded.Y)
+				local score = goalGain * 4 + clearance * 2 + heightGain + forward:Dot(direction)
+				if score > bestScore and (not retreat or goalGain > 1) then
+					bestScore, bestGoal = score, grounded
+				end
 			end
 		end
 	end
@@ -3406,6 +3501,8 @@ local function beginLocalRecovery(goal: Vector3)
 	ProgressState.RecoveryGoal = chooseRecoveryDetour(goal)
 	if ProgressState.RecoveryGoal then
 		ProgressState.RecoveryUntil = os.clock() + Config.DetourDuration
+		RuntimeState.RecoveryGoalDistance = if Root then (ProgressState.RecoveryGoal - Root.Position).Magnitude else math.huge
+		RuntimeState.RecoveryGoalStartedAt = os.clock()
 		setNavigationState(NavigationState.RECOVERY)
 		return
 	end
@@ -3413,6 +3510,8 @@ local function beginLocalRecovery(goal: Vector3)
 	-- back to PATH so its bounded, verified fallback can move while a new path is
 	-- requested; the next Heartbeat performs that request without duplicating it.
 	ProgressState.RecoveryUntil = 0
+	RuntimeState.RecoveryGoalDistance = math.huge
+	RuntimeState.RecoveryGoalStartedAt = 0
 	RuntimeUtil.telemetry("RECOVERY", "fallback=path reason=no-local-detour")
 	setNavigationState(NavigationState.PATH)
 end
@@ -3688,6 +3787,36 @@ local function updateRecoveryMovement()
 	if ProgressState.RecoveryGoal and os.clock() < ProgressState.RecoveryUntil then
 		local direction = Vector3.new(ProgressState.RecoveryGoal.X - Root.Position.X, 0, ProgressState.RecoveryGoal.Z - Root.Position.Z)
 		if direction.Magnitude > Config.WaypointReachedDistance then
+			local now = os.clock()
+			local horizontalSpeed = Vector3.new(Root.AssemblyLinearVelocity.X, 0, Root.AssemblyLinearVelocity.Z).Magnitude
+			local routeStillValid = directRouteClear(ProgressState.RecoveryGoal, Target)
+				and kiteRouteIsSafeFromHazards(ProgressState.RecoveryGoal)
+				and pointIsSafeFromHazards(ProgressState.RecoveryGoal)
+			local progressed = direction.Magnitude <= RuntimeState.RecoveryGoalDistance - 0.5
+			if progressed then
+				RuntimeState.RecoveryGoalDistance = direction.Magnitude
+				RuntimeState.LocalBlockedDirection = Vector3.zero
+				RuntimeState.LocalBlockedUntil = 0
+			elseif
+				not routeStillValid
+				or (
+					now - RuntimeState.RecoveryGoalStartedAt >= 0.4
+					and horizontalSpeed <= 1.5
+				)
+			then
+				-- This direction is a local failure, not an eight-second recovery
+				-- event. Remember it briefly and immediately evaluate the other side.
+				RuntimeState.LocalBlockedDirection = direction.Unit
+				RuntimeState.LocalBlockedUntil = now + 0.65
+				ProgressState.RecoveryGoal = nil
+				ProgressState.RecoveryUntil = 0
+				RuntimeUtil.telemetry("RECOVERY", "local-reselect=blocked-or-no-progress")
+				beginLocalRecovery(NavigationGoal or Root.Position)
+				if State == NavigationState.PATH then
+					updatePathNavigation()
+				end
+				return
+			end
 			Humanoid:Move(direction.Unit, false)
 			return
 		end
@@ -3747,10 +3876,14 @@ local function decideNavigation()
 		ProgressState.RecoveryGoal = nil
 		setNavigationState(NavigationState.DIRECT)
 	else
-		-- A blocked DIRECT route must start path computation immediately. Waiting for
-		-- a full STEER interval made the controller repeatedly resume DIRECT into the
-		-- same basic Part, producing bursty stop/start movement at walls and corners.
+		-- A blocked DIRECT route gets a short local sidestep first. Waiting for the
+		-- long recovery window used to resume DIRECT into the same BasicPart.
 		ProgressState.SteeringTried = true
+		local blockedDirection = Vector3.new(NavigationGoal.X - Root.Position.X, 0, NavigationGoal.Z - Root.Position.Z)
+		if blockedDirection.Magnitude > 0.1 then
+			RuntimeState.LocalBlockedDirection = blockedDirection.Unit
+			RuntimeState.LocalBlockedUntil = now + 0.65
+		end
 		cancelPathRequest()
 		beginLocalRecovery(NavigationGoal)
 	end
@@ -4037,6 +4170,16 @@ local function leaveDodge()
 end
 
 local function updateDodgeController(): boolean
+	if RuntimeState.LastDodgeEnabled ~= Config.DodgeEnabled then
+		-- A toggle starts from a clean ownership boundary in both directions; no
+		-- old goal, hold, or beam-side commitment may leak into the next mode.
+		RuntimeState.LastDodgeEnabled = Config.DodgeEnabled
+		clearDodgeObjective()
+		table.clear(NearbyActiveHazards)
+		table.clear(HazardSet)
+		table.clear(RuntimeState.HazardMetadata)
+		LastHazardRefreshAt = -math.huge
+	end
 	if not Config.DodgeEnabled then
 		if State == NavigationState.DODGE then
 			leaveDodge()
@@ -4093,8 +4236,15 @@ local function updateDodgeController(): boolean
 	RuntimeState.DodgeRaycastsUsed = 0
 	RuntimeState.DodgeBudgetExhausted = false
 	RuntimeState.DodgeEvaluationSerial += 1
-	if graceHorizontalHazard then
-		hazard, predicted, edgeDistance, routeDistance = horizontalBeamThreat()
+	local horizontalHazard, horizontalPredicted, horizontalEdge, horizontalRoute
+	local policy = Target and bossPolicyForTarget(Target)
+	if graceHorizontalHazard or (policy and policy.Mode == "BOB") then
+		horizontalHazard, horizontalPredicted, horizontalEdge, horizontalRoute = horizontalBeamThreat()
+	end
+	if graceHorizontalHazard or horizontalHazard then
+		-- HorizontalBeam is a confirmed Bob mechanic. Its appearance gets the
+		-- lateral response before generic proximity/prediction ranking.
+		hazard, predicted, edgeDistance, routeDistance = horizontalHazard, horizontalPredicted, horizontalEdge, horizontalRoute
 	else
 		hazard, predicted, edgeDistance, routeDistance = threateningHazard()
 	end
@@ -4209,7 +4359,11 @@ local function updateDodgeController(): boolean
 		if lockedSpecialDirection then
 			local continued = Root.Position + RuntimeState.BossDodgeDirection.Unit * 8
 			local grounded, foundGround = RuntimeState.projectDodgeGround(continued, Target)
-			if foundGround and pointIsSafeFromHazards(grounded) and select(2, dodgeRouteClear(grounded)) == "SAFE" then
+			if
+				foundGround
+				and select(2, dodgeRouteClear(grounded)) == "SAFE"
+				and (specialMode == "HORIZONTAL_BEAM" or pointIsSafeFromHazards(grounded))
+			then
 				selectedGoal, candidateStatus, selectedLabel = grounded, "SAFE", "locked-side"
 			else
 				if specialMode == "HORIZONTAL_BEAM" then
@@ -4223,7 +4377,10 @@ local function updateDodgeController(): boolean
 				end
 			end
 		end
-		if not selectedGoal and not lockedSpecialDirection then
+		if not selectedGoal and not lockedSpecialDirection and specialMode == "HORIZONTAL_BEAM" then
+			selectedGoal, selectedLabel, selectedScore = RuntimeState.chooseHorizontalBeamGoal(hazard)
+			candidateStatus = if selectedGoal then "SAFE" else "UNSAFE"
+		elseif not selectedGoal and not lockedSpecialDirection then
 			selectedGoal, candidateStatus, selectedLabel, selectedScore = chooseNearestSafeDodgeGoal(hazard)
 		end
 		if not selectedGoal and candidateStatus == "UNKNOWN" and reusableGoal then
