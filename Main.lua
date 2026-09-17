@@ -192,6 +192,10 @@ end
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
+-- A legacy saved combat distance could be larger than the current kite band,
+-- leaving a normal mob at 70–74 studs in COMBAT even though Kite displays 70.
+-- Keep the owner boundary canonical: >70 approaches, <=70 retreats.
+Config.PreferredCombatDistance = 70
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 71
 Config.BossSkillRange = 100
