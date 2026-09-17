@@ -4647,7 +4647,7 @@ local function recoveryAbortReason(allowRespawnGrace: boolean?): string?
 	if not allowRespawnGrace and os.clock() < RuntimeState.RespawnRushUntil then
 		return "respawn-grace"
 	end
-	if cachedStartScreen() then
+	if cachedStartScreen() and alive() then
 		return "start-screen"
 	end
 	return nil
@@ -5392,6 +5392,25 @@ local function bindCharacter(character: Model)
 				end
 			end)
 		)
+		if Running and boundHumanoid.Health <= 0 then
+			-- A loader can execute after this Humanoid has already died, so its Died
+			-- signal will never fire for this generation. Recover that late-bound dead
+			-- character instead of remaining IDLE at HP 0 until another watchdog acts.
+			local executionGeneration = RuntimeState.Generation
+			task.defer(function()
+				task.wait(0.65)
+				if
+					RuntimeUtil.isCurrentExecution()
+					and RuntimeState.Generation == executionGeneration
+					and Running
+					and Player.Character == character
+					and boundHumanoid == Humanoid
+					and not alive()
+				then
+					recoverByRespawn(nil, nil)
+				end
+			end)
+		end
 	end
 end
 
