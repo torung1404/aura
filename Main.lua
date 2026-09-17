@@ -5082,6 +5082,18 @@ local function updateTargetAndObjective()
 		-- at the hold distance it naturally becomes a safe D-style strafe.
 		if
 			RuntimeState.KiteMode == "BOB_DIAGONAL"
+			and NavigationGoal
+			and (State == NavigationState.RECOVERY or State == NavigationState.STEER or State == NavigationState.PATH)
+		then
+			-- A Bob goal that met a wall must leave translation to the shared local
+			-- detour/PATH owner. Reissuing DIRECT here every frame was what kept the
+			-- character pressing into a simple wall until the 12-second watchdog.
+			updateProgressTracking()
+			runRecoveryPolicy()
+			return
+		end
+		if
+			RuntimeState.KiteMode == "BOB_DIAGONAL"
 			and RuntimeState.KiteGoal
 			and now - LastGoalRefreshAt < Config.GoalRefreshInterval
 			and directRouteClear(RuntimeState.KiteGoal, Target)
@@ -5090,7 +5102,9 @@ local function updateTargetAndObjective()
 		then
 			NavigationGoal = RuntimeState.KiteGoal
 			setNavigationState(NavigationState.DIRECT)
+			decideNavigation()
 			updateProgressTracking()
+			runRecoveryPolicy()
 			return
 		end
 		LastGoalRefreshAt = now
@@ -5128,7 +5142,9 @@ local function updateTargetAndObjective()
 			RuntimeState.KiteMode = "BOB_DIAGONAL"
 			NavigationGoal = bobGoal
 			setNavigationState(NavigationState.DIRECT)
+			decideNavigation()
 			updateProgressTracking()
+			runRecoveryPolicy()
 			return
 		end
 	end
