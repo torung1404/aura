@@ -34,6 +34,7 @@ local DEFAULT_CONFIG = {
 	AttackRange = 15,
 	NormalSkillRange = 61,
 	QSkillRange = 100,
+	NormalSkillCooldownHoldDistance = 100,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
 	-- six seconds to reach a target without retreat/path state churn.
 	RespawnRushDuration = 6,
@@ -209,6 +210,7 @@ Config.NormalSkillRange = 61
 -- Q is a separate close-combat opener.  Do not inherit the normal/boss E
 -- range, which is selected through skillRangeForTarget().
 Config.QSkillRange = 100
+Config.NormalSkillCooldownHoldDistance = 100
 Config.NormalKiteApproachDistance = 60
 Config.NormalKiteRetreatDistance = 60
 Config.KiteDistance = 60
@@ -275,6 +277,7 @@ local function saveConfig()
 		persisted.NormalKiteRetreatDistance = 60
 		persisted.KiteDistance = 60
 		persisted.QSkillRange = 100
+		persisted.NormalSkillCooldownHoldDistance = 100
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
 	end)
 end
@@ -343,6 +346,7 @@ local CombatState = {
 	LastAttack = 0,
 	NextQAt = 0,
 	NextEAt = 0,
+	CooldownHoldTarget = nil :: Model?,
 	BindSerial = 0,
 }
 local TargetDiedConnection: RBXScriptConnection? = nil
@@ -3251,7 +3255,11 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 		return
 	end
 	local now = os.clock()
-	if distance3D <= Config.QSkillRange and now >= CombatState.NextQAt then
+	if
+		distance3D <= Config.QSkillRange
+		and now >= CombatState.NextQAt
+		and CombatState.CooldownHoldTarget ~= Target
+	then
 		local minimum = math.max(0.1, Config.QCooldownMin)
 		local maximum = math.max(minimum, Config.QCooldownMax)
 		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
@@ -3263,6 +3271,11 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 	if distance3D <= activeSkillRange and now >= CombatState.NextEAt then
 		if activateSkill(Config.SkillEToolName, Enum.KeyCode.E) then
 			CombatState.NextEAt = now + math.max(0.1, Config.ECooldown)
+			if not bossPolicyForTarget(Target) then
+				-- Q has its own 100-stud opener. Arm the distance hold only after E
+				-- actually fires, otherwise Q alone would keep a normal mob out of E range.
+				CombatState.CooldownHoldTarget = Target
+			end
 			RuntimeUtil.telemetry("COMBAT_E", "E")
 		end
 	end
@@ -4186,7 +4199,7 @@ resetRuntimeForNewDungeon = function()
 	LastTargetAcquireAt = -math.huge
 	RuntimeState.LastFallbackTargetScanAt = -math.huge
 	NoTargetSince = now
-	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
+	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack, CombatState.CooldownHoldTarget = 0, 0, 0, nil
 	CombatState.BindSerial = CharacterBindSerial
 	State = NavigationState.IDLE
 	stopTranslation()
@@ -5174,6 +5187,32 @@ local function updateTargetAndObjective()
 		end
 	end
 	if not bossPolicy then
+		-- After a completed normal-mob Q/E cycle, create separation while both
+		-- skills recharge. Bosses deliberately bypass this owner entirely.
+		if CombatState.CooldownHoldTarget and CombatState.CooldownHoldTarget ~= Target then
+			CombatState.CooldownHoldTarget = nil
+		end
+		if CombatState.CooldownHoldTarget == Target then
+			if now < CombatState.NextQAt or now < CombatState.NextEAt then
+				local cooldownGoal = navigationGoalForTarget(enemyRoot, Target, Config.NormalSkillCooldownHoldDistance)
+				if (cooldownGoal - Root.Position).Magnitude > Config.DirectReachedDistance + 2 then
+					cancelPathRequest()
+					RuntimeState.KiteGoal = cooldownGoal
+					RuntimeState.KiteDirection = Vector3.new(cooldownGoal.X - Root.Position.X, 0, cooldownGoal.Z - Root.Position.Z).Unit
+					RuntimeState.KiteMode = "NORMAL_SKILL_COOLDOWN_HOLD"
+					NavigationGoal = cooldownGoal
+					setNavigationState(NavigationState.DIRECT)
+					updateProgressTracking()
+					return
+				end
+				-- The target is already in the requested 100-stud band. Do not let
+				-- the ordinary 60-stud kite branch pull the character back in early.
+				NavigationGoal = nil
+				setNavigationState(NavigationState.COMBAT)
+				return
+			end
+			CombatState.CooldownHoldTarget = nil
+		end
 		-- Keep a small stable lateral band around the desired 60-stud spacing.
 		-- Only retreat after we are genuinely inside that band; otherwise a mob at
 		-- 60 would repeatedly alternate between approach and retreat every refresh.
@@ -5258,6 +5297,7 @@ local function updateTargetAndObjective()
 			or RuntimeState.KiteMode == "RETREAT_VECTOR"
 			or RuntimeState.KiteMode == "NORMAL_STRAFE"
 			or RuntimeState.KiteMode == "NORMAL_APPROACH_DIAGONAL"
+			or RuntimeState.KiteMode == "NORMAL_SKILL_COOLDOWN_HOLD"
 		then
 			cancelPathRequest()
 			ProgressState.RecoveryGoal = nil
@@ -5564,7 +5604,7 @@ local function bindCharacter(character: Model)
 		DefaultAutoRotate = Humanoid.AutoRotate
 		DefaultWalkSpeed = Humanoid.WalkSpeed
 	end
-	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack = 0, 0, 0
+	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack, CombatState.CooldownHoldTarget = 0, 0, 0, nil
 	CombatState.BindSerial = CharacterBindSerial
 	RespawnInProgress = false
 	ResetExecuting = false
