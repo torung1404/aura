@@ -72,7 +72,7 @@ local DEFAULT_CONFIG = {
 	SlowMovementSpeedThreshold = 10,
 	SlowMovementRepathDelay = 0.35,
 	SlowMovementRepathCooldown = 0.35,
-	RespawnStuckTime = 6,
+	RespawnStuckTime = 12,
 	DetourProbeDistance = 13,
 	DetourDuration = 0.45,
 	DodgeEnabled = false,
@@ -195,7 +195,7 @@ if SavedConfig.AutoStartConfigVersion ~= 1 then
 	Config.AutoStart = DEFAULT_CONFIG.AutoStart
 end
 Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
-Config.RespawnStuckTime = 6
+Config.RespawnStuckTime = 12
 Config.RecoveryRefreshAt = 3
 Config.SlowMovementRepathDelay = 0.35
 Config.SlowMovementRepathCooldown = 0.35
@@ -2499,11 +2499,11 @@ local function updateGlobalStuckJump()
 	if physicalProgress then
 		RuntimeState.JumpStillSince = now
 	elseif now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
-		-- A target/goal proves intent, not physical movement. Preserve the continuous
-		-- stalled episode and hand the targeted watchdog its original timestamp.
+		-- This is the single hard-stuck authority used by both HUD and respawn.
+		-- Target/goal bookkeeping is deliberately not part of this episode.
 		if Target and validTarget(Target) and NavigationGoal then
 			RuntimeUtil.telemetry("STUCK_HARD", "hard-respawn target=" .. Target.Name)
-			recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
+			recoverByRespawn(Target, nil, false, RuntimeState.JumpStillSince)
 		else
 			recoverByRespawn(nil, nil, false, RuntimeState.JumpStillSince)
 		end
@@ -4702,13 +4702,6 @@ local function runRecoveryPolicy()
 		ProgressState.LowSpeedSince = nil
 	end
 	local stuckFor = now - ProgressState.LastMeaningfulAt
-	if stuckFor >= Config.RespawnStuckTime then
-		-- Local detours and path retries have already been allowed below this hard
-		-- deadline. Do not turn a configured six-second stall into a longer wait.
-		RuntimeUtil.telemetry("STUCK_HARD", string.format("hard-respawn target=%s age=%.1f", Target.Name, stuckFor))
-		recoverByRespawn(Target, ProgressState.LastMeaningfulAt)
-		return
-	end
 	if stuckFor >= Config.RecoveryRefreshAt and now - ProgressState.LastStuckPathRetryAt >= Config.StuckPathRetryInterval then
 		-- A BasicPart edge can stop a direct route without blocking it outright.
 		-- Rebuild the route before escalating to a character reset.
@@ -4797,6 +4790,7 @@ recoverByRespawn = function(
 				or not expectedRoot
 				or (verticalRecovery and expectedRoot.Position.Y - Root.Position.Y <= 75)
 				or (not verticalRecovery and movedSinceRecovery)
+				or (not verticalRecovery and globalStuckAt and RuntimeState.JumpStillSince ~= globalStuckAt)
 			then
 				releaseRecoveryIfOwned()
 				return
@@ -5194,7 +5188,19 @@ local function updateTargetAndObjective()
 		end
 		if CombatState.CooldownHoldTarget == Target then
 			if now < CombatState.NextQAt or now < CombatState.NextEAt then
-				local cooldownGoal = navigationGoalForTarget(enemyRoot, Target, Config.NormalSkillCooldownHoldDistance)
+				-- Do not call navigationGoalForTarget here: its vertical safety fallback
+				-- may return targetGround, which is the enemy's feet rather than this
+				-- normal-mob-only 100-stud cooldown hold position.
+				local flat = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z)
+				local height = math.abs(enemyRoot.Position.Y - Root.Position.Y)
+				local horizontalHold = math.sqrt(math.max(0, Config.NormalSkillCooldownHoldDistance ^ 2 - height ^ 2))
+				local cooldownDesired = if flat.Magnitude > 0.1
+					then enemyRoot.Position - flat.Unit * horizontalHold
+					else Root.Position
+				local cooldownGoal, foundCooldownGround = projectToWalkableGround(cooldownDesired, Target)
+				if not foundCooldownGround then
+					cooldownGoal = cooldownDesired
+				end
 				if (cooldownGoal - Root.Position).Magnitude > Config.DirectReachedDistance + 2 then
 					cancelPathRequest()
 					RuntimeState.KiteGoal = cooldownGoal
