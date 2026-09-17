@@ -26,11 +26,11 @@ local DEFAULT_CONFIG = {
 	TargetAcquireInterval = 1,
 	GoalRefreshInterval = 0.15,
 	TargetLockRangeMultiplier = 1.25,
-	PreferredCombatDistance = 70,
+	PreferredCombatDistance = 75,
 	RetreatEnterDistance = 40,
 	RetreatExitDistance = 45,
-	NormalKiteApproachDistance = 70,
-	NormalKiteRetreatDistance = 70,
+	NormalKiteApproachDistance = 75,
+	NormalKiteRetreatDistance = 75,
 	AttackRange = 15,
 	NormalSkillRange = 71,
 	BossSkillRange = 100,
@@ -38,7 +38,7 @@ local DEFAULT_CONFIG = {
 	-- six seconds to reach a target without retreat/path state churn.
 	RespawnRushDuration = 6,
 	HorizontalBeamGraceDuration = 3,
-	KiteDistance = 70,
+	KiteDistance = 75,
 	KiteHysteresis = 3,
 	AttackCooldown = 0.12,
 	QCooldownMin = 0.3,
@@ -193,15 +193,15 @@ Config.DodgeConfigVersion = DODGE_CONFIG_VERSION
 Config.RespawnStuckTime = 12
 Config.ApproachDistance = nil
 -- A legacy saved combat distance could be larger than the current kite band,
--- leaving a normal mob at 70–74 studs in COMBAT even though Kite displays 70.
--- Keep the owner boundary canonical: >70 approaches, <=70 retreats.
-Config.PreferredCombatDistance = 70
+-- leaving a normal mob at 75 studs in COMBAT even though Kite displays 75.
+-- Keep the owner boundary canonical: >75 approaches, <=75 retreats.
+Config.PreferredCombatDistance = 75
 -- Keep the current Q/E contract regardless of stale old config files.
 Config.NormalSkillRange = 71
 Config.BossSkillRange = 100
-Config.NormalKiteApproachDistance = 70
-Config.NormalKiteRetreatDistance = 70
-Config.KiteDistance = 70
+Config.NormalKiteApproachDistance = 75
+Config.NormalKiteRetreatDistance = 75
+Config.KiteDistance = 75
 Config.QCooldownMin = 0.3
 Config.QCooldownMax = 0.5
 Config.ECooldown = 0.4
