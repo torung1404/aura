@@ -447,6 +447,7 @@ local RuntimeState = {
 	CharacterBindTimeoutReported = false,
 	CharacterBindStartedAt = 0,
 	LastCharacterBindWait = "",
+	LastCharacterBindProbeAt = -math.huge,
 	SmoothedFPS = 0,
 	HUDInfo = nil :: TextLabel?,
 	HUDButton = nil :: TextButton?,
@@ -5092,6 +5093,33 @@ local function updateTargetAndObjective()
 		cancelPathRequest()
 		NavigationGoal = nil
 		ProgressState.RecoveryGoal = nil
+		-- Target discovery can be briefly empty after a replay/respawn even though
+		-- the character is ready.  Reuse the bounded exploration controller rather
+		-- than leaving the farm in permanent IDLE with no route to new enemies.
+		if not Target and Root and Humanoid and NoTargetSince and now - NoTargetSince >= Config.ExploreStartDelay then
+			local reachedExploreGoal = ExploreGoal
+				and flatPointDistance(Root.Position, ExploreGoal) <= Config.ExploreReachedDistance
+			if
+				not ExploreGoal
+				or reachedExploreGoal
+				or now >= ExploreCommitUntil
+				or now - LastExploreSelectionAt >= Config.ExploreReselectAfter
+			then
+				LastExploreSelectionAt = now
+				local exploreGoal, exploreDirection = RuntimeState.chooseExploreGoal()
+				if exploreGoal and exploreDirection then
+					ExploreGoal = exploreGoal
+					ExploreHeading = exploreDirection
+					ExploreBestDistance = flatPointDistance(Root.Position, exploreGoal)
+					ExploreCommitUntil = now + Config.ExploreCommitTime
+					LastExploreMeaningfulProgressAt = now
+				end
+			end
+			if ExploreGoal then
+				setNavigationState(NavigationState.EXPLORE)
+				return
+			end
+		end
 		setNavigationState(NavigationState.IDLE)
 		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
 		return
@@ -5559,7 +5587,15 @@ local function bindCharacter(character: Model)
 	end
 	local serial = CharacterBindSerial
 	local newHumanoid = character:FindFirstChildOfClass("Humanoid")
-	local newRoot = character:FindFirstChild("HumanoidRootPart")
+	local namedRoot = character:FindFirstChild("HumanoidRootPart")
+	-- Some respawns replicate the Humanoid's root reference before the named
+	-- child is visible. Either authoritative Roblox reference is valid; do not
+	-- strand a live character waiting forever for the child-name path.
+	local newRoot = if namedRoot and namedRoot:IsA("BasePart")
+		then namedRoot
+		elseif newHumanoid and newHumanoid.RootPart and newHumanoid.RootPart:IsA("BasePart")
+			then newHumanoid.RootPart
+			else nil
 	if not RuntimeUtil.isCurrentExecution() or serial ~= CharacterBindSerial or Player.Character ~= character then
 		return
 	end
@@ -6324,6 +6360,25 @@ table.insert(
 			end
 		end
 		if not Running or not alive() then
+			-- ChildAdded normally completes a delayed bind, but auto-exec can attach
+			-- between replication events. Probe the current character at a bounded
+			-- rate on the existing Heartbeat so a late root can always resume farm.
+			local currentCharacter = Player.Character
+			if
+				Running
+				and currentCharacter
+				and (
+					Character ~= currentCharacter
+					or not Humanoid
+					or not Root
+					or Humanoid.Parent ~= currentCharacter
+					or Root.Parent ~= currentCharacter
+				)
+				and now - RuntimeState.LastCharacterBindProbeAt >= 1
+			then
+				RuntimeState.LastCharacterBindProbeAt = now
+				bindCharacter(currentCharacter)
+			end
 			return
 		end
 		-- Other game scripts can overwrite WalkSpeed after a spawn or transition.
