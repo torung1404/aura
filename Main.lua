@@ -563,6 +563,82 @@ RuntimeUtil.telemetry = function(event: string, message: string)
 	print(string.format("[AutoFarm:%s] %s", event, message))
 end
 
+-- Keep executor-specific input behind one capability-checked boundary. Roblox
+-- VIM is preferred when available; Volt/UNC-style input functions are a real
+-- fallback rather than unreachable code behind a failed VIM access.
+RuntimeUtil.tapKey = function(key: Enum.KeyCode, virtualKey: number): (boolean, string)
+	local vim = Services.VirtualInput
+	if vim then
+		local issued = pcall(function()
+			vim:SendKeyEvent(true, key, false, game)
+		end)
+		if issued then
+			local executionGeneration = RuntimeState.Generation
+			task.delay(0.03, function()
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+					pcall(function()
+						vim:SendKeyEvent(false, key, false, game)
+					end)
+				end
+			end)
+			return true, "virtual-input"
+		end
+	end
+	if type(keypress) == "function" and type(keyrelease) == "function" then
+		local issued = pcall(function()
+			keypress(virtualKey)
+		end)
+		if issued then
+			local executionGeneration = RuntimeState.Generation
+			task.delay(0.03, function()
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+					pcall(function()
+						keyrelease(virtualKey)
+					end)
+				end
+			end)
+			return true, "keypress"
+		end
+	end
+	return false, "unavailable"
+end
+
+RuntimeUtil.clickAt = function(clickX: number, clickY: number): (boolean, string)
+	local vim = Services.VirtualInput
+	if vim then
+		local issued = pcall(function()
+			vim:SendMouseMoveEvent(clickX, clickY, game)
+			vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
+		end)
+		if issued then
+			local executionGeneration = RuntimeState.Generation
+			task.delay(0.04, function()
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+					pcall(function()
+						vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
+					end)
+				end
+			end)
+			return true, "virtual-input"
+		end
+	end
+	if type(mouse1click) == "function" then
+		local issued = pcall(mouse1click)
+		if issued then
+			return true, "mouse1click"
+		end
+	elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
+		local issued = pcall(mouse1press)
+		if issued then
+			task.delay(0.04, function()
+				pcall(mouse1release)
+			end)
+			return true, "mouse1press"
+		end
+	end
+	return false, "unavailable"
+end
+
 -- Lifecycle events remain callable, but webhook/network activity is removed.
 RuntimeState.sendStatusWebhook = function(_event: string) end
 
@@ -3094,28 +3170,8 @@ local function tryStartDungeon(): boolean
 		print(string.format("[START] inset=%s", tostring(inset)))
 		print(string.format("[START] finalClick=%.1f,%.1f", clickX, clickY))
 	end
-	local physicalClickIssued = pcall(function()
-		Services.VirtualInput:SendMouseMoveEvent(clickX, clickY, game)
-	end)
-	if physicalClickIssued then
-		local executionGeneration = RuntimeState.Generation
-		task.delay(0.05, function()
-			if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
-				return
-			end
-			pcall(function()
-				Services.VirtualInput:SendMouseButtonEvent(clickX, clickY, 0, true, game, 0)
-			end)
-			task.delay(0.04, function()
-				if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
-					return
-				end
-				pcall(function()
-					Services.VirtualInput:SendMouseButtonEvent(clickX, clickY, 0, false, game, 0)
-				end)
-			end)
-		end)
-	end
+	local physicalClickIssued, inputMethod = RuntimeUtil.clickAt(clickX, clickY)
+	RuntimeUtil.telemetry("START_INPUT", "method=" .. inputMethod)
 	if button then
 		RuntimeUtil.telemetry("START", button:GetFullName())
 		if not physicalClickIssued then
@@ -3214,10 +3270,8 @@ RuntimeState.combatCharacterCurrent = function(): boolean
 end
 
 local function sendKey(key: Enum.KeyCode)
-	pcall(function()
-		Services.VirtualInput:SendKeyEvent(true, key, false, game)
-		Services.VirtualInput:SendKeyEvent(false, key, false, game)
-	end)
+	local virtualKey = if key == Enum.KeyCode.Q then 0x51 elseif key == Enum.KeyCode.E then 0x45 else 0x20
+	RuntimeUtil.tapKey(key, virtualKey)
 end
 
 local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
@@ -3234,40 +3288,11 @@ local function activateSkill(toolName: string, key: Enum.KeyCode): boolean
 		end
 	end
 	local virtualKey = if toolName == Config.SkillQToolName or key == Enum.KeyCode.Q then 0x51 else 0x45
-	if type(keypress) == "function" and type(keyrelease) == "function" then
-		local ok = pcall(function()
-			keypress(virtualKey)
-		end)
-		if ok then
-			local executionGeneration = RuntimeState.Generation
-			task.delay(0.03, function()
-				if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
-					return
-				end
-				pcall(function()
-					keyrelease(virtualKey)
-				end)
-			end)
-			RuntimeUtil.telemetry("SKILL_" .. toolName, "method=keypress")
-			return true
-		end
+	local issued, inputMethod = RuntimeUtil.tapKey(key, virtualKey)
+	if issued then
+		RuntimeUtil.telemetry("SKILL_" .. toolName, "method=" .. inputMethod)
 	end
-	local ok = pcall(function()
-		Services.VirtualInput:SendKeyEvent(true, key, false, game)
-	end)
-	if ok then
-		local executionGeneration = RuntimeState.Generation
-		task.delay(0.03, function()
-			if not RuntimeUtil.isCurrentExecution() or RuntimeState.Generation ~= executionGeneration then
-				return
-			end
-			pcall(function()
-				Services.VirtualInput:SendKeyEvent(false, key, false, game)
-			end)
-		end)
-		RuntimeUtil.telemetry("SKILL_" .. toolName, "method=virtual-input")
-	end
-	return ok
+	return issued
 end
 
 local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
