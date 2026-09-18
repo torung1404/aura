@@ -2490,8 +2490,8 @@ local function updateGlobalStuckJump()
 		end
 	end
 	local previousPosition = RuntimeState.JumpLastPhysicalPosition
-	RuntimeState.JumpLastPhysicalPosition = Root.Position
 	if not previousPosition then
+		RuntimeState.JumpLastPhysicalPosition = Root.Position
 		RuntimeState.JumpStillSince = now
 		return
 	end
@@ -2501,8 +2501,26 @@ local function updateGlobalStuckJump()
 		Root.Position.Z - previousPosition.Z
 	).Magnitude >= Config.MeaningfulProgressDistance
 	if physicalProgress then
+		-- Keep this reference until the accumulated horizontal displacement is
+		-- meaningful. Replacing it every Heartbeat made normal 20.8-speed movement
+		-- look stationary because one frame is shorter than 1.5 studs.
+		RuntimeState.JumpLastPhysicalPosition = Root.Position
 		RuntimeState.JumpStillSince = now
-	elseif now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
+		return
+	end
+	-- A zero-speed timer is a wall/corner watchdog, not a generic combat timer.
+	-- Local recovery marks a blocked side before this escalation can begin.
+	local obstructionEpisode = State == NavigationState.RECOVERY
+		or State == NavigationState.STEER
+		or State == NavigationState.PATH
+		or now < RuntimeState.LocalBlockedUntil
+	local horizontalSpeed = Vector3.new(Root.AssemblyLinearVelocity.X, 0, Root.AssemblyLinearVelocity.Z).Magnitude
+	if not obstructionEpisode or horizontalSpeed > 1.5 then
+		RuntimeState.JumpStillSince = now
+		RuntimeState.JumpLastPhysicalPosition = Root.Position
+		return
+	end
+	if now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
 		-- This is the single hard-stuck authority used by both HUD and respawn.
 		-- Target/goal bookkeeping is deliberately not part of this episode.
 		if Target and validTarget(Target) and NavigationGoal then
