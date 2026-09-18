@@ -2115,7 +2115,7 @@ RuntimeState.evaluateExploreDirection = function(direction: Vector3): (Vector3?,
 		downhillDelta
 end
 
-RuntimeState.chooseRuntimeState.ExploreGoal = function(): (Vector3?, Vector3?, number)
+RuntimeState.chooseExploreGoal = function(): (Vector3?, Vector3?, number)
 	if not Root then
 		return nil, nil, 0
 	end
@@ -5146,16 +5146,16 @@ local function updateTargetAndObjective()
 		-- the character is ready.  Reuse the bounded exploration controller rather
 		-- than leaving the farm in permanent IDLE with no route to new enemies.
 		if not Target and Root and Humanoid and RuntimeState.NoTargetSince and now - RuntimeState.NoTargetSince >= Config.ExploreStartDelay then
-			local reachedRuntimeState.ExploreGoal = RuntimeState.ExploreGoal
+			local reachedExploreGoal = RuntimeState.ExploreGoal
 				and flatPointDistance(Root.Position, RuntimeState.ExploreGoal) <= Config.ExploreReachedDistance
 			if
 				not RuntimeState.ExploreGoal
-				or reachedRuntimeState.ExploreGoal
+				or reachedExploreGoal
 				or now >= RuntimeState.ExploreCommitUntil
 				or now - RuntimeState.LastExploreSelectionAt >= Config.ExploreReselectAfter
 			then
 				RuntimeState.LastExploreSelectionAt = now
-				local exploreGoal, exploreDirection = RuntimeState.chooseRuntimeState.ExploreGoal()
+				local exploreGoal, exploreDirection = RuntimeState.chooseExploreGoal()
 				if exploreGoal and exploreDirection then
 					RuntimeState.ExploreGoal = exploreGoal
 					RuntimeState.ExploreHeading = exploreDirection
