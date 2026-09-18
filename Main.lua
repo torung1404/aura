@@ -6,11 +6,17 @@ local Services = {
 	Pathfinding = game:GetService("PathfindingService"),
 	Run = game:GetService("RunService"),
 	Input = game:GetService("UserInputService"),
-	VirtualInput = game:GetService("VirtualInputManager"),
+	VirtualInput = nil,
 	Http = game:GetService("HttpService"),
 	Gui = game:GetService("GuiService"),
 	Stats = game:GetService("Stats"),
 }
+-- VIM is useful on Delta, but Volt does not need it. Resolve it without making
+-- the whole script fail so the documented executor input APIs can take over.
+Services.VirtualInput = select(2, pcall(game.GetService, game, "VirtualInputManager"))
+if typeof(Services.VirtualInput) ~= "Instance" then
+	Services.VirtualInput = nil
+end
 
 local Player = Services.Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
@@ -537,6 +543,7 @@ local chooseKiteGoal
 local hazardAssociatedWithTarget
 
 local RuntimeUtil = {}
+RuntimeUtil.PreferNativeInput = Environment.AutoFarmPreferNativeInput == true
 
 RuntimeUtil.isCurrentExecution = function(): boolean
 	return Enabled and Environment.AutoFarmV21Generation == RuntimeState.Generation
@@ -567,6 +574,35 @@ end
 -- VIM is preferred when available; Volt/UNC-style input functions are a real
 -- fallback rather than unreachable code behind a failed VIM access.
 RuntimeUtil.tapKey = function(key: Enum.KeyCode, virtualKey: number): (boolean, string)
+	local function nativeTap(): (boolean, string)
+		if type(keyclick) == "function" then
+			local issued = pcall(keyclick, virtualKey)
+			if issued then
+				return true, "keyclick"
+			end
+		end
+		if type(keypress) == "function" and type(keyrelease) == "function" then
+			local issued = pcall(keypress, virtualKey)
+			if issued then
+				local executionGeneration = RuntimeState.Generation
+				task.delay(0.03, function()
+					if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+						pcall(keyrelease, virtualKey)
+					end
+				end)
+				return true, "keypress"
+			end
+		end
+		return false, "unavailable"
+	end
+
+	if RuntimeUtil.PreferNativeInput then
+		local issued, method = nativeTap()
+		if issued then
+			return true, method
+		end
+	end
+
 	local vim = Services.VirtualInput
 	if vim then
 		local issued = pcall(function()
@@ -584,26 +620,61 @@ RuntimeUtil.tapKey = function(key: Enum.KeyCode, virtualKey: number): (boolean, 
 			return true, "virtual-input"
 		end
 	end
-	if type(keypress) == "function" and type(keyrelease) == "function" then
-		local issued = pcall(function()
-			keypress(virtualKey)
-		end)
-		if issued then
-			local executionGeneration = RuntimeState.Generation
-			task.delay(0.03, function()
-				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
-					pcall(function()
-						keyrelease(virtualKey)
-					end)
-				end
-			end)
-			return true, "keypress"
-		end
+
+	if not RuntimeUtil.PreferNativeInput then
+		return nativeTap()
 	end
 	return false, "unavailable"
 end
 
 RuntimeUtil.clickAt = function(clickX: number, clickY: number): (boolean, string)
+	local function nativeClick(): (boolean, string)
+		if type(iswindowactive) == "function" then
+			local ok, active = pcall(iswindowactive)
+			if ok and active == false then
+				return false, "window-inactive"
+			end
+		end
+
+		local moved = false
+		if type(mousemoveabs) == "function" then
+			moved = pcall(mousemoveabs, clickX, clickY)
+		elseif type(mousemoverel) == "function" then
+			local ok, current = pcall(function()
+				return Services.Input:GetMouseLocation()
+			end)
+			if ok and current then
+				moved = pcall(mousemoverel, clickX - current.X, clickY - current.Y)
+			end
+		end
+		if not moved then
+			return false, "mouse-move-unavailable"
+		end
+
+		if type(mouse1click) == "function" then
+			local issued = pcall(mouse1click)
+			if issued then
+				return true, "mouse1click"
+			end
+		elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
+			local issued = pcall(mouse1press)
+			if issued then
+				task.delay(0.04, function()
+					pcall(mouse1release)
+				end)
+				return true, "mouse1press"
+			end
+		end
+		return false, "unavailable"
+	end
+
+	if RuntimeUtil.PreferNativeInput then
+		local issued, method = nativeClick()
+		if issued then
+			return true, method
+		end
+	end
+
 	local vim = Services.VirtualInput
 	if vim then
 		local issued = pcall(function()
@@ -622,19 +693,9 @@ RuntimeUtil.clickAt = function(clickX: number, clickY: number): (boolean, string
 			return true, "virtual-input"
 		end
 	end
-	if type(mouse1click) == "function" then
-		local issued = pcall(mouse1click)
-		if issued then
-			return true, "mouse1click"
-		end
-	elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
-		local issued = pcall(mouse1press)
-		if issued then
-			task.delay(0.04, function()
-				pcall(mouse1release)
-			end)
-			return true, "mouse1press"
-		end
+
+	if not RuntimeUtil.PreferNativeInput then
+		return nativeClick()
 	end
 	return false, "unavailable"
 end
