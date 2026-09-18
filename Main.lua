@@ -6,17 +6,16 @@ local Services = {
 	Pathfinding = game:GetService("PathfindingService"),
 	Run = game:GetService("RunService"),
 	Input = game:GetService("UserInputService"),
-	VirtualInput = nil,
+	VirtualInput = (function()
+		local ok, service = pcall(function()
+			return game:GetService("VirtualInputManager")
+		end)
+		return if ok then service else nil
+	end)(),
 	Http = game:GetService("HttpService"),
 	Gui = game:GetService("GuiService"),
 	Stats = game:GetService("Stats"),
 }
--- VIM is useful on Delta, but Volt does not need it. Resolve it without making
--- the whole script fail so the documented executor input APIs can take over.
-Services.VirtualInput = select(2, pcall(game.GetService, game, "VirtualInputManager"))
-if typeof(Services.VirtualInput) ~= "Instance" then
-	Services.VirtualInput = nil
-end
 
 local Player = Services.Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
@@ -297,16 +296,8 @@ local Root: BasePart? = nil
 local Target: Model? = nil
 local Running = Config.FarmEnabled == true
 local Enabled = true
-local DefaultAutoRotate = true
-local DefaultWalkSpeed = 16
-local AppliedWalkSpeed: number? = nil
-local SpeedApplied = false
 
 local State = NavigationState.IDLE
-local NavigationGoal: Vector3? = nil
-local GoalTarget: Model? = nil
-local LastGoalRefreshAt = 0
-local LastDirectDecisionAt = 0
 
 local PathState = {
 	Active = nil :: Path?,
@@ -344,12 +335,6 @@ local ProgressState = {
 	LastRecoveryEscalationAt = -math.huge,
 	LastPhysicalPosition = nil :: Vector3?,
 }
-local DodgeStartedAt = 0
-local LastStartClickAt = -math.huge
-local CharacterBindSerial = 0
-local RespawnInProgress = false
-local ResetExecuting = false
-
 
 local CombatState = {
 	LastAttack = 0,
@@ -359,7 +344,6 @@ local CombatState = {
 	CooldownHoldUntil = 0,
 	BindSerial = 0,
 }
-local TargetDiedConnection: RBXScriptConnection? = nil
 local AimState = {
 	Attachment = nil :: Attachment?,
 	Alignment = nil :: AlignOrientation?,
@@ -369,31 +353,45 @@ local ControlState = {
 	Disabled = false,
 	ResolvePending = false,
 }
-
-local EnemySet: { [Model]: boolean } = {}
-local PendingEnemyModels: { [Model]: boolean } = {}
-local LastTargetAcquireAt = -math.huge
-local HazardSet: { [BasePart]: boolean } = {}
-local ActiveHazard: BasePart? = nil
-local DodgeGoal: Vector3? = nil
-local LastDodgeGoalAttemptAt = -math.huge
-local LastHazardThreatAt = -math.huge
-local NearbyActiveHazards: { [BasePart]: boolean } = {}
-local LastHazardRefreshAt = -math.huge
-local ExploreGoal: Vector3? = nil
-local ExploreHeading: Vector3? = nil
-local ExploreCommitUntil = 0
-local ExploreBestDistance = math.huge
-local LastExploreMeaningfulProgressAt = os.clock()
-local LastExploreSelectionAt = -math.huge
-local NoTargetSince: number? = nil
-local DescentLocked = false
-local DescentRiseStrikes = 0
-local ExploredCells: { [string]: boolean } = {}
-local ExploredCellOrder: { string } = {}
-local LastTelemetry: { [string]: string } = {}
 local RuntimeState = {
 	Generation = Environment.AutoFarmV21Generation,
+	DefaultAutoRotate = true,
+	DefaultWalkSpeed = 16,
+	AppliedWalkSpeed = nil :: number?,
+	SpeedApplied = false,
+	NavigationGoal = nil :: Vector3?,
+	GoalTarget = nil :: Model?,
+	LastGoalRefreshAt = 0,
+	LastDirectDecisionAt = 0,
+	DodgeStartedAt = 0,
+	LastStartClickAt = -math.huge,
+	CharacterBindSerial = 0,
+	RespawnInProgress = false,
+	ResetExecuting = false,
+	TargetDiedConnection = nil :: RBXScriptConnection?,
+	EnemySet = {} :: { [Model]: boolean },
+	PendingEnemyModels = {} :: { [Model]: boolean },
+	LastTargetAcquireAt = -math.huge,
+	HazardSet = {} :: { [BasePart]: boolean },
+	ActiveHazard = nil :: BasePart?,
+	DodgeGoal = nil :: Vector3?,
+	LastDodgeGoalAttemptAt = -math.huge,
+	LastHazardThreatAt = -math.huge,
+	NearbyActiveHazards = {} :: { [BasePart]: boolean },
+	LastHazardRefreshAt = -math.huge,
+	ExploreGoal = nil :: Vector3?,
+	ExploreHeading = nil :: Vector3?,
+	ExploreCommitUntil = 0,
+	ExploreBestDistance = math.huge,
+	LastExploreMeaningfulProgressAt = os.clock(),
+	LastExploreSelectionAt = -math.huge,
+	NoTargetSince = nil :: number?,
+	DescentLocked = false,
+	DescentRiseStrikes = 0,
+	ExploredCells = {} :: { [string]: boolean },
+	ExploredCellOrder = {} :: { string },
+	LastTelemetry = {} :: { [string]: string },
+	Callbacks = {},
 	JumpStillSince = os.clock(),
 	JumpBestDistance = math.huge,
 	JumpBestVertical = math.huge,
@@ -533,17 +531,7 @@ local UIState = {
 	CharacterConnections = {} :: { RBXScriptConnection },
 	HUD = nil :: ScreenGui?,
 }
-local recoverByRespawn
-local setRunning
-local setNavigationState
-local stopTranslation
-local resetRuntimeForNewDungeon
-local getTargetRoot
-local chooseKiteGoal
-local hazardAssociatedWithTarget
-
 local RuntimeUtil = {}
-RuntimeUtil.PreferNativeInput = Environment.AutoFarmPreferNativeInput == true
 
 RuntimeUtil.isCurrentExecution = function(): boolean
 	return Enabled and Environment.AutoFarmV21Generation == RuntimeState.Generation
@@ -563,46 +551,32 @@ RuntimeUtil.readPingMs = function(): number?
 end
 
 RuntimeUtil.telemetry = function(event: string, message: string)
-	if not Config.DebugTelemetry or LastTelemetry[event] == message then
+	if not Config.DebugTelemetry or RuntimeState.LastTelemetry[event] == message then
 		return
 	end
-	LastTelemetry[event] = message
+	RuntimeState.LastTelemetry[event] = message
 	print(string.format("[AutoFarm:%s] %s", event, message))
 end
 
--- Keep executor-specific input behind one capability-checked boundary. Roblox
--- VIM is preferred when available; Volt/UNC-style input functions are a real
--- fallback rather than unreachable code behind a failed VIM access.
+-- Preserve Delta's established keyboard path, while allowing VIM only when
+-- the executor's key helpers are not available.
 RuntimeUtil.tapKey = function(key: Enum.KeyCode, virtualKey: number): (boolean, string)
-	local function nativeTap(): (boolean, string)
-		if type(keyclick) == "function" then
-			local issued = pcall(keyclick, virtualKey)
-			if issued then
-				return true, "keyclick"
-			end
-		end
-		if type(keypress) == "function" and type(keyrelease) == "function" then
-			local issued = pcall(keypress, virtualKey)
-			if issued then
-				local executionGeneration = RuntimeState.Generation
-				task.delay(0.03, function()
-					if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
-						pcall(keyrelease, virtualKey)
-					end
-				end)
-				return true, "keypress"
-			end
-		end
-		return false, "unavailable"
-	end
-
-	if RuntimeUtil.PreferNativeInput then
-		local issued, method = nativeTap()
+	if type(keypress) == "function" and type(keyrelease) == "function" then
+		local issued = pcall(function()
+			keypress(virtualKey)
+		end)
 		if issued then
-			return true, method
+			local executionGeneration = RuntimeState.Generation
+			task.delay(0.03, function()
+				if RuntimeUtil.isCurrentExecution() and RuntimeState.Generation == executionGeneration then
+					pcall(function()
+						keyrelease(virtualKey)
+					end)
+				end
+			end)
+			return true, "keypress"
 		end
 	end
-
 	local vim = Services.VirtualInput
 	if vim then
 		local issued = pcall(function()
@@ -620,61 +594,10 @@ RuntimeUtil.tapKey = function(key: Enum.KeyCode, virtualKey: number): (boolean, 
 			return true, "virtual-input"
 		end
 	end
-
-	if not RuntimeUtil.PreferNativeInput then
-		return nativeTap()
-	end
 	return false, "unavailable"
 end
 
 RuntimeUtil.clickAt = function(clickX: number, clickY: number): (boolean, string)
-	local function nativeClick(): (boolean, string)
-		if type(iswindowactive) == "function" then
-			local ok, active = pcall(iswindowactive)
-			if ok and active == false then
-				return false, "window-inactive"
-			end
-		end
-
-		local moved = false
-		if type(mousemoveabs) == "function" then
-			moved = pcall(mousemoveabs, clickX, clickY)
-		elseif type(mousemoverel) == "function" then
-			local ok, current = pcall(function()
-				return Services.Input:GetMouseLocation()
-			end)
-			if ok and current then
-				moved = pcall(mousemoverel, clickX - current.X, clickY - current.Y)
-			end
-		end
-		if not moved then
-			return false, "mouse-move-unavailable"
-		end
-
-		if type(mouse1click) == "function" then
-			local issued = pcall(mouse1click)
-			if issued then
-				return true, "mouse1click"
-			end
-		elseif type(mouse1press) == "function" and type(mouse1release) == "function" then
-			local issued = pcall(mouse1press)
-			if issued then
-				task.delay(0.04, function()
-					pcall(mouse1release)
-				end)
-				return true, "mouse1press"
-			end
-		end
-		return false, "unavailable"
-	end
-
-	if RuntimeUtil.PreferNativeInput then
-		local issued, method = nativeClick()
-		if issued then
-			return true, method
-		end
-	end
-
 	local vim = Services.VirtualInput
 	if vim then
 		local issued = pcall(function()
@@ -692,10 +615,6 @@ RuntimeUtil.clickAt = function(clickX: number, clickY: number): (boolean, string
 			end)
 			return true, "virtual-input"
 		end
-	end
-
-	if not RuntimeUtil.PreferNativeInput then
-		return nativeClick()
 	end
 	return false, "unavailable"
 end
@@ -844,7 +763,7 @@ local function skillRangeForTarget(target: Model): number
 	return policy and policy.SkillRange or Config.NormalSkillRange
 end
 
-getTargetRoot = function(model: Model): BasePart?
+RuntimeState.Callbacks.getTargetRoot = function(model: Model): BasePart?
 	local humanoidRoot = model:FindFirstChild("HumanoidRootPart", true)
 	if humanoidRoot and humanoidRoot:IsA("BasePart") then
 		return humanoidRoot
@@ -871,7 +790,7 @@ local function validTarget(target: Model?): boolean
 		return false
 	end
 	local enemyHumanoid = target:FindFirstChildOfClass("Humanoid")
-	local enemyRoot = getTargetRoot(target)
+	local enemyRoot = RuntimeState.Callbacks.getTargetRoot(target)
 	return enemyHumanoid ~= nil
 		and enemyRoot ~= nil
 		and enemyRoot:IsDescendantOf(workspace)
@@ -884,17 +803,17 @@ local function registerEnemy(instance: Instance)
 	while current and current ~= workspace do
 		if current:IsA("Model") and current ~= Character and not Services.Players:GetPlayerFromCharacter(current) then
 			local enemyHumanoid = current:FindFirstChildOfClass("Humanoid")
-			local enemyRoot = getTargetRoot(current)
+			local enemyRoot = RuntimeState.Callbacks.getTargetRoot(current)
 			if enemyHumanoid and enemyHumanoid.Health > 0 and enemyRoot and enemyRoot:IsDescendantOf(workspace) then
-				local wasKnown = EnemySet[current] == true
-				EnemySet[current] = true
-				PendingEnemyModels[current] = nil
+				local wasKnown = RuntimeState.EnemySet[current] == true
+				RuntimeState.EnemySet[current] = true
+				RuntimeState.PendingEnemyModels[current] = nil
 				if Running and not wasKnown then
-					LastTargetAcquireAt = -math.huge
+					RuntimeState.LastTargetAcquireAt = -math.huge
 				end
 				return
 			end
-			PendingEnemyModels[current] = true
+			RuntimeState.PendingEnemyModels[current] = true
 		end
 		current = current.Parent
 	end
@@ -1209,7 +1128,7 @@ local function registerHazard(instance: Instance)
 	end
 	local reason = hazardCandidateReason(instance)
 	if reason then
-		HazardSet[instance] = true
+		RuntimeState.HazardSet[instance] = true
 		RuntimeState.HazardMetadata[instance] = {
 			CFrame = instance.CFrame,
 			SampleAt = os.clock(),
@@ -1549,37 +1468,37 @@ end
 
 local function refreshNearbyActiveHazards()
 	if not Config.DodgeEnabled then
-		table.clear(NearbyActiveHazards)
+		table.clear(RuntimeState.NearbyActiveHazards)
 		return
 	end
 	if not Root then
-		table.clear(NearbyActiveHazards)
+		table.clear(RuntimeState.NearbyActiveHazards)
 		return
 	end
 	local now = os.clock()
-	if now - LastHazardRefreshAt < Config.DodgeRefreshInterval then
+	if now - RuntimeState.LastHazardRefreshAt < Config.DodgeRefreshInterval then
 		return
 	end
-	LastHazardRefreshAt = now
-	table.clear(NearbyActiveHazards)
+	RuntimeState.LastHazardRefreshAt = now
+	table.clear(RuntimeState.NearbyActiveHazards)
 	-- Registered hazards are the hot path. They are populated by DescendantAdded,
 	-- including known boss skills, so Dodge does not spatial-query the arena every
 	-- evaluation.
-	for part in pairs(HazardSet) do
+	for part in pairs(RuntimeState.HazardSet) do
 		if not part:IsDescendantOf(workspace) or ignoredSkillPart(part) then
-			HazardSet[part] = nil
+			RuntimeState.HazardSet[part] = nil
 			RuntimeState.HazardMetadata[part] = nil
 		elseif
 			(part.Position - Root.Position).Magnitude <= Config.DodgeDetectionRadius + hazardRadius(part)
 			and isCanonicalActiveHazard(part)
 			and hazardThreatensHeight(part, Root.Position)
 		then
-			NearbyActiveHazards[part] = true
+			RuntimeState.NearbyActiveHazards[part] = true
 		end
 	end
 	-- A small, slow fallback only covers effects that were present before this
 	-- script attached or were initially rejected while still replicating.
-	if next(HazardSet) == nil and now - RuntimeState.LastHazardSpatialFallbackAt >= Config.HazardSpatialFallbackInterval then
+	if next(RuntimeState.HazardSet) == nil and now - RuntimeState.LastHazardSpatialFallbackAt >= Config.HazardSpatialFallbackInterval then
 		RuntimeState.LastHazardSpatialFallbackAt = now
 		local overlap = OverlapParams.new()
 		overlap.FilterType = Enum.RaycastFilterType.Exclude
@@ -1588,8 +1507,8 @@ local function refreshNearbyActiveHazards()
 		for _, part in ipairs(workspace:GetPartBoundsInRadius(Root.Position, Config.DodgeDetectionRadius, overlap)) do
 			if isCanonicalActiveHazard(part) and hazardThreatensHeight(part, Root.Position) then
 				registerHazard(part)
-				if HazardSet[part] then
-					NearbyActiveHazards[part] = true
+				if RuntimeState.HazardSet[part] then
+					RuntimeState.NearbyActiveHazards[part] = true
 				end
 			end
 		end
@@ -1604,11 +1523,11 @@ local function dodgeDestinationSafety(position: Vector3): (boolean, number, numb
 	local minimumClearance = math.huge
 	local footprint = playerFootprintRadius()
 	local midgardianTarget = Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
-	for part in pairs(NearbyActiveHazards) do
+	for part in pairs(RuntimeState.NearbyActiveHazards) do
 		if
 			part:IsDescendantOf(workspace)
 			and isCanonicalActiveHazard(part)
-			and (not midgardianTarget or hazardAssociatedWithTarget(part, Target :: Model))
+			and (not midgardianTarget or RuntimeState.Callbacks.hazardAssociatedWithTarget(part, Target :: Model))
 			and hazardThreatensHeight(part, position)
 		then
 			local clearance = RuntimeState.hazardEdgeDistance(part, position, 0, footprint)
@@ -1631,10 +1550,10 @@ local function kiteRouteIsSafeFromHazards(goal: Vector3): boolean
 	end
 	local footprint = playerFootprintRadius()
 	local midgardianTarget = Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
-	for hazard in pairs(NearbyActiveHazards) do
+	for hazard in pairs(RuntimeState.NearbyActiveHazards) do
 		if
 			isCanonicalActiveHazard(hazard)
-			and (not midgardianTarget or hazardAssociatedWithTarget(hazard, Target :: Model))
+			and (not midgardianTarget or RuntimeState.Callbacks.hazardAssociatedWithTarget(hazard, Target :: Model))
 			and hazardThreatensHeight(hazard, Root.Position)
 			and RuntimeState.segmentHazardClearance(hazard, Root.Position, goal, footprint) <= Config.DodgeSafePadding
 		then
@@ -1649,16 +1568,16 @@ local function upcomingMovementGoal(): Vector3?
 		return nil
 	end
 	if State == NavigationState.DIRECT then
-		return NavigationGoal
+		return RuntimeState.NavigationGoal
 	elseif State == NavigationState.PATH and PathState.Waypoints then
 		local waypoint = PathState.Waypoints[PathState.Index]
 		return waypoint and waypoint.Position or nil
 	elseif State == NavigationState.RECOVERY or State == NavigationState.STEER or State == NavigationState.RETREAT then
 		return ProgressState.RecoveryGoal
 	elseif State == NavigationState.EXPLORE then
-		return ExploreGoal
+		return RuntimeState.ExploreGoal
 	elseif State == NavigationState.DODGE then
-		return DodgeGoal
+		return RuntimeState.DodgeGoal
 	end
 	return Root.Position
 end
@@ -1667,8 +1586,8 @@ local function dodgeCanResumeNormalMovement(): boolean
 	if not Root or not select(1, dodgeDestinationSafety(Root.Position)) then
 		return false
 	end
-	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
-	local goal = NavigationGoal or (targetRoot and targetRoot.Position)
+	local targetRoot = Target and validTarget(Target) and RuntimeState.Callbacks.getTargetRoot(Target)
+	local goal = RuntimeState.NavigationGoal or (targetRoot and targetRoot.Position)
 	if not goal then
 		return true
 	end
@@ -1679,10 +1598,10 @@ local function dodgeCanResumeNormalMovement(): boolean
 	local immediateGoal = Root.Position + flatDelta.Unit * math.min(8, flatDelta.Magnitude)
 	local footprint = playerFootprintRadius()
 	local midgardianTarget = Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
-	for hazard in pairs(NearbyActiveHazards) do
+	for hazard in pairs(RuntimeState.NearbyActiveHazards) do
 		if
 			isCanonicalActiveHazard(hazard)
-			and (not midgardianTarget or hazardAssociatedWithTarget(hazard, Target :: Model))
+			and (not midgardianTarget or RuntimeState.Callbacks.hazardAssociatedWithTarget(hazard, Target :: Model))
 			and hazardThreatensHeight(hazard, Root.Position)
 		then
 			if RuntimeState.segmentHazardClearance(hazard, Root.Position, immediateGoal, footprint) <= Config.DodgeSafePadding then
@@ -1710,7 +1629,7 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 	-- Use the complete current navigation segment, not only a short lookahead:
 	-- a beam can block the approach route before its edge reaches the player.
 	local approachEnd = movementGoal or Root.Position
-	for part in pairs(NearbyActiveHazards) do
+	for part in pairs(RuntimeState.NearbyActiveHazards) do
 		local canonical = canonicalHazardPart(part)
 		local skillModel = skillModelForPart(canonical)
 		if skillModel and groupedSkills[skillModel] then
@@ -1727,7 +1646,7 @@ local function threateningHazard(): (BasePart?, boolean, number, number)
 		if
 			part:IsDescendantOf(workspace)
 			and isCanonicalActiveHazard(part)
-			and (not midgardianTarget or hazardAssociatedWithTarget(part, Target :: Model))
+			and (not midgardianTarget or RuntimeState.Callbacks.hazardAssociatedWithTarget(part, Target :: Model))
 		then
 			local edgeDistance = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
 			local currentRouteClearance = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint, 0)
@@ -1780,7 +1699,7 @@ local function bossSpecialThreat(kind: string): (BasePart?, boolean, number, num
 	local approachEnd = upcomingMovementGoal() or Root.Position
 	local footprint = playerFootprintRadius()
 	local bobIsCurrentTarget = Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "BOB"
-	for part in pairs(HazardSet) do
+	for part in pairs(RuntimeState.HazardSet) do
 		if specialSkillKind(part) == kind and isCanonicalActiveHazard(part) then
 			local edge = RuntimeState.hazardEdgeDistance(part, Root.Position, 0, footprint)
 			local route = RuntimeState.segmentHazardClearance(part, Root.Position, approachEnd, footprint)
@@ -1799,7 +1718,7 @@ local function bossSpecialThreat(kind: string): (BasePart?, boolean, number, num
 	return nil, false, math.huge, math.huge
 end
 
-hazardAssociatedWithTarget = function(part: BasePart, target: Model): boolean
+RuntimeState.Callbacks.hazardAssociatedWithTarget = function(part: BasePart, target: Model): boolean
 	-- Boss one only trusts the two runtime-confirmed skill containers. Generic
 	-- red/map parts, including arbitrary descendants of the boss Model, cannot
 	-- claim its movement controller.
@@ -1841,8 +1760,8 @@ local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 	local footprint = playerFootprintRadius()
 	local midgardianTarget = Target and bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN"
 	local previousClearances: { [BasePart]: number } = {}
-	for hazard in pairs(NearbyActiveHazards) do
-		if isCanonicalActiveHazard(hazard) and (not midgardianTarget or hazardAssociatedWithTarget(hazard, Target :: Model)) then
+	for hazard in pairs(RuntimeState.NearbyActiveHazards) do
+		if isCanonicalActiveHazard(hazard) and (not midgardianTarget or RuntimeState.Callbacks.hazardAssociatedWithTarget(hazard, Target :: Model)) then
 			previousClearances[hazard] = RuntimeState.hazardEdgeDistance(hazard, Root.Position, 0, footprint)
 			local destinationClearance = RuntimeState.hazardEdgeDistance(hazard, goal, 0, footprint)
 			local routeClearance = RuntimeState.segmentHazardClearance(hazard, Root.Position, goal, footprint)
@@ -1867,10 +1786,10 @@ local function dodgeRouteClear(goal: Vector3): (boolean?, string)
 		if math.abs(grounded.Y - previous.Y) > Config.ExploreMaxVerticalStep then
 			return false, "UNSAFE"
 		end
-		for hazard in pairs(NearbyActiveHazards) do
+		for hazard in pairs(RuntimeState.NearbyActiveHazards) do
 			if
 				isCanonicalActiveHazard(hazard)
-				and (not midgardianTarget or hazardAssociatedWithTarget(hazard, Target :: Model))
+				and (not midgardianTarget or RuntimeState.Callbacks.hazardAssociatedWithTarget(hazard, Target :: Model))
 				and hazardThreatensHeight(hazard, grounded)
 			then
 				local clearance = RuntimeState.hazardEdgeDistance(hazard, grounded, 0, footprint)
@@ -1920,8 +1839,8 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 		Config.DodgeSafePadding - currentClearance + 2
 	)
 	local ringDistances = { escapeDistance, escapeDistance + 5, escapeDistance + 10 }
-	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
-	local objective = targetRoot and targetRoot.Position or NavigationGoal
+	local targetRoot = Target and validTarget(Target) and RuntimeState.Callbacks.getTargetRoot(Target)
+	local objective = targetRoot and targetRoot.Position or RuntimeState.NavigationGoal
 	local currentTargetDistance = objective and flatPointDistance(Root.Position, objective) or nil
 	local forwardDirection = objective
 		and Vector3.new(objective.X - Root.Position.X, 0, objective.Z - Root.Position.Z)
@@ -2030,7 +1949,7 @@ local function chooseNearestSafeDodgeGoal(hazard: BasePart): (Vector3?, string, 
 			if evaluation == "SAFE" then
 				local distance = flatPointDistance(Root.Position, grounded)
 				local minimumSafety = math.huge
-				for otherHazard in pairs(NearbyActiveHazards) do
+				for otherHazard in pairs(RuntimeState.NearbyActiveHazards) do
 					if isCanonicalActiveHazard(otherHazard) and hazardThreatensHeight(otherHazard, grounded) then
 						minimumSafety = math.min(
 							minimumSafety,
@@ -2093,14 +2012,14 @@ end
 
 RuntimeState.rememberExplorePosition = function(position: Vector3)
 	local key = RuntimeState.exploreCellKey(position)
-	if ExploredCells[key] then
+	if RuntimeState.ExploredCells[key] then
 		return
 	end
-	ExploredCells[key] = true
-	table.insert(ExploredCellOrder, key)
-	if #ExploredCellOrder > Config.ExploreHistoryLimit then
-		local oldest = table.remove(ExploredCellOrder, 1)
-		ExploredCells[oldest] = nil
+	RuntimeState.ExploredCells[key] = true
+	table.insert(RuntimeState.ExploredCellOrder, key)
+	if #RuntimeState.ExploredCellOrder > Config.ExploreHistoryLimit then
+		local oldest = table.remove(RuntimeState.ExploredCellOrder, 1)
+		RuntimeState.ExploredCells[oldest] = nil
 	end
 end
 
@@ -2135,9 +2054,9 @@ RuntimeState.evaluateExploreDirection = function(direction: Vector3): (Vector3?,
 	if not finalGround then
 		return nil, -math.huge, "no-ground", 0
 	end
-	local continuity = ExploreHeading and math.max(-1, math.min(1, ExploreHeading:Dot(direction))) or 0
+	local continuity = RuntimeState.ExploreHeading and math.max(-1, math.min(1, RuntimeState.ExploreHeading:Dot(direction))) or 0
 	local downhillDelta = Root.Position.Y - finalGround.Y
-	local novelty = ExploredCells[RuntimeState.exploreCellKey(finalGround)] and -14 or 12
+	local novelty = RuntimeState.ExploredCells[RuntimeState.exploreCellKey(finalGround)] and -14 or 12
 	local downhillBonus = math.clamp(downhillDelta * 1.25, -5, 7)
 	local score = 30 + continuity * 8 + novelty + downhillBonus
 	return finalGround,
@@ -2152,12 +2071,12 @@ RuntimeState.evaluateExploreDirection = function(direction: Vector3): (Vector3?,
 		downhillDelta
 end
 
-RuntimeState.chooseExploreGoal = function(): (Vector3?, Vector3?, number)
+RuntimeState.chooseRuntimeState.ExploreGoal = function(): (Vector3?, Vector3?, number)
 	if not Root then
 		return nil, nil, 0
 	end
 	refreshNearbyActiveHazards()
-	local forward = ExploreHeading or Vector3.new(Root.CFrame.LookVector.X, 0, Root.CFrame.LookVector.Z)
+	local forward = RuntimeState.ExploreHeading or Vector3.new(Root.CFrame.LookVector.X, 0, Root.CFrame.LookVector.Z)
 	if forward.Magnitude <= 0.1 then
 		forward = Vector3.new(0, 0, -1)
 	else
@@ -2186,58 +2105,58 @@ RuntimeState.chooseExploreGoal = function(): (Vector3?, Vector3?, number)
 end
 
 local function clearExploreObjective()
-	ExploreGoal = nil
-	ExploreCommitUntil = 0
-	ExploreBestDistance = math.huge
-	DescentLocked = false
-	DescentRiseStrikes = 0
+	RuntimeState.ExploreGoal = nil
+	RuntimeState.ExploreCommitUntil = 0
+	RuntimeState.ExploreBestDistance = math.huge
+	RuntimeState.DescentLocked = false
+	RuntimeState.DescentRiseStrikes = 0
 end
 
 RuntimeState.extendDescentGoal = function(now: number): boolean
-	if not DescentLocked or not ExploreHeading or not Root then
+	if not RuntimeState.DescentLocked or not RuntimeState.ExploreHeading or not Root then
 		return false
 	end
-	local goal, _, reason, downhill = RuntimeState.evaluateExploreDirection(ExploreHeading)
+	local goal, _, reason, downhill = RuntimeState.evaluateExploreDirection(RuntimeState.ExploreHeading)
 	if not goal then
 		RuntimeUtil.telemetry("DESCENT_RELEASE", reason)
-		DescentLocked = false
-		DescentRiseStrikes = 0
+		RuntimeState.DescentLocked = false
+		RuntimeState.DescentRiseStrikes = 0
 		return false
 	end
 	if downhill < -Config.DescentFlatTolerance then
-		DescentRiseStrikes += 1
-		if DescentRiseStrikes >= Config.DescentRiseReleaseCount then
+		RuntimeState.DescentRiseStrikes += 1
+		if RuntimeState.DescentRiseStrikes >= Config.DescentRiseReleaseCount then
 			RuntimeUtil.telemetry("DESCENT_RELEASE", string.format("rising downhill=%.1f", downhill))
-			DescentLocked = false
-			DescentRiseStrikes = 0
+			RuntimeState.DescentLocked = false
+			RuntimeState.DescentRiseStrikes = 0
 			return false
 		end
 	else
-		DescentRiseStrikes = 0
+		RuntimeState.DescentRiseStrikes = 0
 	end
-	ExploreGoal = goal
-	ExploreBestDistance = flatPointDistance(Root.Position, goal)
-	ExploreCommitUntil = now + Config.ExploreCommitTime
+	RuntimeState.ExploreGoal = goal
+	RuntimeState.ExploreBestDistance = flatPointDistance(Root.Position, goal)
+	RuntimeState.ExploreCommitUntil = now + Config.ExploreCommitTime
 	RuntimeUtil.telemetry("DESCENT_EXTEND", string.format("goal=%s downhill=%.1f", tostring(goal), downhill))
 	return true
 end
 
 local function updateExploreMovement()
-	if State ~= NavigationState.EXPLORE or not Root or not Humanoid or not ExploreGoal or Target then
+	if State ~= NavigationState.EXPLORE or not Root or not Humanoid or not RuntimeState.ExploreGoal or Target then
 		return
 	end
-	local direction = Vector3.new(ExploreGoal.X - Root.Position.X, 0, ExploreGoal.Z - Root.Position.Z)
+	local direction = Vector3.new(RuntimeState.ExploreGoal.X - Root.Position.X, 0, RuntimeState.ExploreGoal.Z - Root.Position.Z)
 	local distance = direction.Magnitude
 	if distance <= Config.ExploreReachedDistance then
 		Humanoid:Move(Vector3.zero, false)
 		return
 	end
-	if distance <= ExploreBestDistance - Config.MeaningfulProgressDistance then
-		ExploreBestDistance = distance
-		LastExploreMeaningfulProgressAt = os.clock()
+	if distance <= RuntimeState.ExploreBestDistance - Config.MeaningfulProgressDistance then
+		RuntimeState.ExploreBestDistance = distance
+		RuntimeState.LastExploreMeaningfulProgressAt = os.clock()
 	end
-	if os.clock() - LastExploreMeaningfulProgressAt >= Config.ExploreRespawnStuckTime and not RespawnInProgress then
-		recoverByRespawn(nil, LastExploreMeaningfulProgressAt, true)
+	if os.clock() - RuntimeState.LastExploreMeaningfulProgressAt >= Config.ExploreRespawnStuckTime and not RuntimeState.RespawnInProgress then
+		RuntimeState.Callbacks.recoverByRespawn(nil, RuntimeState.LastExploreMeaningfulProgressAt, true)
 		return
 	end
 	Humanoid:Move(direction.Unit, false)
@@ -2325,7 +2244,7 @@ RuntimeState.chooseHorizontalBeamGoal = function(beam: BasePart): (Vector3?, str
 	if not Root then
 		return nil, nil, nil
 	end
-	local targetRoot = if Target and validTarget(Target) then getTargetRoot(Target) else nil
+	local targetRoot = if Target and validTarget(Target) then RuntimeState.Callbacks.getTargetRoot(Target) else nil
 	local forward = targetRoot and Vector3.new(targetRoot.Position.X - Root.Position.X, 0, targetRoot.Position.Z - Root.Position.Z)
 		or Vector3.new(Root.CFrame.LookVector.X, 0, Root.CFrame.LookVector.Z)
 	if forward.Magnitude <= 0.1 then
@@ -2453,12 +2372,12 @@ local function acquireBestTarget(): Model?
 		return nil
 	end
 	local cheapCandidates = {}
-	for model in pairs(EnemySet) do
+	for model in pairs(RuntimeState.EnemySet) do
 		if not model:IsDescendantOf(workspace) then
-			EnemySet[model] = nil
+			RuntimeState.EnemySet[model] = nil
 		else
 			local enemyHumanoid = model:FindFirstChildOfClass("Humanoid")
-			local enemyRoot = getTargetRoot(model)
+			local enemyRoot = RuntimeState.Callbacks.getTargetRoot(model)
 			if
 				not isIgnoredTarget(model)
 				and enemyHumanoid
@@ -2475,7 +2394,7 @@ local function acquireBestTarget(): Model?
 					})
 				end
 			else
-				EnemySet[model] = nil
+				RuntimeState.EnemySet[model] = nil
 			end
 		end
 	end
@@ -2489,7 +2408,7 @@ local function acquireBestTarget(): Model?
 				and isEnemy(object)
 			then
 				local enemyHumanoid = object:FindFirstChildOfClass("Humanoid")
-				local enemyRoot = getTargetRoot(object)
+				local enemyRoot = RuntimeState.Callbacks.getTargetRoot(object)
 				if
 					not isIgnoredTarget(object)
 					and enemyHumanoid
@@ -2499,8 +2418,8 @@ local function acquireBestTarget(): Model?
 				then
 					local delta = enemyRoot.Position - Root.Position
 					if delta.Magnitude <= Config.FarmRange then
-							EnemySet[object] = true
-							PendingEnemyModels[object] = nil
+							RuntimeState.EnemySet[object] = true
+							RuntimeState.PendingEnemyModels[object] = nil
 							table.insert(cheapCandidates, {
 							Model = object,
 							Vertical = math.abs(delta.Y),
@@ -2532,7 +2451,7 @@ local function targetMetrics(target: Model?): (number, number)
 	if not target or not Root then
 		return math.huge, math.huge
 	end
-	local enemyRoot = getTargetRoot(target)
+	local enemyRoot = RuntimeState.Callbacks.getTargetRoot(target)
 	if not enemyRoot then
 		return math.huge, math.huge
 	end
@@ -2619,7 +2538,7 @@ local function updateGlobalStuckJump()
 	if not translating then
 		-- State/goal churn is not proof of movement. Keep a live target+goal in
 		-- the same stuck episode so IDLE/RECOVERY hand-offs cannot postpone reset.
-		if not Target or not NavigationGoal or State == NavigationState.COMBAT then
+		if not Target or not RuntimeState.NavigationGoal or State == NavigationState.COMBAT then
 			RuntimeState.JumpStillSince = now
 			RuntimeState.JumpBestDistance = math.huge
 			RuntimeState.JumpBestVertical = math.huge
@@ -2658,14 +2577,14 @@ local function updateGlobalStuckJump()
 		RuntimeState.JumpLastPhysicalPosition = Root.Position
 		return
 	end
-	if now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RespawnInProgress then
+	if now - RuntimeState.JumpStillSince >= Config.RespawnStuckTime and not RuntimeState.RespawnInProgress then
 		-- This is the single hard-stuck authority used by both HUD and respawn.
 		-- Target/goal bookkeeping is deliberately not part of this episode.
-		if Target and validTarget(Target) and NavigationGoal then
+		if Target and validTarget(Target) and RuntimeState.NavigationGoal then
 			RuntimeUtil.telemetry("STUCK_HARD", "hard-respawn target=" .. Target.Name)
-			recoverByRespawn(Target, nil, false, RuntimeState.JumpStillSince)
+			RuntimeState.Callbacks.recoverByRespawn(Target, nil, false, RuntimeState.JumpStillSince)
 		else
-			recoverByRespawn(nil, nil, false, RuntimeState.JumpStillSince)
+			RuntimeState.Callbacks.recoverByRespawn(nil, nil, false, RuntimeState.JumpStillSince)
 		end
 	end
 end
@@ -3200,16 +3119,16 @@ local function tryStartDungeon(): boolean
 		RuntimeState.AutoStartReadyFolder = nil
 		return false
 	end
-	if not Running or not Config.AutoStart or os.clock() - LastStartClickAt < 1 then
+	if not Running or not Config.AutoStart or os.clock() - RuntimeState.LastStartClickAt < 1 then
 		return true
 	end
-	LastStartClickAt = os.clock()
+	RuntimeState.LastStartClickAt = os.clock()
 	-- Auto-exec can run while the next dungeon is still replicating. Keep the
 	-- short readiness gate only long enough to avoid issuing a route into an
 	-- incomplete floor; replay/bootstrap owns all longer reference retries.
 	RuntimeState.AutoStartAwaitingReady = true
-	RuntimeState.AutoStartReadyAt = LastStartClickAt + 0.25
-	RuntimeState.AutoStartDeadline = LastStartClickAt + 2
+	RuntimeState.AutoStartReadyAt = RuntimeState.LastStartClickAt + 0.25
+	RuntimeState.AutoStartDeadline = RuntimeState.LastStartClickAt + 2
 	RuntimeState.AutoStartReadySamples = 0
 	RuntimeState.AutoStartLastReadySampleAt = -math.huge
 	RuntimeState.AutoStartReadyFolder = nil
@@ -3288,7 +3207,7 @@ local function restoreRotation()
 		AimState.Alignment.Enabled = false
 	end
 	if Humanoid then
-		Humanoid.AutoRotate = DefaultAutoRotate
+		Humanoid.AutoRotate = RuntimeState.DefaultAutoRotate
 	end
 end
 
@@ -3310,7 +3229,7 @@ end
 
 local function updateTargetFacing()
 	if Target and validTarget(Target) then
-		local enemyRoot = getTargetRoot(Target)
+		local enemyRoot = RuntimeState.Callbacks.getTargetRoot(Target)
 		if enemyRoot then
 			faceTarget(enemyRoot)
 			return
@@ -3327,10 +3246,20 @@ RuntimeState.combatCharacterCurrent = function(): boolean
 		and Root ~= nil
 		and Root.Parent == Character
 		and Humanoid.Health > 0
-		and CombatState.BindSerial == CharacterBindSerial
+		and CombatState.BindSerial == RuntimeState.CharacterBindSerial
 end
 
 local function sendKey(key: Enum.KeyCode)
+	local vim = Services.VirtualInput
+	if vim then
+		local issued = pcall(function()
+			vim:SendKeyEvent(true, key, false, game)
+			vim:SendKeyEvent(false, key, false, game)
+		end)
+		if issued then
+			return
+		end
+	end
 	local virtualKey = if key == Enum.KeyCode.Q then 0x51 elseif key == Enum.KeyCode.E then 0x45 else 0x20
 	RuntimeUtil.tapKey(key, virtualKey)
 end
@@ -3500,25 +3429,25 @@ local function applyMovementSpeed()
 	if not Humanoid then
 		return
 	end
-	if not SpeedApplied then
-		DefaultWalkSpeed = Humanoid.WalkSpeed
-		SpeedApplied = true
+	if not RuntimeState.SpeedApplied then
+		RuntimeState.DefaultWalkSpeed = Humanoid.WalkSpeed
+		RuntimeState.SpeedApplied = true
 	end
-	AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
-	if math.abs(Humanoid.WalkSpeed - AppliedWalkSpeed) > 0.05 then
-		Humanoid.WalkSpeed = AppliedWalkSpeed
+	RuntimeState.AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
+	if math.abs(Humanoid.WalkSpeed - RuntimeState.AppliedWalkSpeed) > 0.05 then
+		Humanoid.WalkSpeed = RuntimeState.AppliedWalkSpeed
 	end
 end
 
 local function restoreMovementSpeed()
-	if Humanoid and SpeedApplied and AppliedWalkSpeed and math.abs(Humanoid.WalkSpeed - AppliedWalkSpeed) <= 0.05 then
-		Humanoid.WalkSpeed = DefaultWalkSpeed
+	if Humanoid and RuntimeState.SpeedApplied and RuntimeState.AppliedWalkSpeed and math.abs(Humanoid.WalkSpeed - RuntimeState.AppliedWalkSpeed) <= 0.05 then
+		Humanoid.WalkSpeed = RuntimeState.DefaultWalkSpeed
 	end
-	AppliedWalkSpeed = nil
-	SpeedApplied = false
+	RuntimeState.AppliedWalkSpeed = nil
+	RuntimeState.SpeedApplied = false
 end
 
-stopTranslation = function()
+RuntimeState.Callbacks.stopTranslation = function()
 	if Humanoid then
 		Humanoid:Move(Vector3.zero, false)
 	end
@@ -3552,7 +3481,7 @@ local function cancelPathRequest()
 	disposePath()
 end
 
-setNavigationState = function(newState: string)
+RuntimeState.Callbacks.setNavigationState = function(newState: string)
 	if State == newState then
 		return
 	end
@@ -3583,17 +3512,17 @@ local function resetProgress(target: Model?, goal: Vector3?)
 end
 
 local function pathRemainingMetric(): number
-	if not Root or not NavigationGoal then
+	if not Root or not RuntimeState.NavigationGoal then
 		return math.huge
 	end
 	if State ~= NavigationState.PATH or not PathState.Waypoints or not PathState.Waypoints[PathState.Index] then
-		return (NavigationGoal - Root.Position).Magnitude
+		return (RuntimeState.NavigationGoal - Root.Position).Magnitude
 	end
 	local metric = (PathState.Waypoints[PathState.Index].Position - Root.Position).Magnitude
 	for index = PathState.Index, #PathState.Waypoints - 1 do
 		metric += (PathState.Waypoints[index + 1].Position - PathState.Waypoints[index].Position).Magnitude
 	end
-	metric += (NavigationGoal - PathState.Waypoints[#PathState.Waypoints].Position).Magnitude
+	metric += (RuntimeState.NavigationGoal - PathState.Waypoints[#PathState.Waypoints].Position).Magnitude
 	return metric
 end
 
@@ -3613,12 +3542,12 @@ local function markMeaningfulProgress()
 end
 
 local function updateProgressTracking()
-	if not Root or not Target or not NavigationGoal then
+	if not Root or not Target or not RuntimeState.NavigationGoal then
 		return
 	end
 	local now = os.clock()
 	if ProgressState.Target ~= Target or not ProgressState.GoalAnchor then
-		resetProgress(Target, NavigationGoal)
+		resetProgress(Target, RuntimeState.NavigationGoal)
 		return
 	end
 	if now - ProgressState.LastCheckAt < Config.ProgressCheckInterval then
@@ -3626,7 +3555,7 @@ local function updateProgressTracking()
 	end
 	ProgressState.LastCheckAt = now
 	local metric = pathRemainingMetric()
-	local enemyRoot = getTargetRoot(Target)
+	local enemyRoot = RuntimeState.Callbacks.getTargetRoot(Target)
 	local vertical = enemyRoot and math.abs(enemyRoot.Position.Y - Root.Position.Y) or math.huge
 	local verticalProgress = ProgressState.BestVerticalDifference < math.huge
 		and vertical <= ProgressState.BestVerticalDifference - Config.MeaningfulProgressDistance
@@ -3727,7 +3656,7 @@ local function beginLocalRecovery(goal: Vector3)
 		ProgressState.RecoveryUntil = os.clock() + Config.DetourDuration
 		RuntimeState.RecoveryGoalDistance = if Root then (ProgressState.RecoveryGoal - Root.Position).Magnitude else math.huge
 		RuntimeState.RecoveryGoalStartedAt = os.clock()
-		setNavigationState(NavigationState.RECOVERY)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.RECOVERY)
 		return
 	end
 	-- A failed local detour is not an instruction to stand still. Hand ownership
@@ -3737,7 +3666,7 @@ local function beginLocalRecovery(goal: Vector3)
 	RuntimeState.RecoveryGoalDistance = math.huge
 	RuntimeState.RecoveryGoalStartedAt = 0
 	RuntimeUtil.telemetry("RECOVERY", "fallback=path reason=no-local-detour")
-	setNavigationState(NavigationState.PATH)
+	RuntimeState.Callbacks.setNavigationState(NavigationState.PATH)
 end
 
 local function issueCurrentWaypoint()
@@ -3747,7 +3676,7 @@ local function issueCurrentWaypoint()
 	local waypoint = PathState.Waypoints[PathState.Index]
 	if not waypoint then
 		disposePath()
-		setNavigationState(NavigationState.IDLE)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 		return
 	end
 	if PathState.IssuedIndex == PathState.Index then
@@ -3823,8 +3752,8 @@ local function requestPath(goal: Vector3): boolean
 			or not alive()
 			or Target ~= expectedTarget
 			or Character ~= expectedCharacter
-			or not NavigationGoal
-			or (NavigationGoal - expectedGoal).Magnitude >= Config.PathGoalChangeDistance
+			or not RuntimeState.NavigationGoal
+			or (RuntimeState.NavigationGoal - expectedGoal).Magnitude >= Config.PathGoalChangeDistance
 		then
 			PathState.RequestStatus = "REJECTED"
 			newPath:Destroy()
@@ -3837,7 +3766,7 @@ local function requestPath(goal: Vector3): boolean
 			newPath:Destroy()
 			ProgressState.RecoveryGoal = nil
 			ProgressState.RecoveryUntil = 0
-			setNavigationState(NavigationState.RECOVERY)
+			RuntimeState.Callbacks.setNavigationState(NavigationState.RECOVERY)
 			return
 		end
 		PathState.Active = newPath
@@ -3855,7 +3784,7 @@ local function requestPath(goal: Vector3): boolean
 				PathState.NeedsRebuild = true
 			end
 		end)
-		setNavigationState(NavigationState.PATH)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.PATH)
 		ProgressState.BestGoalMetric = pathRemainingMetric()
 		-- The async compute callback publishes state only. The next Heartbeat issues MoveTo.
 	end)
@@ -3902,7 +3831,7 @@ local function updatePathFallback(goal: Vector3)
 			end
 		end
 		RuntimeUtil.telemetry("PATH_FALLBACK", "result=stop-no-safe-detour status=" .. PathState.RequestStatus)
-		stopTranslation()
+		RuntimeState.Callbacks.stopTranslation()
 	end
 end
 
@@ -3911,28 +3840,28 @@ local function updatePathNavigation()
 		return
 	end
 	if not PathState.Waypoints then
-		if NavigationGoal then
+		if RuntimeState.NavigationGoal then
 			if not PathState.Computing then
-				requestPath(NavigationGoal)
+				requestPath(RuntimeState.NavigationGoal)
 			end
 			-- COMPUTING and COOLDOWN both retain a bounded, verified fallback. A
 			-- failed request publishes RECOVERY in its callback, so PATH never has a
 			-- silent no-waypoint return.
-			updatePathFallback(NavigationGoal)
+			updatePathFallback(RuntimeState.NavigationGoal)
 		else
-			stopTranslation()
+			RuntimeState.Callbacks.stopTranslation()
 		end
 		return
 	end
 	if PathState.NeedsRebuild then
 		cancelPathRequest()
-		beginLocalRecovery(NavigationGoal or Root.Position)
+		beginLocalRecovery(RuntimeState.NavigationGoal or Root.Position)
 		return
 	end
 	local waypoint = PathState.Waypoints[PathState.Index]
 	if not waypoint then
 		disposePath()
-		setNavigationState(NavigationState.IDLE)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 		return
 	end
 	-- A published path is not monitorable until its current waypoint has been issued.
@@ -3972,10 +3901,10 @@ local function updatePathNavigation()
 end
 
 local function updateDirectMovement()
-	if State ~= NavigationState.DIRECT or not Humanoid or not Root or not NavigationGoal then
+	if State ~= NavigationState.DIRECT or not Humanoid or not Root or not RuntimeState.NavigationGoal then
 		return
 	end
-	local direction = Vector3.new(NavigationGoal.X - Root.Position.X, 0, NavigationGoal.Z - Root.Position.Z)
+	local direction = Vector3.new(RuntimeState.NavigationGoal.X - Root.Position.X, 0, RuntimeState.NavigationGoal.Z - Root.Position.Z)
 	if direction.Magnitude <= Config.DirectReachedDistance then
 		Humanoid:Move(Vector3.zero, false)
 	else
@@ -3992,9 +3921,9 @@ local function updateRecoveryMovement()
 		return
 	end
 	if State == NavigationState.RETREAT and Target and validTarget(Target) then
-		local enemyRoot = getTargetRoot(Target)
+		local enemyRoot = RuntimeState.Callbacks.getTargetRoot(Target)
 		if enemyRoot then
-			local retreatGoal, retreatDirection = chooseKiteGoal(enemyRoot, true)
+			local retreatGoal, retreatDirection = RuntimeState.Callbacks.chooseKiteGoal(enemyRoot, true)
 			if retreatDirection then
 				RuntimeState.KiteGoal = retreatGoal
 				RuntimeState.KiteDirection = retreatDirection
@@ -4005,7 +3934,7 @@ local function updateRecoveryMovement()
 				-- instead of converting a transient probe miss into zero movement.
 				Humanoid:Move(RuntimeState.KiteDirection, false)
 			else
-				stopTranslation()
+				RuntimeState.Callbacks.stopTranslation()
 			end
 			return
 		end
@@ -4054,7 +3983,7 @@ local function updateRecoveryMovement()
 				ProgressState.RecoveryGoal = nil
 				ProgressState.RecoveryUntil = 0
 				RuntimeUtil.telemetry("RECOVERY", "local-reselect=blocked-or-no-progress")
-				beginLocalRecovery(NavigationGoal or Root.Position)
+				beginLocalRecovery(RuntimeState.NavigationGoal or Root.Position)
 				if State == NavigationState.PATH then
 					updatePathNavigation()
 				end
@@ -4064,26 +3993,26 @@ local function updateRecoveryMovement()
 			return
 		end
 	end
-	if State ~= NavigationState.RETREAT and NavigationGoal then
+	if State ~= NavigationState.RETREAT and RuntimeState.NavigationGoal then
 		-- The detour completed or was unavailable. Re-enter PATH in this same
 		-- dispatch cycle so there is no RECOVERY + zero-move gap before the path
 		-- fallback can validate and issue the next movement command.
 		ProgressState.RecoveryGoal = nil
 		ProgressState.RecoveryUntil = 0
-		setNavigationState(NavigationState.PATH)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.PATH)
 		updatePathNavigation()
 		return
 	end
-	stopTranslation()
+	RuntimeState.Callbacks.stopTranslation()
 end
 
 local function decideNavigation()
-	if not alive() or not Target or not NavigationGoal then
+	if not alive() or not Target or not RuntimeState.NavigationGoal then
 		return
 	end
 	local now = os.clock()
 	if State == NavigationState.PATH then
-		if PathState.Goal and (NavigationGoal - PathState.Goal).Magnitude >= Config.PathGoalChangeDistance then
+		if PathState.Goal and (RuntimeState.NavigationGoal - PathState.Goal).Magnitude >= Config.PathGoalChangeDistance then
 			PathState.NeedsRebuild = true
 		end
 		return
@@ -4094,10 +4023,10 @@ local function decideNavigation()
 	then
 		return
 	end
-	if now - LastDirectDecisionAt < Config.DirectDecisionInterval then
+	if now - RuntimeState.LastDirectDecisionAt < Config.DirectDecisionInterval then
 		return
 	end
-	LastDirectDecisionAt = now
+	RuntimeState.LastDirectDecisionAt = now
 	local progressing = now - ProgressState.LastMeaningfulAt < Config.RecoveryRefreshAt
 	local velocity = Root.AssemblyLinearVelocity
 	local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
@@ -4108,7 +4037,7 @@ local function decideNavigation()
 	if State == NavigationState.DIRECT and progressing and horizontalSpeed >= Config.SlowMovementSpeedThreshold then
 		return
 	end
-	local delta = NavigationGoal - Root.Position
+	local delta = RuntimeState.NavigationGoal - Root.Position
 	local localGoal = Root.Position
 		+ (delta.Magnitude > 0.01 and delta.Unit or Vector3.zero)
 			* math.min(delta.Magnitude, Config.DetourProbeDistance)
@@ -4117,29 +4046,29 @@ local function decideNavigation()
 	if safeDirect and (State ~= NavigationState.DIRECT or progressing) then
 		disposePath()
 		ProgressState.RecoveryGoal = nil
-		setNavigationState(NavigationState.DIRECT)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 	else
-		if now - LastStartClickAt <= 6 then
+		if now - RuntimeState.LastStartClickAt <= 6 then
 			-- Immediately after the start click, collision/ground replication can
 			-- make a valid long route look locally blocked. PATH's existing verified
 			-- fallback can move now; do not spend the initial map load in RECOVERY.
 			ProgressState.RecoveryGoal = nil
 			ProgressState.RecoveryUntil = 0
 			cancelPathRequest()
-			setNavigationState(NavigationState.PATH)
-			requestPath(NavigationGoal)
+			RuntimeState.Callbacks.setNavigationState(NavigationState.PATH)
+			requestPath(RuntimeState.NavigationGoal)
 			return
 		end
 		-- A blocked DIRECT route gets a short local sidestep first. Waiting for the
 		-- long recovery window used to resume DIRECT into the same BasicPart.
 		ProgressState.SteeringTried = true
-		local blockedDirection = Vector3.new(NavigationGoal.X - Root.Position.X, 0, NavigationGoal.Z - Root.Position.Z)
+		local blockedDirection = Vector3.new(RuntimeState.NavigationGoal.X - Root.Position.X, 0, RuntimeState.NavigationGoal.Z - Root.Position.Z)
 		if blockedDirection.Magnitude > 0.1 then
 			RuntimeState.LocalBlockedDirection = blockedDirection.Unit
 			RuntimeState.LocalBlockedUntil = now + 0.65
 		end
 		cancelPathRequest()
-		beginLocalRecovery(NavigationGoal)
+		beginLocalRecovery(RuntimeState.NavigationGoal)
 	end
 end
 
@@ -4159,9 +4088,9 @@ local function resetNavigationForTarget(newTarget: Model?)
 	RuntimeState.TargetRootStabilizeUntil = 0
 	RuntimeState.TargetRootStabilizeStartedAt = 0
 	invalidateDirectRouteCache()
-	if Target ~= newTarget and TargetDiedConnection then
-		TargetDiedConnection:Disconnect()
-		TargetDiedConnection = nil
+	if Target ~= newTarget and RuntimeState.TargetDiedConnection then
+		RuntimeState.TargetDiedConnection:Disconnect()
+		RuntimeState.TargetDiedConnection = nil
 	end
 	if RuntimeState.BossDiedTarget ~= newTarget then
 		if RuntimeState.BossDiedConnection then
@@ -4183,10 +4112,10 @@ local function resetNavigationForTarget(newTarget: Model?)
 		RuntimeUtil.telemetry("EXPLORE_TARGET", "target=" .. newTarget:GetFullName())
 		local targetHumanoid = newTarget:FindFirstChildOfClass("Humanoid")
 		if targetHumanoid then
-			TargetDiedConnection = targetHumanoid.Died:Connect(function()
+			RuntimeState.TargetDiedConnection = targetHumanoid.Died:Connect(function()
 				if Target == newTarget then
-					EnemySet[newTarget] = nil
-					LastTargetAcquireAt = -math.huge
+					RuntimeState.EnemySet[newTarget] = nil
+					RuntimeState.LastTargetAcquireAt = -math.huge
 					resetNavigationForTarget(nil)
 				end
 			end)
@@ -4203,10 +4132,10 @@ local function resetNavigationForTarget(newTarget: Model?)
 			end
 		end
 	end
-	GoalTarget = nil
-	NavigationGoal = nil
-	LastGoalRefreshAt = 0
-	LastDirectDecisionAt = 0
+	RuntimeState.GoalTarget = nil
+	RuntimeState.NavigationGoal = nil
+	RuntimeState.LastGoalRefreshAt = 0
+	RuntimeState.LastDirectDecisionAt = 0
 	ProgressState.RecoveryGoal = nil
 	ProgressState.RecoveryUntil = 0
 	ProgressState.SteeringTried = false
@@ -4214,15 +4143,15 @@ local function resetNavigationForTarget(newTarget: Model?)
 	cancelPathRequest()
 	PathState.LastBuildAt = -math.huge
 	resetProgress(newTarget, nil)
-	setNavigationState(NavigationState.IDLE)
+	RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 	if not newTarget then
 		restoreRotation()
 	end
 end
 
 local function clearDodgeObjective()
-	ActiveHazard = nil
-	DodgeGoal = nil
+	RuntimeState.ActiveHazard = nil
+	RuntimeState.DodgeGoal = nil
 	RuntimeState.DodgeCommitUntil = 0
 	RuntimeState.DodgeHoldUntil = 0
 	RuntimeState.DodgeNoGoalSince = 0
@@ -4239,11 +4168,11 @@ local function clearDodgeObjective()
 	RuntimeState.CircleHitboxSide = Vector3.zero
 	RuntimeState.DodgeRaycastsUsed = 0
 	RuntimeState.DodgeBudgetExhausted = false
-	LastHazardThreatAt = -math.huge
-	LastDodgeGoalAttemptAt = -math.huge
+	RuntimeState.LastHazardThreatAt = -math.huge
+	RuntimeState.LastDodgeGoalAttemptAt = -math.huge
 end
 
-resetRuntimeForNewDungeon = function()
+RuntimeState.Callbacks.resetRuntimeForNewDungeon = function()
 	RuntimeState.RoundResetSerial += 1
 	RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
 	local resetSerial = RuntimeState.RoundResetSerial
@@ -4271,22 +4200,22 @@ resetRuntimeForNewDungeon = function()
 	-- Clear the old target through its normal lifecycle so its death listener,
 	-- path and facing state cannot survive into the replayed dungeon.
 	resetNavigationForTarget(nil)
-	GoalTarget = nil
-	NavigationGoal = nil
+	RuntimeState.GoalTarget = nil
+	RuntimeState.NavigationGoal = nil
 	ProgressState.RecoveryGoal = nil
 	ProgressState.RecoveryUntil = 0
 	ProgressState.SteeringTried = false
 	clearDodgeObjective()
-	DodgeStartedAt = 0
-	table.clear(NearbyActiveHazards)
-	LastHazardRefreshAt = -math.huge
+	RuntimeState.DodgeStartedAt = 0
+	table.clear(RuntimeState.NearbyActiveHazards)
+	RuntimeState.LastHazardRefreshAt = -math.huge
 	RuntimeState.LastHazardSpatialFallbackAt = -math.huge
 	clearExploreObjective()
-	ExploreHeading = nil
-	ExploreBestDistance = math.huge
-	LastExploreSelectionAt = -math.huge
-	table.clear(ExploredCells)
-	table.clear(ExploredCellOrder)
+	RuntimeState.ExploreHeading = nil
+	RuntimeState.ExploreBestDistance = math.huge
+	RuntimeState.LastExploreSelectionAt = -math.huge
+	table.clear(RuntimeState.ExploredCells)
+	table.clear(RuntimeState.ExploredCellOrder)
 	ProgressState.Target = nil
 	ProgressState.GoalAnchor = nil
 	ProgressState.BestGoalMetric = math.huge
@@ -4296,27 +4225,27 @@ resetRuntimeForNewDungeon = function()
 	ProgressState.LastStuckPathRetryAt = -math.huge
 	ProgressState.LowSpeedSince = nil
 	ProgressState.LastLowSpeedPathRetryAt = -math.huge
-	LastDirectDecisionAt = 0
-	LastGoalRefreshAt = 0
+	RuntimeState.LastDirectDecisionAt = 0
+	RuntimeState.LastGoalRefreshAt = 0
 	PathState.LastBuildAt = -math.huge
-	ResetExecuting = false
-	RespawnInProgress = false
+	RuntimeState.ResetExecuting = false
+	RuntimeState.RespawnInProgress = false
 	RuntimeState.JumpBurstGeneration += 1
 	RuntimeState.JumpStillSince = now
 	RuntimeState.JumpBestDistance = math.huge
 	RuntimeState.JumpBestVertical = math.huge
 	RuntimeState.JumpBurstUntil = 0
 	RuntimeState.JumpBurstTaskRunning = false
-	LastTargetAcquireAt = -math.huge
+	RuntimeState.LastTargetAcquireAt = -math.huge
 	RuntimeState.LastFallbackTargetScanAt = -math.huge
-	NoTargetSince = now
+	RuntimeState.NoTargetSince = now
 	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack, CombatState.CooldownHoldTarget, CombatState.CooldownHoldUntil = 0, 0, 0, nil, 0
-	CombatState.BindSerial = CharacterBindSerial
+	CombatState.BindSerial = RuntimeState.CharacterBindSerial
 	State = NavigationState.IDLE
-	stopTranslation()
-	table.clear(EnemySet)
-	table.clear(PendingEnemyModels)
-	table.clear(HazardSet)
+	RuntimeState.Callbacks.stopTranslation()
+	table.clear(RuntimeState.EnemySet)
+	table.clear(RuntimeState.PendingEnemyModels)
+	table.clear(RuntimeState.HazardSet)
 	table.clear(RuntimeState.HazardMetadata)
 	table.clear(RuntimeState.MageHitboxSeen)
 	RuntimeState.DungeonFinishedInstance = nil
@@ -4381,7 +4310,7 @@ resetRuntimeForNewDungeon = function()
 			RuntimeState.RoundTransitionTimedOut = true
 			ProgressState.LastMeaningfulAt = attemptNow
 			ProgressState.LowSpeedSince = nil
-			LastTargetAcquireAt = -math.huge
+			RuntimeState.LastTargetAcquireAt = -math.huge
 			print("[ROUND] transition=TIMEOUT")
 			return
 		end
@@ -4399,12 +4328,12 @@ resetRuntimeForNewDungeon = function()
 			cacheBuilt = true
 		end
 		RuntimeState.processStaticWallRoot(activeDungeonRoot)
-		LastTargetAcquireAt = -math.huge
+		RuntimeState.LastTargetAcquireAt = -math.huge
 		if alive() and not Target then
 			local acquired = acquireBestTarget()
 			if acquired then
 				resetNavigationForTarget(acquired)
-				NoTargetSince = nil
+				RuntimeState.NoTargetSince = nil
 			end
 		end
 		if Target or (alive() and enemyFolder and enemyFolder:IsDescendantOf(workspace) and cacheBuilt) then
@@ -4423,15 +4352,15 @@ resetRuntimeForNewDungeon = function()
 end
 
 local function leaveDodge()
-	RuntimeUtil.telemetry("DODGE_EXIT", ActiveHazard and ("inactive=" .. ActiveHazard:GetFullName()) or "no-active-hazard")
+	RuntimeUtil.telemetry("DODGE_EXIT", RuntimeState.ActiveHazard and ("inactive=" .. RuntimeState.ActiveHazard:GetFullName()) or "no-active-hazard")
 	clearDodgeObjective()
 	-- Pause, rather than erase, the accumulated no-progress duration.
-	local pausedFor = math.max(0, os.clock() - DodgeStartedAt)
+	local pausedFor = math.max(0, os.clock() - RuntimeState.DodgeStartedAt)
 	ProgressState.LastMeaningfulAt += pausedFor
-	LastExploreMeaningfulProgressAt += pausedFor
+	RuntimeState.LastExploreMeaningfulProgressAt += pausedFor
 	ProgressState.BestGoalMetric = pathRemainingMetric()
-	LastDirectDecisionAt = 0
-	setNavigationState(NavigationState.IDLE)
+	RuntimeState.LastDirectDecisionAt = 0
+	RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 	if not Target or not validTarget(Target) then
 		restoreRotation()
 	end
@@ -4443,16 +4372,16 @@ local function updateDodgeController(): boolean
 		-- old goal, hold, or beam-side commitment may leak into the next mode.
 		RuntimeState.LastDodgeEnabled = Config.DodgeEnabled
 		clearDodgeObjective()
-		table.clear(NearbyActiveHazards)
-		table.clear(HazardSet)
+		table.clear(RuntimeState.NearbyActiveHazards)
+		table.clear(RuntimeState.HazardSet)
 		table.clear(RuntimeState.HazardMetadata)
-		LastHazardRefreshAt = -math.huge
+		RuntimeState.LastHazardRefreshAt = -math.huge
 		RuntimeState.LastHazardSpatialFallbackAt = -math.huge
 	end
 	if not Config.DodgeEnabled then
 		if State == NavigationState.DODGE then
 			leaveDodge()
-		elseif DodgeGoal or ActiveHazard or RuntimeState.DodgeHoldUntil > 0 then
+		elseif RuntimeState.DodgeGoal or RuntimeState.ActiveHazard or RuntimeState.DodgeHoldUntil > 0 then
 			-- Disabled Dodge must never leave a cached goal/hold that can influence
 			-- the normal dispatcher on a later frame.
 			clearDodgeObjective()
@@ -4481,20 +4410,20 @@ local function updateDodgeController(): boolean
 			return false
 		end
 		RuntimeUtil.telemetry("BOSS", graceCircleHazard and "mode=circle-hitbox-grace" or "mode=horizontal-beam-grace")
-	elseif State == NavigationState.DODGE and not DodgeGoal then
+	elseif State == NavigationState.DODGE and not RuntimeState.DodgeGoal then
 		-- Never preserve a no-goal Dodge owner across a non-evaluation frame.
 		leaveDodge()
 		return false
 	end
 	local evaluateNow = now - RuntimeState.LastDodgeEvaluationAt >= Config.DodgeEvaluationInterval
 	if not evaluateNow then
-		if State == NavigationState.DODGE and DodgeGoal then
-			local cachedDirection = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
+		if State == NavigationState.DODGE and RuntimeState.DodgeGoal then
+			local cachedDirection = Vector3.new(RuntimeState.DodgeGoal.X - Root.Position.X, 0, RuntimeState.DodgeGoal.Z - Root.Position.Z)
 			Humanoid:Move(cachedDirection.Magnitude > 1.5 and cachedDirection.Unit or Vector3.zero, false)
 			return true
 		end
 		if now < RuntimeState.DodgeHoldUntil then
-			stopTranslation()
+			RuntimeState.Callbacks.stopTranslation()
 			return true
 		end
 		return false
@@ -4529,9 +4458,9 @@ local function updateDodgeController(): boolean
 	end
 	if hazard and Target then
 		local policy = bossPolicyForTarget(Target)
-		local targetRoot = getTargetRoot(Target)
+		local targetRoot = RuntimeState.Callbacks.getTargetRoot(Target)
 		if policy and policy.Mode == "MIDGARDIAN" then
-			if not hazardAssociatedWithTarget(hazard, Target) then
+			if not RuntimeState.Callbacks.hazardAssociatedWithTarget(hazard, Target) then
 				RuntimeUtil.telemetry("BOSS", "mode=midgardian hazard=ignored-unconfirmed")
 				hazard = nil
 			elseif targetRoot and (targetRoot.Position - Root.Position).Magnitude > 120 then
@@ -4544,14 +4473,14 @@ local function updateDodgeController(): boolean
 				if
 					State == NavigationState.DIRECT
 					and RuntimeState.KiteMode == "ORBIT"
-					and NavigationGoal
-					and kiteRouteIsSafeFromHazards(NavigationGoal)
+					and RuntimeState.NavigationGoal
+					and kiteRouteIsSafeFromHazards(RuntimeState.NavigationGoal)
 				then
-					ActiveHazard = nil
+					RuntimeState.ActiveHazard = nil
 					return false
 				end
 				if edgeDistance > Config.DodgeSafePadding then
-					ActiveHazard = nil
+					RuntimeState.ActiveHazard = nil
 					return false
 				end
 			end
@@ -4566,28 +4495,28 @@ local function updateDodgeController(): boolean
 		RuntimeState.DodgeNoGoalSince = 0
 		if State == NavigationState.DODGE then
 			if dodgeCanResumeNormalMovement() then
-				RuntimeUtil.telemetry("DODGE_STALE", "stale-cleared hazard=" .. (ActiveHazard and ActiveHazard.Name or "nil"))
+				RuntimeUtil.telemetry("DODGE_STALE", "stale-cleared hazard=" .. (RuntimeState.ActiveHazard and RuntimeState.ActiveHazard.Name or "nil"))
 				RuntimeUtil.telemetry("DODGE_ROUTE", "exit=no-current-threat")
 				leaveDodge()
-			elseif DodgeGoal then
-				local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
+			elseif RuntimeState.DodgeGoal then
+				local direction = Vector3.new(RuntimeState.DodgeGoal.X - Root.Position.X, 0, RuntimeState.DodgeGoal.Z - Root.Position.Z)
 				Humanoid:Move(direction.Magnitude > 1.5 and direction.Unit or Vector3.zero, false)
 				return true
 			end
 		end
 		return false
 	end
-	LastHazardThreatAt = os.clock()
+	RuntimeState.LastHazardThreatAt = os.clock()
 
 	local goalUnsafe = false
 	local cachedGoalUnknown = false
 	if State == NavigationState.DODGE then
-		if not DodgeGoal then
+		if not RuntimeState.DodgeGoal then
 			goalUnsafe = true
-		elseif not pointIsSafeFromHazards(DodgeGoal) then
+		elseif not pointIsSafeFromHazards(RuntimeState.DodgeGoal) then
 			goalUnsafe = true
 		else
-			local _, routeStatus = dodgeRouteClear(DodgeGoal)
+			local _, routeStatus = dodgeRouteClear(RuntimeState.DodgeGoal)
 			if routeStatus == "UNSAFE" then
 				goalUnsafe = true
 			elseif routeStatus == "UNKNOWN" then
@@ -4595,7 +4524,7 @@ local function updateDodgeController(): boolean
 			end
 			-- A budget-exhausted route check is UNKNOWN, not unsafe. Keep the
 			-- already validated route until the next bounded evaluation.
-			ActiveHazard = hazard
+			RuntimeState.ActiveHazard = hazard
 		end
 	end
 	local currentFootprintSafe, currentOverlaps, currentMinimumClearance = dodgeDestinationSafety(Root.Position)
@@ -4603,7 +4532,7 @@ local function updateDodgeController(): boolean
 		"DODGE_OVERLAPS",
 		string.format("overlaps=%d minClearance=%.1f", currentOverlaps, currentMinimumClearance)
 	)
-	local goalReached = DodgeGoal and (DodgeGoal - Root.Position).Magnitude <= 1.5
+	local goalReached = RuntimeState.DodgeGoal and (RuntimeState.DodgeGoal - Root.Position).Magnitude <= 1.5
 	if goalReached and not currentFootprintSafe then
 		RuntimeUtil.telemetry("DODGE_CONTINUE", "reason=still-inside-hitbox")
 	end
@@ -4612,12 +4541,12 @@ local function updateDodgeController(): boolean
 		or goalReached
 		or (now >= RuntimeState.DodgeCommitUntil and not cachedGoalUnknown)
 	if needsNewGoal then
-		local reusableGoal = if State == NavigationState.DODGE and DodgeGoal and not goalUnsafe then DodgeGoal else nil
+		local reusableGoal = if State == NavigationState.DODGE and RuntimeState.DodgeGoal and not goalUnsafe then RuntimeState.DodgeGoal else nil
 		if State ~= NavigationState.DODGE then
-			DodgeStartedAt = os.clock()
+			RuntimeState.DodgeStartedAt = os.clock()
 		end
-		LastDodgeGoalAttemptAt = os.clock()
-		ActiveHazard = hazard
+		RuntimeState.LastDodgeGoalAttemptAt = os.clock()
+		RuntimeState.ActiveHazard = hazard
 		RuntimeUtil.telemetry(
 			"DODGE_ENTER",
 			string.format(
@@ -4708,7 +4637,7 @@ local function updateDodgeController(): boolean
 		end
 		if selectedGoal then
 			cancelPathRequest()
-			DodgeGoal = selectedGoal
+			RuntimeState.DodgeGoal = selectedGoal
 			RuntimeState.DodgeHoldUntil = 0
 			RuntimeState.DodgeNoGoalSince = 0
 			RuntimeState.DodgeCommitUntil = now + Config.DodgeCommitDuration
@@ -4728,22 +4657,22 @@ local function updateDodgeController(): boolean
 					RuntimeUtil.telemetry("BOSS", "mode=" .. string.lower(specialMode))
 				end
 			end
-			setNavigationState(NavigationState.DODGE)
-			local _, goalOverlaps, goalMinimumClearance = dodgeDestinationSafety(DodgeGoal)
+			RuntimeState.Callbacks.setNavigationState(NavigationState.DODGE)
+			local _, goalOverlaps, goalMinimumClearance = dodgeDestinationSafety(RuntimeState.DodgeGoal)
 			RuntimeUtil.telemetry(
 				"DODGE_GOAL_CLEARANCE",
 				string.format("goal overlapsAfter=%d minClearance=%.1f", goalOverlaps, goalMinimumClearance)
 			)
 			RuntimeUtil.telemetry(
 				"DODGE_GOAL",
-				string.format("choose=%s score=%.1f goal=%s", selectedLabel or "fallback", selectedScore or 0, tostring(DodgeGoal))
+				string.format("choose=%s score=%.1f goal=%s", selectedLabel or "fallback", selectedScore or 0, tostring(RuntimeState.DodgeGoal))
 			)
 		else
 			-- UNKNOWN means the current evaluation ran out of evidence, not that all
 			-- unchecked routes are unsafe. Hold only for a bounded window, without
 			-- renewing watchdog progress; then use the existing recovery/path policy.
-			ActiveHazard = nil
-			DodgeGoal = nil
+			RuntimeState.ActiveHazard = nil
+			RuntimeState.DodgeGoal = nil
 			RuntimeState.DodgeCommitUntil = 0
 			RuntimeState.DodgeCachedHazard = nil
 			if RuntimeState.DodgeNoGoalSince <= 0 then
@@ -4753,18 +4682,18 @@ local function updateDodgeController(): boolean
 			if now < holdDeadline then
 				RuntimeState.DodgeHoldUntil = math.min(now + Config.DodgeEvaluationInterval, holdDeadline)
 				RuntimeUtil.telemetry("DODGE_GOAL", candidateStatus == "UNKNOWN" and "budget-or-data-unknown" or "no-safe-goal")
-				stopTranslation()
+				RuntimeState.Callbacks.stopTranslation()
 				return true
 			end
 			RuntimeState.DodgeHoldUntil = 0
 			RuntimeState.DodgeNoGoalSince = 0
 			-- Do not resume a confirmed-danger DIRECT command after a no-goal hold.
 			-- Recovery owns the next movement and can request an existing safe path.
-			beginLocalRecovery(NavigationGoal or Root.Position)
+			beginLocalRecovery(RuntimeState.NavigationGoal or Root.Position)
 			return false
 		end
 	end
-	local direction = Vector3.new(DodgeGoal.X - Root.Position.X, 0, DodgeGoal.Z - Root.Position.Z)
+	local direction = Vector3.new(RuntimeState.DodgeGoal.X - Root.Position.X, 0, RuntimeState.DodgeGoal.Z - Root.Position.Z)
 	if direction.Magnitude <= 1.5 then
 		Humanoid:Move(Vector3.zero, false)
 	else
@@ -4781,7 +4710,7 @@ local function runRecoveryPolicy()
 		ProgressState.LowSpeedSince = nil
 		return
 	end
-	if not Target or not NavigationGoal or State == NavigationState.COMBAT then
+	if not Target or not RuntimeState.NavigationGoal or State == NavigationState.COMBAT then
 		ProgressState.LowSpeedSince = nil
 		return
 	end
@@ -4803,7 +4732,7 @@ local function runRecoveryPolicy()
 			then
 				ProgressState.LastLowSpeedPathRetryAt = now
 				cancelPathRequest()
-				beginLocalRecovery(NavigationGoal)
+				beginLocalRecovery(RuntimeState.NavigationGoal)
 				return
 			end
 		else
@@ -4818,7 +4747,7 @@ local function runRecoveryPolicy()
 		-- Rebuild the route before escalating to a character reset.
 		ProgressState.LastStuckPathRetryAt = now
 		cancelPathRequest()
-		beginLocalRecovery(NavigationGoal)
+		beginLocalRecovery(RuntimeState.NavigationGoal)
 		return
 	end
 end
@@ -4847,14 +4776,14 @@ local function recoveryAbortReason(allowRespawnGrace: boolean?): string?
 	return nil
 end
 
-recoverByRespawn = function(
+RuntimeState.Callbacks.recoverByRespawn = function(
 	expectedTarget: Model?,
 	expectedProgressAt: number?,
 	exploreRecovery: boolean?,
 	globalStuckAt: number?,
 	verticalRecovery: boolean?
 )
-	if RespawnInProgress or recoveryAbortReason(verticalRecovery) then
+	if RuntimeState.RespawnInProgress or recoveryAbortReason(verticalRecovery) then
 		return
 	end
 	RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
@@ -4863,7 +4792,7 @@ recoverByRespawn = function(
 	local roundSerial = RuntimeState.RoundResetSerial
 	local recoveryCharacter = Character
 	local recoveryOrigin = Root and Root.Position
-	RespawnInProgress = true
+	RuntimeState.RespawnInProgress = true
 	local function recoveryStillCurrent(): boolean
 		return RuntimeUtil.isCurrentExecution()
 			and RuntimeState.Generation == executionGeneration
@@ -4872,8 +4801,8 @@ recoverByRespawn = function(
 	end
 	local function releaseRecoveryIfOwned()
 		if RuntimeState.RecoverySerial == recoverySerial then
-			RespawnInProgress = false
-			ResetExecuting = false
+			RuntimeState.RespawnInProgress = false
+			RuntimeState.ResetExecuting = false
 		end
 	end
 	task.spawn(function()
@@ -4889,7 +4818,7 @@ recoverByRespawn = function(
 			return
 		end
 		if expectedTarget then
-			local expectedRoot = getTargetRoot(expectedTarget)
+			local expectedRoot = RuntimeState.Callbacks.getTargetRoot(expectedTarget)
 			local movedSinceRecovery = recoveryOrigin
 				and Root
 				and Vector3.new(Root.Position.X - recoveryOrigin.X, 0, Root.Position.Z - recoveryOrigin.Z).Magnitude
@@ -4907,7 +4836,7 @@ recoverByRespawn = function(
 				return
 			end
 		elseif exploreRecovery then
-			if State == NavigationState.DODGE or Target or LastExploreMeaningfulProgressAt ~= expectedProgressAt then
+			if State == NavigationState.DODGE or Target or RuntimeState.LastExploreMeaningfulProgressAt ~= expectedProgressAt then
 				releaseRecoveryIfOwned()
 				return
 			end
@@ -4924,10 +4853,10 @@ recoverByRespawn = function(
 			releaseRecoveryIfOwned()
 			return
 		end
-		ResetExecuting = true
+		RuntimeState.ResetExecuting = true
 		local recoveryReason = if verticalRecovery then "vertical" else "stuck"
 		print("[RECOVERY] reason=" .. recoveryReason)
-		local recoveryTargetRoot = Target and getTargetRoot(Target)
+		local recoveryTargetRoot = Target and RuntimeState.Callbacks.getTargetRoot(Target)
 		local recoveryDistance = recoveryTargetRoot and Root and (recoveryTargetRoot.Position - Root.Position).Magnitude
 		RuntimeUtil.telemetry(
 			"RECOVERY",
@@ -4944,12 +4873,12 @@ recoverByRespawn = function(
 		local retainedTarget = if validTarget(Target) then Target else nil
 		if retainedTarget then
 			cancelPathRequest()
-			GoalTarget = nil
-			NavigationGoal = nil
+			RuntimeState.GoalTarget = nil
+			RuntimeState.NavigationGoal = nil
 			ProgressState.RecoveryGoal = nil
 			ProgressState.RecoveryUntil = 0
 			resetProgress(retainedTarget, nil)
-			setNavigationState(NavigationState.IDLE)
+			RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 		else
 			resetNavigationForTarget(nil)
 		end
@@ -5030,11 +4959,11 @@ local function updateDungeonReplayState()
 		end
 		RuntimeState.DungeonFinishedLastState = finished.Value
 		RuntimeState.PreviousDungeonFinishedInstance = finished
-		if newRound and resetRuntimeForNewDungeon then
+		if newRound and RuntimeState.Callbacks.resetRuntimeForNewDungeon then
 			RuntimeState.ReplayPhase = "WAIT_NEW_ROUND"
 			print("[REPLAY] NEW ROUND")
 			RuntimeState.sendStatusWebhook("NEW_ROUND")
-			resetRuntimeForNewDungeon()
+			RuntimeState.Callbacks.resetRuntimeForNewDungeon()
 			RuntimeState.sendStatusWebhook("DUNGEON_STARTED")
 			return
 		end
@@ -5061,7 +4990,7 @@ local function updateDungeonReplayState()
 			RuntimeState.ReplayCompletionRoot = nil
 			RuntimeState.ReplayOpener = nil
 			resetNavigationForTarget(nil)
-			LastTargetAcquireAt = -math.huge
+			RuntimeState.LastTargetAcquireAt = -math.huge
 			print("[ROUND] transition=TIMEOUT")
 		end
 	end
@@ -5079,8 +5008,8 @@ local function updateTargetAndObjective()
 	end
 	local now = os.clock()
 	if tryStartDungeon() and not validTarget(Target) then
-		setNavigationState(NavigationState.IDLE)
-		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+		if not RuntimeState.SuppressObjectiveTranslation then RuntimeState.Callbacks.stopTranslation() end
 		return
 	end
 	if RuntimeState.AutoStartAwaitingReady then
@@ -5115,14 +5044,14 @@ local function updateTargetAndObjective()
 			RuntimeState.AutoStartReadyFolder = nil
 			buildInitialCaches(enemyFolder)
 			RuntimeState.processStaticWallRoot(RuntimeState.ActiveDungeonRoot)
-			LastTargetAcquireAt = -math.huge
+			RuntimeState.LastTargetAcquireAt = -math.huge
 			resetProgress(nil, nil)
 			print("[START] map-ready")
 		elseif now < RuntimeState.AutoStartDeadline then
 			ProgressState.LastMeaningfulAt = now
 			ProgressState.LowSpeedSince = nil
-			setNavigationState(NavigationState.IDLE)
-			if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
+			RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+			if not RuntimeState.SuppressObjectiveTranslation then RuntimeState.Callbacks.stopTranslation() end
 			return
 		else
 			-- Do not hold forever if this game round exposes no recognizable folder;
@@ -5145,13 +5074,13 @@ local function updateTargetAndObjective()
 			RuntimeState.RoundTransitionActive = false
 			RuntimeState.RoundTransitionTimedOut = false
 			RuntimeState.ReplayPhase = "IDLE"
-			LastTargetAcquireAt = -math.huge
+			RuntimeState.LastTargetAcquireAt = -math.huge
 			RuntimeUtil.telemetry("ROUND_READY", validTarget(Target) and "ready reason=target" or "ready reason=enemy-folder")
 		else
 		ProgressState.LastMeaningfulAt = now
 		ProgressState.LowSpeedSince = nil
-		setNavigationState(NavigationState.IDLE)
-		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+		if not RuntimeState.SuppressObjectiveTranslation then RuntimeState.Callbacks.stopTranslation() end
 		return
 		end
 	end
@@ -5161,68 +5090,68 @@ local function updateTargetAndObjective()
 			RuntimeState.LastStaleTarget = invalidTarget
 			print("[TARGET] stale=" .. invalidTarget.Name .. " reason=invalid")
 		end
-		if invalidTarget or now - LastTargetAcquireAt >= Config.TargetAcquireInterval then
-			LastTargetAcquireAt = now
+		if invalidTarget or now - RuntimeState.LastTargetAcquireAt >= Config.TargetAcquireInterval then
+			RuntimeState.LastTargetAcquireAt = now
 			local acquired = acquireBestTarget()
 			if acquired then
 				resetNavigationForTarget(acquired)
 				RuntimeState.LastStaleTarget = nil
-				NoTargetSince = nil
+				RuntimeState.NoTargetSince = nil
 			elseif invalidTarget then
 				resetNavigationForTarget(nil)
-				LastTargetAcquireAt = -math.huge
-				NoTargetSince = now
+				RuntimeState.LastTargetAcquireAt = -math.huge
+				RuntimeState.NoTargetSince = now
 			end
 		end
 	end
 	if not Target or not Root or not Humanoid then
 		cancelPathRequest()
-		NavigationGoal = nil
+		RuntimeState.NavigationGoal = nil
 		ProgressState.RecoveryGoal = nil
 		-- Target discovery can be briefly empty after a replay/respawn even though
 		-- the character is ready.  Reuse the bounded exploration controller rather
 		-- than leaving the farm in permanent IDLE with no route to new enemies.
-		if not Target and Root and Humanoid and NoTargetSince and now - NoTargetSince >= Config.ExploreStartDelay then
-			local reachedExploreGoal = ExploreGoal
-				and flatPointDistance(Root.Position, ExploreGoal) <= Config.ExploreReachedDistance
+		if not Target and Root and Humanoid and RuntimeState.NoTargetSince and now - RuntimeState.NoTargetSince >= Config.ExploreStartDelay then
+			local reachedRuntimeState.ExploreGoal = RuntimeState.ExploreGoal
+				and flatPointDistance(Root.Position, RuntimeState.ExploreGoal) <= Config.ExploreReachedDistance
 			if
-				not ExploreGoal
-				or reachedExploreGoal
-				or now >= ExploreCommitUntil
-				or now - LastExploreSelectionAt >= Config.ExploreReselectAfter
+				not RuntimeState.ExploreGoal
+				or reachedRuntimeState.ExploreGoal
+				or now >= RuntimeState.ExploreCommitUntil
+				or now - RuntimeState.LastExploreSelectionAt >= Config.ExploreReselectAfter
 			then
-				LastExploreSelectionAt = now
-				local exploreGoal, exploreDirection = RuntimeState.chooseExploreGoal()
+				RuntimeState.LastExploreSelectionAt = now
+				local exploreGoal, exploreDirection = RuntimeState.chooseRuntimeState.ExploreGoal()
 				if exploreGoal and exploreDirection then
-					ExploreGoal = exploreGoal
-					ExploreHeading = exploreDirection
-					ExploreBestDistance = flatPointDistance(Root.Position, exploreGoal)
-					ExploreCommitUntil = now + Config.ExploreCommitTime
-					LastExploreMeaningfulProgressAt = now
+					RuntimeState.ExploreGoal = exploreGoal
+					RuntimeState.ExploreHeading = exploreDirection
+					RuntimeState.ExploreBestDistance = flatPointDistance(Root.Position, exploreGoal)
+					RuntimeState.ExploreCommitUntil = now + Config.ExploreCommitTime
+					RuntimeState.LastExploreMeaningfulProgressAt = now
 				end
 			end
-			if ExploreGoal then
-				setNavigationState(NavigationState.EXPLORE)
+			if RuntimeState.ExploreGoal then
+				RuntimeState.Callbacks.setNavigationState(NavigationState.EXPLORE)
 				return
 			end
 		end
-		setNavigationState(NavigationState.IDLE)
-		if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+		if not RuntimeState.SuppressObjectiveTranslation then RuntimeState.Callbacks.stopTranslation() end
 		return
 	end
-	local enemyRoot = getTargetRoot(Target)
+	local enemyRoot = RuntimeState.Callbacks.getTargetRoot(Target)
 	local enemyHumanoid = Target:FindFirstChildOfClass("Humanoid")
 	if not enemyRoot or not enemyHumanoid or enemyHumanoid.Health <= 0 then
 		resetNavigationForTarget(nil)
-		LastTargetAcquireAt = now
+		RuntimeState.LastTargetAcquireAt = now
 		local acquired = acquireBestTarget()
 		if acquired then
 			resetNavigationForTarget(acquired)
-			NoTargetSince = nil
+			RuntimeState.NoTargetSince = nil
 		else
-			NoTargetSince = now
-			setNavigationState(NavigationState.IDLE)
-			if not RuntimeState.SuppressObjectiveTranslation then stopTranslation() end
+			RuntimeState.NoTargetSince = now
+			RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+			if not RuntimeState.SuppressObjectiveTranslation then RuntimeState.Callbacks.stopTranslation() end
 		end
 		return
 	end
@@ -5236,16 +5165,16 @@ local function updateTargetAndObjective()
 			RuntimeState.sendStatusWebhook("BOSS_DIED")
 		end)
 	end
-	NoTargetSince = nil
+	RuntimeState.NoTargetSince = nil
 	if State == NavigationState.DODGE and not (bossPolicyForTarget(Target) and bossPolicyForTarget(Target).Mode == "MIDGARDIAN") then
 		return
 	end
 	if
-		now - LastTargetAcquireAt >= Config.TargetAcquireInterval
+		now - RuntimeState.LastTargetAcquireAt >= Config.TargetAcquireInterval
 		and State ~= NavigationState.DODGE
 		and now >= RuntimeState.RespawnRushUntil
 	then
-		LastTargetAcquireAt = now
+		RuntimeState.LastTargetAcquireAt = now
 		local candidate = acquireBestTarget()
 		local _, currentDistance = targetMetrics(Target)
 		local _, candidateDistance = targetMetrics(candidate)
@@ -5268,13 +5197,13 @@ local function updateTargetAndObjective()
 	local verticalDelta = enemyRoot.Position.Y - Root.Position.Y
 	if
 		verticalDelta > 75
-		and not RespawnInProgress
+		and not RuntimeState.RespawnInProgress
 		and not RuntimeState.RoundTransitionActive
 		and not cachedStartScreen()
 		and not replayBlocksRecovery()
 	then
 		RuntimeUtil.telemetry("RECOVERY_VERTICAL", string.format("reason=vertical deltaY=%.1f", verticalDelta))
-		recoverByRespawn(Target, ProgressState.LastMeaningfulAt, nil, nil, true)
+		RuntimeState.Callbacks.recoverByRespawn(Target, ProgressState.LastMeaningfulAt, nil, nil, true)
 		return
 	end
 	if
@@ -5289,13 +5218,13 @@ local function updateTargetAndObjective()
 		end
 		RuntimeState.VerticalPathTarget = nil
 		RuntimeState.VerticalPathGoal = nil
-		NavigationGoal = nil
+		RuntimeState.NavigationGoal = nil
 		ProgressState.RecoveryGoal = nil
 		ProgressState.RecoveryUntil = 0
 		ProgressState.LastMeaningfulAt = now
-		setNavigationState(NavigationState.IDLE)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 		if not RuntimeState.SuppressObjectiveTranslation then
-			stopTranslation()
+			RuntimeState.Callbacks.stopTranslation()
 		end
 		return
 	end
@@ -5310,8 +5239,8 @@ local function updateTargetAndObjective()
 		local boundaryGoal, foundBoundaryGround = projectToWalkableGround(boundaryPoint, Target)
 		if foundBoundaryGround and RuntimeState.midgardianGoalAllowed(boundaryGoal, Target) then
 			cancelPathRequest()
-			NavigationGoal = boundaryGoal
-			setNavigationState(NavigationState.DIRECT)
+			RuntimeState.NavigationGoal = boundaryGoal
+			RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 			decideNavigation()
 			updateProgressTracking()
 			runRecoveryPolicy()
@@ -5345,15 +5274,15 @@ local function updateTargetAndObjective()
 					RuntimeState.KiteGoal = cooldownGoal
 					RuntimeState.KiteDirection = Vector3.new(cooldownGoal.X - Root.Position.X, 0, cooldownGoal.Z - Root.Position.Z).Unit
 					RuntimeState.KiteMode = "NORMAL_SKILL_COOLDOWN_HOLD"
-					NavigationGoal = cooldownGoal
-					setNavigationState(NavigationState.DIRECT)
+					RuntimeState.NavigationGoal = cooldownGoal
+					RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 					updateProgressTracking()
 					return
 				end
 				-- The target is already in the requested 100-stud band. Do not let
 				-- the ordinary 60-stud kite branch pull the character back in early.
-				NavigationGoal = nil
-				setNavigationState(NavigationState.COMBAT)
+				RuntimeState.NavigationGoal = nil
+				RuntimeState.Callbacks.setNavigationState(NavigationState.COMBAT)
 				return
 			end
 			CombatState.CooldownHoldTarget = nil
@@ -5366,41 +5295,41 @@ local function updateTargetAndObjective()
 			if
 				RuntimeState.KiteMode == "RETREAT_DIAGONAL"
 				and RuntimeState.KiteGoal
-				and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+				and now - RuntimeState.LastGoalRefreshAt < Config.GoalRefreshInterval
 				and directRouteClear(RuntimeState.KiteGoal, Target)
 				and pointIsSafeFromHazards(RuntimeState.KiteGoal)
 				and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
 			then
-				NavigationGoal = RuntimeState.KiteGoal
-				setNavigationState(NavigationState.DIRECT)
+				RuntimeState.NavigationGoal = RuntimeState.KiteGoal
+				RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
 				return
 			end
-			LastGoalRefreshAt = now
-			local kiteGoal, kiteDirection = chooseKiteGoal(enemyRoot, true)
+			RuntimeState.LastGoalRefreshAt = now
+			local kiteGoal, kiteDirection = RuntimeState.Callbacks.chooseKiteGoal(enemyRoot, true)
 			if kiteGoal and kiteDirection then
 				cancelPathRequest()
 				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = kiteGoal, kiteDirection, "RETREAT_DIAGONAL"
-				NavigationGoal = kiteGoal
-				setNavigationState(NavigationState.DIRECT)
+				RuntimeState.NavigationGoal = kiteGoal
+				RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
 				return
 			end
 			if kiteDirection then
 				-- The bounded probe found a usable local S+A/S+D vector but no full
-				-- NavigationGoal. Keep that vector as the retreat owner immediately.
+				-- RuntimeState.NavigationGoal. Keep that vector as the retreat owner immediately.
 				cancelPathRequest()
 				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = nil, kiteDirection, "RETREAT_VECTOR"
-				NavigationGoal = nil
-				setNavigationState(NavigationState.RETREAT)
+				RuntimeState.NavigationGoal = nil
+				RuntimeState.Callbacks.setNavigationState(NavigationState.RETREAT)
 				return
 			end
 			-- Keep RETREAT as the single retry owner when the first diagonal probe
 			-- cannot choose a direction. updateRecoveryMovement uses the same
 			-- multi-candidate helper on this heartbeat instead of falling into COMBAT.
 			cancelPathRequest()
-			NavigationGoal = nil
-			setNavigationState(NavigationState.RETREAT)
+			RuntimeState.NavigationGoal = nil
+			RuntimeState.Callbacks.setNavigationState(NavigationState.RETREAT)
 			return
 		end
 		-- 60..70: close the gap using W+A/W+D.  At the desired spacing, keep
@@ -5414,23 +5343,23 @@ local function updateTargetAndObjective()
 				RuntimeState.KiteMode == normalKiteMode
 				and RuntimeState.KiteGoal
 				and (RuntimeState.KiteGoal - Root.Position).Magnitude > Config.DirectReachedDistance
-				and now - LastGoalRefreshAt < 0.65
+				and now - RuntimeState.LastGoalRefreshAt < 0.65
 				and directRouteClear(RuntimeState.KiteGoal, Target)
 				and pointIsSafeFromHazards(RuntimeState.KiteGoal)
 				and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
 			then
-				NavigationGoal = RuntimeState.KiteGoal
-				setNavigationState(NavigationState.DIRECT)
+				RuntimeState.NavigationGoal = RuntimeState.KiteGoal
+				RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
 				return
 			end
-			LastGoalRefreshAt = now
-			local kiteGoal, kiteDirection = chooseKiteGoal(enemyRoot, false, lateralOnly)
+			RuntimeState.LastGoalRefreshAt = now
+			local kiteGoal, kiteDirection = RuntimeState.Callbacks.chooseKiteGoal(enemyRoot, false, lateralOnly)
 			if kiteGoal and kiteDirection then
 				cancelPathRequest()
 				RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = kiteGoal, kiteDirection, normalKiteMode
-				NavigationGoal = kiteGoal
-				setNavigationState(NavigationState.DIRECT)
+				RuntimeState.NavigationGoal = kiteGoal
+				RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 				updateProgressTracking()
 				return
 			end
@@ -5448,8 +5377,8 @@ local function updateTargetAndObjective()
 			cancelPathRequest()
 			ProgressState.RecoveryGoal = nil
 			ProgressState.RecoveryUntil = 0
-			LastDirectDecisionAt = 0
-			setNavigationState(NavigationState.IDLE)
+			RuntimeState.LastDirectDecisionAt = 0
+			RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 		end
 	elseif bossPolicy.Mode == "MIDGARDIAN" and distance3D <= 80 then
 		local boundaryRecoveryNeeded = Root.Position.X <= -633 or Root.Position.Z <= 376
@@ -5463,18 +5392,18 @@ local function updateTargetAndObjective()
 			and pointIsSafeFromHazards(RuntimeState.KiteGoal)
 			and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
 		then
-			NavigationGoal = RuntimeState.KiteGoal
-			setNavigationState(NavigationState.DIRECT)
+			RuntimeState.NavigationGoal = RuntimeState.KiteGoal
+			RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 			updateProgressTracking()
 			return
 		end
-		LastGoalRefreshAt = now
-		local orbitGoal, orbitDirection = chooseKiteGoal(enemyRoot, false, true)
+		RuntimeState.LastGoalRefreshAt = now
+		local orbitGoal, orbitDirection = RuntimeState.Callbacks.chooseKiteGoal(enemyRoot, false, true)
 		if orbitGoal and orbitDirection then
 			cancelPathRequest()
 			RuntimeState.KiteGoal, RuntimeState.KiteDirection, RuntimeState.KiteMode = orbitGoal, orbitDirection, "ORBIT"
-			NavigationGoal = orbitGoal
-			setNavigationState(NavigationState.DIRECT)
+			RuntimeState.NavigationGoal = orbitGoal
+			RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 			local radial = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z).Unit
 			local right = Vector3.new(-radial.Z, 0, radial.X)
 			RuntimeState.MidgardianOrbitSide = if orbitDirection:Dot(right) >= 0 then 1 else -1
@@ -5491,7 +5420,7 @@ local function updateTargetAndObjective()
 		-- combat band instead of continuing to press forward into the boss.
 		if
 			RuntimeState.KiteMode == "BOB_DIAGONAL"
-			and NavigationGoal
+			and RuntimeState.NavigationGoal
 			and (State == NavigationState.RECOVERY or State == NavigationState.STEER or State == NavigationState.PATH)
 		then
 			-- A Bob goal that met a wall must leave translation to the shared local
@@ -5504,19 +5433,19 @@ local function updateTargetAndObjective()
 		if
 			RuntimeState.KiteMode == "BOB_DIAGONAL"
 			and RuntimeState.KiteGoal
-			and now - LastGoalRefreshAt < Config.GoalRefreshInterval
+			and now - RuntimeState.LastGoalRefreshAt < Config.GoalRefreshInterval
 			and directRouteClear(RuntimeState.KiteGoal, Target)
 			and pointIsSafeFromHazards(RuntimeState.KiteGoal)
 			and kiteRouteIsSafeFromHazards(RuntimeState.KiteGoal)
 		then
-			NavigationGoal = RuntimeState.KiteGoal
-			setNavigationState(NavigationState.DIRECT)
+			RuntimeState.NavigationGoal = RuntimeState.KiteGoal
+			RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 			decideNavigation()
 			updateProgressTracking()
 			runRecoveryPolicy()
 			return
 		end
-		LastGoalRefreshAt = now
+		RuntimeState.LastGoalRefreshAt = now
 		local bossKiteDistance = bossPolicy.KiteDistance or skillRangeForTarget(Target)
 		local bobGoal = navigationGoalForTarget(enemyRoot, Target, bossKiteDistance)
 		local toBob = Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z)
@@ -5560,8 +5489,8 @@ local function updateTargetAndObjective()
 			RuntimeState.KiteGoal = bobGoal
 			RuntimeState.KiteDirection = bobDirection.Unit
 			RuntimeState.KiteMode = "BOB_DIAGONAL"
-			NavigationGoal = bobGoal
-			setNavigationState(NavigationState.DIRECT)
+			RuntimeState.NavigationGoal = bobGoal
+			RuntimeState.Callbacks.setNavigationState(NavigationState.DIRECT)
 			decideNavigation()
 			updateProgressTracking()
 			runRecoveryPolicy()
@@ -5576,17 +5505,17 @@ local function updateTargetAndObjective()
 		-- retreat owner to walk backward from a newly acquired or risen far target.
 		ProgressState.RecoveryGoal = nil
 		ProgressState.RecoveryUntil = 0
-		LastDirectDecisionAt = 0
-		setNavigationState(NavigationState.IDLE)
+		RuntimeState.LastDirectDecisionAt = 0
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 	end
 	if bossPolicy and State == NavigationState.RETREAT and distance3D < Config.RetreatExitDistance then
 		cancelPathRequest()
-		NavigationGoal = nil
+		RuntimeState.NavigationGoal = nil
 		return
 	elseif bossPolicy and distance3D < Config.RetreatEnterDistance then
 		cancelPathRequest()
-		NavigationGoal = nil
-		setNavigationState(NavigationState.RETREAT)
+		RuntimeState.NavigationGoal = nil
+		RuntimeState.Callbacks.setNavigationState(NavigationState.RETREAT)
 		return
 	end
 	if bossPolicy and distance3D <= Config.PreferredCombatDistance then
@@ -5595,13 +5524,13 @@ local function updateTargetAndObjective()
 		if State ~= NavigationState.COMBAT or PathState.Computing or PathState.Active then
 			cancelPathRequest()
 		end
-		NavigationGoal = nil
-		setNavigationState(NavigationState.COMBAT)
+		RuntimeState.NavigationGoal = nil
+		RuntimeState.Callbacks.setNavigationState(NavigationState.COMBAT)
 		resetProgress(Target, nil)
 		return
 	end
 	if State == NavigationState.COMBAT then
-		setNavigationState(NavigationState.IDLE)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 	end
 	local flatDistance =
 		Vector3.new(enemyRoot.Position.X - Root.Position.X, 0, enemyRoot.Position.Z - Root.Position.Z).Magnitude
@@ -5620,15 +5549,15 @@ local function updateTargetAndObjective()
 				cancelPathRequest()
 			end
 		end
-		GoalTarget = Target
-		NavigationGoal = RuntimeState.VerticalPathGoal
-		if ProgressState.Target ~= Target or ProgressState.GoalAnchor ~= NavigationGoal then
-			resetProgress(Target, NavigationGoal)
+		RuntimeState.GoalTarget = Target
+		RuntimeState.NavigationGoal = RuntimeState.VerticalPathGoal
+		if ProgressState.Target ~= Target or ProgressState.GoalAnchor ~= RuntimeState.NavigationGoal then
+			resetProgress(Target, RuntimeState.NavigationGoal)
 		end
 		if not PathState.Computing and (State ~= NavigationState.PATH or not PathState.Waypoints) then
 			cancelPathRequest()
-			setNavigationState(NavigationState.PATH)
-			requestPath(NavigationGoal)
+			RuntimeState.Callbacks.setNavigationState(NavigationState.PATH)
+			requestPath(RuntimeState.NavigationGoal)
 		end
 		updateProgressTracking()
 		runRecoveryPolicy()
@@ -5640,20 +5569,20 @@ local function updateTargetAndObjective()
 		if PathState.Goal then
 			PathState.NeedsRebuild = true
 		end
-		LastDirectDecisionAt = 0
+		RuntimeState.LastDirectDecisionAt = 0
 	end
-	if GoalTarget ~= Target or now - LastGoalRefreshAt >= Config.GoalRefreshInterval then
-		LastGoalRefreshAt = now
-		GoalTarget = Target
+	if RuntimeState.GoalTarget ~= Target or now - RuntimeState.LastGoalRefreshAt >= Config.GoalRefreshInterval then
+		RuntimeState.LastGoalRefreshAt = now
+		RuntimeState.GoalTarget = Target
 		local newGoal = navigationGoalForTarget(enemyRoot, Target, bossPolicy and bossPolicy.KiteDistance or nil)
-		if not NavigationGoal or (newGoal - NavigationGoal).Magnitude >= Config.DirectGoalChangeDistance then
-			NavigationGoal = newGoal
+		if not RuntimeState.NavigationGoal or (newGoal - RuntimeState.NavigationGoal).Magnitude >= Config.DirectGoalChangeDistance then
+			RuntimeState.NavigationGoal = newGoal
 		elseif State == NavigationState.DIRECT then
-			NavigationGoal = NavigationGoal:Lerp(newGoal, 0.35)
+			RuntimeState.NavigationGoal = RuntimeState.NavigationGoal:Lerp(newGoal, 0.35)
 		end
 	end
 	if not ProgressState.GoalAnchor then
-		resetProgress(Target, NavigationGoal)
+		resetProgress(Target, RuntimeState.NavigationGoal)
 	end
 	decideNavigation()
 	updateProgressTracking()
@@ -5665,13 +5594,13 @@ local function bindCharacter(character: Model)
 	if RuntimeState.CharacterBindActiveCharacter ~= character then
 		-- Retries for one replicated Character are one bind generation. Incrementing
 		-- this serial for every poll made delayed retries invalidate each other.
-		CharacterBindSerial += 1
+		RuntimeState.CharacterBindSerial += 1
 		RuntimeState.CharacterBindActiveCharacter = character
 		RuntimeState.CharacterBindRetryUntil = now + 8
 		RuntimeState.CharacterBindTimeoutReported = false
 		RuntimeState.CharacterBindStartedAt = now
 	end
-	local serial = CharacterBindSerial
+	local serial = RuntimeState.CharacterBindSerial
 	local newHumanoid = character:FindFirstChildOfClass("Humanoid")
 	local namedRoot = character:FindFirstChild("HumanoidRootPart")
 	-- Some respawns replicate the Humanoid's root reference before the named
@@ -5682,7 +5611,7 @@ local function bindCharacter(character: Model)
 		elseif newHumanoid and newHumanoid.RootPart and newHumanoid.RootPart:IsA("BasePart")
 			then newHumanoid.RootPart
 			else nil
-	if not RuntimeUtil.isCurrentExecution() or serial ~= CharacterBindSerial or Player.Character ~= character then
+	if not RuntimeUtil.isCurrentExecution() or serial ~= RuntimeState.CharacterBindSerial or Player.Character ~= character then
 		return
 	end
 	if not newHumanoid or not newHumanoid:IsA("Humanoid") or not newRoot or not newRoot:IsA("BasePart") then
@@ -5755,32 +5684,32 @@ local function bindCharacter(character: Model)
 	RuntimeState.TargetRootStabilizeUntil = 0
 	RuntimeState.TargetRootStabilizeStartedAt = 0
 	if Humanoid then
-		DefaultAutoRotate = Humanoid.AutoRotate
-		DefaultWalkSpeed = Humanoid.WalkSpeed
+		RuntimeState.DefaultAutoRotate = Humanoid.AutoRotate
+		RuntimeState.DefaultWalkSpeed = Humanoid.WalkSpeed
 	end
 	CombatState.NextQAt, CombatState.NextEAt, CombatState.LastAttack, CombatState.CooldownHoldTarget, CombatState.CooldownHoldUntil = 0, 0, 0, nil, 0
-	CombatState.BindSerial = CharacterBindSerial
-	RespawnInProgress = false
-	ResetExecuting = false
+	CombatState.BindSerial = RuntimeState.CharacterBindSerial
+	RuntimeState.RespawnInProgress = false
+	RuntimeState.ResetExecuting = false
 	RuntimeState.JumpStillSince = now
 	RuntimeState.JumpBestDistance = math.huge
 	RuntimeState.JumpBestVertical = math.huge
-	NoTargetSince = os.clock()
+	RuntimeState.NoTargetSince = os.clock()
 	clearDodgeObjective()
 	-- Keep a living target through the player's own death. Its listener remains
 	-- attached, so an enemy that dies during the respawn still clears normally.
 	if Target and validTarget(Target) then
-		GoalTarget = nil
-		NavigationGoal = nil
+		RuntimeState.GoalTarget = nil
+		RuntimeState.NavigationGoal = nil
 		ProgressState.RecoveryGoal = nil
 		ProgressState.RecoveryUntil = 0
 		cancelPathRequest()
 		resetProgress(Target, nil)
-		setNavigationState(NavigationState.IDLE)
-		LastTargetAcquireAt = os.clock()
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+		RuntimeState.LastTargetAcquireAt = os.clock()
 	else
 		resetNavigationForTarget(nil)
-		LastTargetAcquireAt = -math.huge
+		RuntimeState.LastTargetAcquireAt = -math.huge
 	end
 	if Running then
 		applyMovementSpeed()
@@ -5801,8 +5730,8 @@ local function bindCharacter(character: Model)
 				end
 				-- The write triggers this signal once more, then the tolerance guard
 				-- exits. Old-character connections are disposed before rebinding.
-				AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
-				boundHumanoid.WalkSpeed = AppliedWalkSpeed
+				RuntimeState.AppliedWalkSpeed = 16 * Config.MovementSpeedMultiplier
+				boundHumanoid.WalkSpeed = RuntimeState.AppliedWalkSpeed
 			end)
 		)
 		table.insert(
@@ -5818,11 +5747,11 @@ local function bindCharacter(character: Model)
 				-- Do not discard a living enemy just because this character died.
 				-- CharacterAdded will immediately resume the same target when possible.
 				cancelPathRequest()
-				GoalTarget = nil
-				NavigationGoal = nil
+				RuntimeState.GoalTarget = nil
+				RuntimeState.NavigationGoal = nil
 				ProgressState.RecoveryGoal = nil
 				ProgressState.RecoveryUntil = 0
-				setNavigationState(NavigationState.IDLE)
+				RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 				if Running then
 					task.defer(function()
 						task.wait(0.65)
@@ -5833,7 +5762,7 @@ local function bindCharacter(character: Model)
 							and Player.Character == deadCharacter
 							and not alive()
 						then
-							recoverByRespawn(nil, nil)
+							RuntimeState.Callbacks.recoverByRespawn(nil, nil)
 						end
 					end)
 				end
@@ -5854,14 +5783,14 @@ local function bindCharacter(character: Model)
 					and boundHumanoid == Humanoid
 					and not alive()
 				then
-					recoverByRespawn(nil, nil)
+					RuntimeState.Callbacks.recoverByRespawn(nil, nil)
 				end
 			end)
 		end
 	end
 end
 
-chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: boolean?): (Vector3?, Vector3?)
+RuntimeState.Callbacks.chooseKiteGoal = function(enemyRoot: BasePart, retreat: boolean, lateralOnly: boolean?): (Vector3?, Vector3?)
 	if not Root then
 		return nil, nil
 	end
@@ -5999,8 +5928,8 @@ local function telemetryMovementOwner(owner: string)
 	if not Config.DebugTelemetry or not Root then
 		return
 	end
-	local targetRoot = Target and validTarget(Target) and getTargetRoot(Target)
-	local objective = NavigationGoal or (targetRoot and targetRoot.Position)
+	local targetRoot = Target and validTarget(Target) and RuntimeState.Callbacks.getTargetRoot(Target)
+	local objective = RuntimeState.NavigationGoal or (targetRoot and targetRoot.Position)
 	local targetDistance = targetRoot and (targetRoot.Position - Root.Position).Magnitude or math.huge
 	local towardDot = 0
 	if objective then
@@ -6028,7 +5957,7 @@ local function telemetryMovementOwner(owner: string)
 	)
 end
 
-setRunning = function(value: boolean)
+RuntimeState.Callbacks.setRunning = function(value: boolean)
 	if Running == value then
 		return
 	end
@@ -6038,14 +5967,14 @@ setRunning = function(value: boolean)
 	if value then
 		disablePlayerControls()
 		applyMovementSpeed()
-		LastTargetAcquireAt = -math.huge
-		NoTargetSince = os.clock()
+		RuntimeState.LastTargetAcquireAt = -math.huge
+		RuntimeState.NoTargetSince = os.clock()
 		resetProgress(nil, nil)
 	else
 		RuntimeState.RespawnRushUntil = 0
 		clearDodgeObjective()
 		resetNavigationForTarget(nil)
-		stopTranslation()
+		RuntimeState.Callbacks.stopTranslation()
 		restoreMovementSpeed()
 		restoreRotation()
 		enablePlayerControls()
@@ -6112,7 +6041,7 @@ local function createHUD()
 	table.insert(
 		UIState.Connections,
 		button.MouseButton1Click:Connect(function()
-			setRunning(not Running)
+			RuntimeState.Callbacks.setRunning(not Running)
 		end)
 	)
 	local dragging = false
@@ -6170,12 +6099,12 @@ local function shutdown()
 	Enabled, Running = false, false
 	RuntimeState.RespawnRushUntil = 0
 	clearDodgeObjective()
-	table.clear(NearbyActiveHazards)
-	table.clear(HazardSet)
+	table.clear(RuntimeState.NearbyActiveHazards)
+	table.clear(RuntimeState.HazardSet)
 	table.clear(RuntimeState.HazardMetadata)
 	table.clear(RuntimeState.MageHitboxSeen)
 	resetNavigationForTarget(nil)
-	stopTranslation()
+	RuntimeState.Callbacks.stopTranslation()
 	restoreMovementSpeed()
 	restoreRotation()
 	enablePlayerControls()
@@ -6262,10 +6191,10 @@ table.insert(
 	UIState.Connections,
 	workspace.DescendantRemoving:Connect(function(instance)
 		if instance:IsA("Model") then
-			EnemySet[instance] = nil
+			RuntimeState.EnemySet[instance] = nil
 			RuntimeState.MageHitboxSeen[instance] = nil
 		end
-		local targetRoot = Target and getTargetRoot(Target)
+		local targetRoot = Target and RuntimeState.Callbacks.getTargetRoot(Target)
 		if
 			Target
 			and (
@@ -6279,7 +6208,7 @@ table.insert(
 				print("[TARGET] stale=" .. Target.Name .. " reason=removed")
 			end
 			resetNavigationForTarget(nil)
-			LastTargetAcquireAt = -math.huge
+			RuntimeState.LastTargetAcquireAt = -math.huge
 		end
 		local activeRoot = RuntimeState.ActiveDungeonRoot
 		if activeRoot and (activeRoot == instance or activeRoot:IsDescendantOf(instance)) then
@@ -6290,8 +6219,8 @@ table.insert(
 			RuntimeState.LastDungeonReferenceSearchAt = -math.huge
 		end
 		if instance:IsA("BasePart") then
-			HazardSet[instance] = nil
-			NearbyActiveHazards[instance] = nil
+			RuntimeState.HazardSet[instance] = nil
+			RuntimeState.NearbyActiveHazards[instance] = nil
 			RuntimeState.HazardMetadata[instance] = nil
 		end
 	end)
@@ -6317,8 +6246,8 @@ table.insert(
 		-- A recovery operation belongs to the old character. Invalidate it before
 		-- the new bind so it cannot reset or hold this respawn in place.
 		RuntimeState.RecoverySerial = (RuntimeState.RecoverySerial or 0) + 1
-		RespawnInProgress = false
-		ResetExecuting = false
+		RuntimeState.RespawnInProgress = false
+		RuntimeState.ResetExecuting = false
 		RuntimeState.CharacterBindActiveCharacter = nil
 		RuntimeState.CharacterBindRetryUntil = os.clock() + 8
 		RuntimeState.CharacterBindRetryPending = false
@@ -6334,18 +6263,18 @@ table.insert(
 		Humanoid = nil
 		Root = nil
 		invalidateDirectRouteCache()
-		GoalTarget = nil
-		NavigationGoal = nil
+		RuntimeState.GoalTarget = nil
+		RuntimeState.NavigationGoal = nil
 		ProgressState.RecoveryGoal = nil
 		ProgressState.RecoveryUntil = 0
 		clearDodgeObjective()
-		table.clear(NearbyActiveHazards)
-		table.clear(HazardSet)
+		table.clear(RuntimeState.NearbyActiveHazards)
+		table.clear(RuntimeState.HazardSet)
 		table.clear(RuntimeState.HazardMetadata)
 		table.clear(RuntimeState.MageHitboxSeen)
-		LastHazardRefreshAt = -math.huge
+		RuntimeState.LastHazardRefreshAt = -math.huge
 		RuntimeState.LastHazardSpatialFallbackAt = -math.huge
-		setNavigationState(NavigationState.IDLE)
+		RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
 		print("[CHAR] respawn")
 		table.insert(
 			UIState.CharacterConnections,
@@ -6410,7 +6339,7 @@ table.insert(
 			local button = RuntimeState.HUDButton
 			if info and info:IsDescendantOf(game) and button and button:IsDescendantOf(game) then
 				local activeTarget = if validTarget(Target) then Target else nil
-				local targetRoot = activeTarget and getTargetRoot(activeTarget)
+				local targetRoot = activeTarget and RuntimeState.Callbacks.getTargetRoot(activeTarget)
 				local distance = targetRoot and Root and (targetRoot.Position - Root.Position).Magnitude
 				local height = targetRoot and Root and math.abs(targetRoot.Position.Y - Root.Position.Y)
 				local translating = State == NavigationState.DIRECT
@@ -6473,9 +6402,9 @@ table.insert(
 			RuntimeState.LastSpeedReassertAt = now
 			applyMovementSpeed()
 		end
-		if ResetExecuting then
-			setNavigationState(NavigationState.IDLE)
-			stopTranslation()
+		if RuntimeState.ResetExecuting then
+			RuntimeState.Callbacks.setNavigationState(NavigationState.IDLE)
+			RuntimeState.Callbacks.stopTranslation()
 			return
 		end
 		updateGlobalStuckJump()
@@ -6487,7 +6416,7 @@ table.insert(
 		local dodgeOwnsTranslation = updateDodgeController()
 		telemetryMovementOwner(dodgeOwnsTranslation and "DODGE" or State)
 		updateTargetFacing()
-		local enemyRoot = Target and validTarget(Target) and getTargetRoot(Target) or nil
+		local enemyRoot = Target and validTarget(Target) and RuntimeState.Callbacks.getTargetRoot(Target) or nil
 		local distance = enemyRoot and Root and (enemyRoot.Position - Root.Position).Magnitude or nil
 		useCombatSkills(enemyRoot, distance)
 		if enemyRoot and distance then
@@ -6509,7 +6438,7 @@ table.insert(
 		elseif State == NavigationState.EXPLORE then
 			updateExploreMovement()
 		elseif State == NavigationState.COMBAT or State == NavigationState.IDLE then
-			stopTranslation()
+			RuntimeState.Callbacks.stopTranslation()
 		end
 	end)
 )
