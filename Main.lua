@@ -54,7 +54,7 @@ local DEFAULT_CONFIG = {
 	SkillQToolName = "Q",
 	SkillEToolName = "E",
 	UseTool = false,
-	MovementSpeedMultiplier = 1.3,
+	MovementSpeedMultiplier = 1.2,
 	DirectReachedDistance = 0.75,
 	DirectVerticalTolerance = 7,
 	DirectDecisionInterval = 0.25,
@@ -236,9 +236,9 @@ Config.DodgeCandidateCount = 4
 Config.AutoReplay = false
 Config.SkillRange = nil
 -- Keep the AutoFarm movement contract at the game's base 16 WalkSpeed plus
--- thirty percent. Old fixed-speed values must not survive a re-exec.
+-- twenty percent. Old fixed-speed values must not survive a re-exec.
 Config.MovementWalkSpeed = nil
-Config.MovementSpeedMultiplier = 1.3
+Config.MovementSpeedMultiplier = 1.2
 Config.WebhookEnabled = nil
 Config.WebhookURL = nil
 if type(SavedConfig.FarmEnabled) == "boolean" then
@@ -3293,18 +3293,6 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 		return
 	end
 	local now = os.clock()
-	if
-		distance3D <= Config.QSkillRange
-		and now >= CombatState.NextQAt
-		and CombatState.CooldownHoldTarget ~= Target
-	then
-		local minimum = math.max(0.1, Config.QCooldownMin)
-		local maximum = math.max(minimum, Config.QCooldownMax)
-		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
-			CombatState.NextQAt = now + minimum + math.random() * (maximum - minimum)
-			RuntimeUtil.telemetry("COMBAT_Q", "Q")
-		end
-	end
 	local activeSkillRange = skillRangeForTarget(Target)
 	if distance3D <= activeSkillRange and now >= CombatState.NextEAt then
 		if activateSkill(Config.SkillEToolName, Enum.KeyCode.E) then
@@ -3317,6 +3305,18 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 				CombatState.CooldownHoldUntil = now + Config.NormalSkillCooldownHoldDuration
 			end
 			RuntimeUtil.telemetry("COMBAT_E", "E")
+		end
+	end
+	if
+		distance3D <= Config.QSkillRange
+		and now >= CombatState.NextQAt
+		and CombatState.CooldownHoldTarget ~= Target
+	then
+		local minimum = math.max(0.1, Config.QCooldownMin)
+		local maximum = math.max(minimum, Config.QCooldownMax)
+		if activateSkill(Config.SkillQToolName, Enum.KeyCode.Q) then
+			CombatState.NextQAt = now + minimum + math.random() * (maximum - minimum)
+			RuntimeUtil.telemetry("COMBAT_Q", "Q")
 		end
 	end
 end
