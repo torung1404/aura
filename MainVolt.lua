@@ -38,7 +38,7 @@ local DEFAULT_CONFIG = {
 	NormalKiteRetreatDistance = 60,
 	AttackRange = 15,
 	NormalSkillRange = 61,
-	QSkillRange = 100,
+	QSkillRange = 75,
 	NormalSkillCooldownHoldDistance = 100,
 	NormalSkillCooldownHoldDuration = 5,
 	-- The game grants roughly seven seconds of spawn protection. Use the first
@@ -215,7 +215,7 @@ Config.PreferredCombatDistance = 60
 Config.NormalSkillRange = 61
 -- Q is a separate close-combat opener.  Do not inherit the normal/boss E
 -- range, which is selected through skillRangeForTarget().
-Config.QSkillRange = 100
+Config.QSkillRange = 75
 Config.NormalSkillCooldownHoldDistance = 100
 Config.NormalSkillCooldownHoldDuration = 5
 Config.NormalKiteApproachDistance = 60
@@ -283,7 +283,7 @@ local function saveConfig()
 		persisted.NormalKiteApproachDistance = 60
 		persisted.NormalKiteRetreatDistance = 60
 		persisted.KiteDistance = 60
-		persisted.QSkillRange = 100
+		persisted.QSkillRange = 75
 		persisted.NormalSkillCooldownHoldDistance = 100
 		persisted.NormalSkillCooldownHoldDuration = 5
 		writefile(CONFIG_FILE, Services.Http:JSONEncode(persisted))
@@ -3344,7 +3344,6 @@ local function useCombatSkills(enemyRoot: BasePart?, distance3D: number?)
 	if
 		distance3D <= Config.QSkillRange
 		and now >= CombatState.NextQAt
-		and CombatState.CooldownHoldTarget ~= Target
 	then
 		local minimum = math.max(0.1, Config.QCooldownMin)
 		local maximum = math.max(minimum, Config.QCooldownMax)
